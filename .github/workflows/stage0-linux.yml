@@ -3,7 +3,7 @@ name: stage0-linux
 on:
   push:
     branches:
-      - feat/stage0-ext4-fabric-poc
+      - main
   pull_request:
   workflow_dispatch:
 
@@ -31,8 +31,7 @@ jobs:
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
 
-      - name: Format (advisory during Stage 0 bootstrap)
-        continue-on-error: true
+      - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy
