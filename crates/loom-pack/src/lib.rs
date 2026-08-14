@@ -21,7 +21,11 @@ pub fn pack_block(input: &[u8], block_size: usize) -> Result<Vec<u8>, PackError>
     Ok(block)
 }
 
-pub fn pack_file(input_path: &Path, output_path: &Path, block_size: usize) -> Result<(), PackError> {
+pub fn pack_file(
+    input_path: &Path,
+    output_path: &Path,
+    block_size: usize,
+) -> Result<(), PackError> {
     let input = fs::read(input_path).map_err(PackError::Io)?;
     let block = pack_block(&input, block_size)?;
     fs::write(output_path, block).map_err(PackError::Io)
