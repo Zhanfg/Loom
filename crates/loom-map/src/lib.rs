@@ -95,10 +95,7 @@ impl LoomMap {
                     actual: extent.logical_start.0,
                 });
             }
-            expected_start = extent
-                .logical_end()
-                .map_err(MapError::Extent)?
-                .0;
+            expected_start = extent.logical_end().map_err(MapError::Extent)?.0;
         }
 
         if expected_start != self.total_sectors.0 {
@@ -128,10 +125,7 @@ impl LoomMap {
             writeln!(
                 table,
                 "{} {} linear {} {}",
-                extent.logical_start.0,
-                extent.sector_count.0,
-                device,
-                extent.source_start.0
+                extent.logical_start.0, extent.sector_count.0, device, extent.source_start.0
             )
             .expect("writing to String cannot fail");
         }
@@ -195,13 +189,9 @@ mod tests {
 
     #[test]
     fn middle_replacement_is_woven_between_origin_extents() {
-        let map = LoomMap::single_replacement(
-            SectorCount(100),
-            Sector(40),
-            SectorCount(8),
-            Sector(0),
-        )
-        .unwrap();
+        let map =
+            LoomMap::single_replacement(SectorCount(100), Sector(40), SectorCount(8), Sector(0))
+                .unwrap();
 
         assert_eq!(map.extents().len(), 3);
         assert_eq!(map.extents()[0].source, Source::Origin);
@@ -213,13 +203,9 @@ mod tests {
 
     #[test]
     fn dm_table_uses_origin_and_shadow_devices() {
-        let map = LoomMap::single_replacement(
-            SectorCount(32),
-            Sector(8),
-            SectorCount(8),
-            Sector(0),
-        )
-        .unwrap();
+        let map =
+            LoomMap::single_replacement(SectorCount(32), Sector(8), SectorCount(8), Sector(0))
+                .unwrap();
 
         let table = map.to_dm_linear_table("/dev/loop0", "/dev/loop1").unwrap();
         assert_eq!(
@@ -230,13 +216,9 @@ mod tests {
 
     #[test]
     fn out_of_bounds_replacement_is_rejected() {
-        let error = LoomMap::single_replacement(
-            SectorCount(16),
-            Sector(12),
-            SectorCount(8),
-            Sector(0),
-        )
-        .unwrap_err();
+        let error =
+            LoomMap::single_replacement(SectorCount(16), Sector(12), SectorCount(8), Sector(0))
+                .unwrap_err();
 
         assert!(matches!(error, MapError::ReplacementOutOfBounds { .. }));
     }
