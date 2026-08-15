@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod stage10_command;
+mod stage11_command;
 mod stage7_command;
 mod stage9_command;
 
@@ -42,6 +43,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "ext4-create-selinux" => stage7_command::command(&mut args)?,
         "erofs-replace" => stage9_command::command(&mut args)?,
         "erofs-pcluster-swap" => stage10_command::command(&mut args)?,
+        "erofs-lz4-replace" => stage11_command::command(&mut args)?,
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command {other:?}").into()),
     }
@@ -312,7 +314,7 @@ fn parse_usize(value: &str, name: &str) -> Result<usize, Box<dyn Error>> {
 
 fn print_usage() {
     eprintln!(
-        "Loom Stage 6\n\n\
+        "Loom Stage 11\n\n\
          Usage:\n\
            loom pack-block <input> <output-pack> <block-size>\n\
            loom map-single <total-sectors> <start-sector> <sector-count> <shadow-start-sector> \\\n<origin-device> <shadow-device> <output-table>\n\
@@ -321,6 +323,7 @@ fn print_usage() {
            loom ext4-grow <origin-image> <target-path> <replacement> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
            loom ext4-create <origin-image> <target-path> <payload> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
            loom ext4-remove <origin-image> <target-path> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
-           loom ext4-selinux <origin-image> <target-path> <context-bytes-file> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n"
+           loom ext4-selinux <origin-image> <target-path> <context-bytes-file> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
+           loom erofs-lz4-replace <origin-image> <target-path> <replacement-payload> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n"
     );
 }

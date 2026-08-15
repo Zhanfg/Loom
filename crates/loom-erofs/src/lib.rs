@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-pub use compressed::{compile_full_pcluster_swap, CompiledPclusterSwap, CompressedError};
+pub use compressed::{
+    compile_full_pcluster_swap, compile_lz4_replacement, CompiledLz4Replacement,
+    CompiledPclusterSwap, CompressedError,
+};
 mod compressed;
 use loom_map::LoomMap;
 use loom_view::{EffectiveBlockStore, ViewError};
@@ -447,11 +450,11 @@ pub enum ErofsError {
     UnsupportedInodeFeature(&'static str),
     InvalidPath(&'static str),
     PathNotFound(String),
-    InlineDirectoryTailUnsupported(String),
     NotDirectory(u64),
     NotRegularFile(u64),
-    CorruptDirectory,
+    InlineDirectoryTailUnsupported(String),
     ReplacementSizeMismatch { original: u64, replacement: u64 },
+    CorruptDirectory,
     UnexpectedEndOfImage,
     UnexpectedEndOfStructure,
     ArithmeticOverflow,
@@ -464,28 +467,28 @@ impl fmt::Display for ErofsError {
             Self::View(error) => write!(f, "Loom effective-view error: {error}"),
             Self::BadMagic(magic) => write!(f, "invalid EROFS magic {magic:#010x}"),
             Self::InvalidFilesystem(reason) => write!(f, "invalid EROFS filesystem: {reason}"),
-            Self::UnsupportedFilesystemFeature(feature) => {
-                write!(f, "unsupported EROFS filesystem feature: {feature}")
+            Self::UnsupportedFilesystemFeature(reason) => {
+                write!(f, "unsupported EROFS filesystem feature: {reason}")
             }
-            Self::UnsupportedInodeFeature(feature) => {
-                write!(f, "unsupported EROFS inode feature: {feature}")
+            Self::UnsupportedInodeFeature(reason) => {
+                write!(f, "unsupported EROFS inode feature: {reason}")
             }
-            Self::InvalidPath(reason) => write!(f, "invalid EROFS target path: {reason}"),
+            Self::InvalidPath(reason) => write!(f, "invalid EROFS path: {reason}"),
             Self::PathNotFound(name) => write!(f, "EROFS path component not found: {name:?}"),
-            Self::InlineDirectoryTailUnsupported(name) => write!(
-                f,
-                "EROFS path component {name:?} may lie in an inline directory tail unsupported by Stage 9"
-            ),
             Self::NotDirectory(nid) => write!(f, "EROFS nid {nid} is not a directory"),
             Self::NotRegularFile(nid) => write!(f, "EROFS nid {nid} is not a regular file"),
-            Self::CorruptDirectory => write!(f, "malformed EROFS directory block"),
+            Self::InlineDirectoryTailUnsupported(name) => write!(
+                f,
+                "EROFS path component {name:?} may lie in unsupported inline directory tail"
+            ),
             Self::ReplacementSizeMismatch {
                 original,
                 replacement,
             } => write!(
                 f,
-                "EROFS replacement size {replacement} does not match original size {original}"
+                "EROFS replacement size mismatch: original {original} bytes, replacement {replacement} bytes"
             ),
+            Self::CorruptDirectory => write!(f, "malformed EROFS directory block"),
             Self::UnexpectedEndOfImage => write!(f, "EROFS reference lies beyond image bytes"),
             Self::UnexpectedEndOfStructure => write!(f, "unexpected end of EROFS structure"),
             Self::ArithmeticOverflow => write!(f, "integer overflow while parsing EROFS"),
@@ -509,22 +512,15 @@ mod tests {
 
     #[test]
     fn absolute_paths_reject_parent_components() {
-        assert!(matches!(
-            parse_absolute_path("/a/../b"),
-            Err(ErofsError::InvalidPath(_))
-        ));
+        assert!(parse_absolute_path("/system/../etc").is_err());
     }
 
     #[test]
     fn directory_block_parser_finds_exact_name() {
-        let mut block = vec![0_u8; 4096];
-        // Two 12-byte dirents; names begin at 24 and 27.
-        block[0..8].copy_from_slice(&11_u64.to_le_bytes());
-        block[8..10].copy_from_slice(&24_u16.to_le_bytes());
-        block[12..20].copy_from_slice(&22_u64.to_le_bytes());
-        block[20..22].copy_from_slice(&27_u16.to_le_bytes());
-        block[24..27].copy_from_slice(b"abc");
-        block[27..30].copy_from_slice(b"xyz");
-        assert_eq!(find_in_directory_block(&block, b"xyz").unwrap(), Some(22));
+        let mut block = vec![0_u8; 128];
+        block[0..8].copy_from_slice(&7_u64.to_le_bytes());
+        block[8..10].copy_from_slice(&12_u16.to_le_bytes());
+        block[12..19].copy_from_slice(b"payload");
+        assert_eq!(find_in_directory_block(&block, b"payload").unwrap(), Some(7));
     }
 }

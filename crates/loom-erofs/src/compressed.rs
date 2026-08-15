@@ -3,7 +3,7 @@
 use loom_map::LoomMap;
 use loom_view::{EffectiveBlockStore, ViewError};
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -28,6 +28,11 @@ const LZ4_ALGORITHM: u8 = 0;
 const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
 const FEATURE_COMPR_CFGS_OR_BIG_PCLUSTER: u32 = 0x0000_0002;
 const SUPPORTED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_COMPR_CFGS_OR_BIG_PCLUSTER;
+const LZ4_MIN_MATCH: usize = 4;
+const LZ4_LAST_LITERALS: usize = 5;
+const LZ4_MFLIMIT: usize = 12;
+const LZ4_HASH_LOG: u32 = 16;
+const LZ4_HASH_SIZE: usize = 1 << LZ4_HASH_LOG;
 
 #[derive(Debug)]
 pub struct CompiledPclusterSwap {
@@ -37,6 +42,17 @@ pub struct CompiledPclusterSwap {
     pub origin_nid: u64,
     pub origin_pcluster: u64,
     pub replacement_pcluster: u64,
+    pub shadow_blocks: usize,
+}
+
+#[derive(Debug)]
+pub struct CompiledLz4Replacement {
+    pub map: LoomMap,
+    pub shadow: Vec<u8>,
+    pub block_size: u32,
+    pub nid: u64,
+    pub pcluster: u64,
+    pub encoded_bytes: usize,
     pub shadow_blocks: usize,
 }
 
@@ -55,6 +71,7 @@ struct Superblock {
     block_size: u32,
     root_nid: u64,
     meta_block: u64,
+    feature_incompat: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +175,82 @@ pub fn compile_full_pcluster_swap(
         origin_nid,
         origin_pcluster: origin_extent.pcluster,
         replacement_pcluster: replacement_extent.pcluster,
+        shadow_blocks: compiled.shadow_blocks,
+    })
+}
+
+/// Encodes a replacement payload into the existing legacy-layout LZ4 pcluster.
+///
+/// Unlike Stage 10, this path does not need a second EROFS image as an encoding oracle.
+/// It is intentionally limited to non-0padding EROFS, where raw LZ4 bytes begin at offset
+/// zero and unused bytes in the physical pcluster are zero-filled. The replacement must
+/// preserve the target logical size and its complete raw LZ4 block must fit inside the
+/// existing one-block physical footprint.
+///
+/// # Errors
+/// Returns [`CompressedError`] if the origin layout is outside the proven Stage 10 shape,
+/// the replacement size differs, raw LZ4 does not fit, round-trip validation fails, or the
+/// effective-view compiler fails.
+pub fn compile_lz4_replacement(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_path: &Path,
+) -> Result<CompiledLz4Replacement, CompressedError> {
+    let replacement = fs::read(replacement_path).map_err(CompressedError::Io)?;
+    let mut origin = Image::open(origin_path)?;
+    if origin.sb.feature_incompat & FEATURE_LZ4_0PADDING != 0 {
+        return Err(CompressedError::UnsupportedFilesystem(
+            "Stage 11 currently requires legacy non-0padding LZ4 placement",
+        ));
+    }
+
+    let nid = origin.resolve_path(target_path)?;
+    let extent = origin.read_two_lcluster_full_extent(nid)?;
+    let actual =
+        u64::try_from(replacement.len()).map_err(|_| CompressedError::ArithmeticOverflow)?;
+    if actual != extent.logical_size {
+        return Err(CompressedError::ReplacementSizeMismatch {
+            expected: extent.logical_size,
+            actual,
+        });
+    }
+
+    let compressed = encode_lz4_block(&replacement)?;
+    let capacity = usize::try_from(origin.sb.block_size)
+        .map_err(|_| CompressedError::ArithmeticOverflow)?;
+    if compressed.len() > capacity {
+        return Err(CompressedError::CompressionDoesNotFit {
+            encoded: compressed.len(),
+            capacity,
+        });
+    }
+
+    let decoded = decode_lz4_block(&compressed, replacement.len())?;
+    if decoded != replacement {
+        return Err(CompressedError::CompressionValidationFailed);
+    }
+
+    let mut encoded_block = vec![0_u8; capacity];
+    encoded_block[..compressed.len()].copy_from_slice(&compressed);
+    let mut view = EffectiveBlockStore::open(origin_path, origin.sb.block_size)
+        .map_err(CompressedError::View)?;
+    view.block_mut(extent.pcluster)
+        .map_err(CompressedError::View)?
+        .copy_from_slice(&encoded_block);
+    let compiled = view.finalize().map_err(CompressedError::View)?;
+    if compiled.shadow_blocks != 1 {
+        return Err(CompressedError::IncompatibleReplacement(
+            "one-pcluster encoding did not finalize to exactly one shadow block",
+        ));
+    }
+
+    Ok(CompiledLz4Replacement {
+        map: compiled.map,
+        shadow: compiled.shadow,
+        block_size: compiled.block_size,
+        nid,
+        pcluster: extent.pcluster,
+        encoded_bytes: compressed.len(),
         shadow_blocks: compiled.shadow_blocks,
     })
 }
@@ -429,6 +522,223 @@ impl Image {
     }
 }
 
+fn encode_lz4_block(input: &[u8]) -> Result<Vec<u8>, CompressedError> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut table = vec![usize::MAX; LZ4_HASH_SIZE];
+    let mut anchor = 0_usize;
+    let mut cursor = 0_usize;
+    let last_match_start = input.len().saturating_sub(LZ4_MFLIMIT);
+    let match_end = input.len().saturating_sub(LZ4_LAST_LITERALS);
+
+    while cursor <= last_match_start && cursor + LZ4_MIN_MATCH <= input.len() {
+        let hash = lz4_hash(input, cursor)?;
+        let candidate = table[hash];
+        table[hash] = cursor;
+        let valid = candidate != usize::MAX
+            && cursor > candidate
+            && cursor - candidate <= usize::from(u16::MAX)
+            && input[candidate..candidate + LZ4_MIN_MATCH]
+                == input[cursor..cursor + LZ4_MIN_MATCH];
+        if !valid {
+            cursor += 1;
+            continue;
+        }
+
+        let mut match_len = LZ4_MIN_MATCH;
+        while cursor + match_len < match_end
+            && input[candidate + match_len] == input[cursor + match_len]
+        {
+            match_len += 1;
+        }
+        emit_lz4_sequence(
+            &mut output,
+            input,
+            anchor,
+            cursor,
+            candidate,
+            match_len,
+        )?;
+
+        let next = cursor
+            .checked_add(match_len)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        let mut update = cursor + 1;
+        while update < next && update <= last_match_start {
+            let update_hash = lz4_hash(input, update)?;
+            table[update_hash] = update;
+            update += 1;
+        }
+        cursor = next;
+        anchor = next;
+    }
+
+    emit_lz4_last_literals(&mut output, &input[anchor..])?;
+    Ok(output)
+}
+
+fn lz4_hash(input: &[u8], offset: usize) -> Result<usize, CompressedError> {
+    let end = offset
+        .checked_add(LZ4_MIN_MATCH)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
+    let bytes: [u8; 4] = input
+        .get(offset..end)
+        .ok_or(CompressedError::CompressionValidationFailed)?
+        .try_into()
+        .map_err(|_| CompressedError::CompressionValidationFailed)?;
+    let value = u32::from_le_bytes(bytes).wrapping_mul(2_654_435_761);
+    let hash = value >> (32 - LZ4_HASH_LOG);
+    usize::try_from(hash).map_err(|_| CompressedError::ArithmeticOverflow)
+}
+
+fn emit_lz4_sequence(
+    output: &mut Vec<u8>,
+    input: &[u8],
+    anchor: usize,
+    match_start: usize,
+    match_ref: usize,
+    match_len: usize,
+) -> Result<(), CompressedError> {
+    let literal_len = match_start
+        .checked_sub(anchor)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
+    let match_code = match_len
+        .checked_sub(LZ4_MIN_MATCH)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
+    let literal_nibble = literal_len.min(15);
+    let match_nibble = match_code.min(15);
+    let token = u8::try_from((literal_nibble << 4) | match_nibble)
+        .map_err(|_| CompressedError::ArithmeticOverflow)?;
+    output.push(token);
+    if literal_len >= 15 {
+        emit_lz4_length(output, literal_len - 15)?;
+    }
+    output.extend_from_slice(
+        input
+            .get(anchor..match_start)
+            .ok_or(CompressedError::CompressionValidationFailed)?,
+    );
+
+    let offset = match_start
+        .checked_sub(match_ref)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
+    let offset = u16::try_from(offset).map_err(|_| CompressedError::CompressionValidationFailed)?;
+    if offset == 0 {
+        return Err(CompressedError::CompressionValidationFailed);
+    }
+    output.extend_from_slice(&offset.to_le_bytes());
+    if match_code >= 15 {
+        emit_lz4_length(output, match_code - 15)?;
+    }
+    Ok(())
+}
+
+fn emit_lz4_last_literals(output: &mut Vec<u8>, literals: &[u8]) -> Result<(), CompressedError> {
+    let nibble = literals.len().min(15);
+    output.push(
+        u8::try_from(nibble << 4).map_err(|_| CompressedError::ArithmeticOverflow)?,
+    );
+    if literals.len() >= 15 {
+        emit_lz4_length(output, literals.len() - 15)?;
+    }
+    output.extend_from_slice(literals);
+    Ok(())
+}
+
+fn emit_lz4_length(output: &mut Vec<u8>, mut length: usize) -> Result<(), CompressedError> {
+    while length >= 255 {
+        output.push(255);
+        length -= 255;
+    }
+    output.push(u8::try_from(length).map_err(|_| CompressedError::ArithmeticOverflow)?);
+    Ok(())
+}
+
+fn decode_lz4_block(encoded: &[u8], expected: usize) -> Result<Vec<u8>, CompressedError> {
+    let mut input_pos = 0_usize;
+    let mut output = Vec::with_capacity(expected);
+    while input_pos < encoded.len() {
+        let token = encoded[input_pos];
+        input_pos += 1;
+
+        let mut literal_len = usize::from(token >> 4);
+        if literal_len == 15 {
+            literal_len = literal_len
+                .checked_add(read_lz4_length(encoded, &mut input_pos)?)
+                .ok_or(CompressedError::ArithmeticOverflow)?;
+        }
+        let literal_end = input_pos
+            .checked_add(literal_len)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        let literals = encoded
+            .get(input_pos..literal_end)
+            .ok_or(CompressedError::CompressionValidationFailed)?;
+        if output.len().saturating_add(literals.len()) > expected {
+            return Err(CompressedError::CompressionValidationFailed);
+        }
+        output.extend_from_slice(literals);
+        input_pos = literal_end;
+        if input_pos == encoded.len() {
+            break;
+        }
+
+        let offset_end = input_pos
+            .checked_add(2)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        let offset_bytes: [u8; 2] = encoded
+            .get(input_pos..offset_end)
+            .ok_or(CompressedError::CompressionValidationFailed)?
+            .try_into()
+            .map_err(|_| CompressedError::CompressionValidationFailed)?;
+        input_pos = offset_end;
+        let offset = usize::from(u16::from_le_bytes(offset_bytes));
+        if offset == 0 || offset > output.len() {
+            return Err(CompressedError::CompressionValidationFailed);
+        }
+
+        let mut match_len = usize::from(token & 0x0f) + LZ4_MIN_MATCH;
+        if token & 0x0f == 15 {
+            match_len = match_len
+                .checked_add(read_lz4_length(encoded, &mut input_pos)?)
+                .ok_or(CompressedError::ArithmeticOverflow)?;
+        }
+        if output.len().saturating_add(match_len) > expected {
+            return Err(CompressedError::CompressionValidationFailed);
+        }
+        for _ in 0..match_len {
+            let source = output
+                .len()
+                .checked_sub(offset)
+                .ok_or(CompressedError::CompressionValidationFailed)?;
+            let byte = *output
+                .get(source)
+                .ok_or(CompressedError::CompressionValidationFailed)?;
+            output.push(byte);
+        }
+    }
+    if output.len() != expected {
+        return Err(CompressedError::CompressionValidationFailed);
+    }
+    Ok(output)
+}
+
+fn read_lz4_length(encoded: &[u8], input_pos: &mut usize) -> Result<usize, CompressedError> {
+    let mut total = 0_usize;
+    loop {
+        let byte = *encoded
+            .get(*input_pos)
+            .ok_or(CompressedError::CompressionValidationFailed)?;
+        *input_pos = (*input_pos)
+            .checked_add(1)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        total = total
+            .checked_add(usize::from(byte))
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        if byte != 255 {
+            return Ok(total);
+        }
+    }
+}
+
 fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, CompressedError> {
     ensure_range(bytes, SB_OFFSET, SB_SIZE as u64)?;
     let mut raw = [0_u8; SB_SIZE];
@@ -461,6 +771,7 @@ fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, Compressed
         block_size,
         root_nid: u64::from(read_u16(&raw, 0x0e)?),
         meta_block: u64::from(read_u32(&raw, 0x28)?),
+        feature_incompat,
     })
 }
 
@@ -619,6 +930,9 @@ pub enum CompressedError {
     UnsupportedFilesystem(&'static str),
     UnsupportedInode(&'static str),
     IncompatibleReplacement(&'static str),
+    ReplacementSizeMismatch { expected: u64, actual: u64 },
+    CompressionDoesNotFit { encoded: usize, capacity: usize },
+    CompressionValidationFailed,
     InvalidPath(&'static str),
     PathNotFound(String),
     NotDirectory(u64),
@@ -642,6 +956,17 @@ impl fmt::Display for CompressedError {
             Self::UnsupportedInode(reason) => write!(f, "unsupported compressed inode: {reason}"),
             Self::IncompatibleReplacement(reason) => {
                 write!(f, "incompatible encoded replacement: {reason}")
+            }
+            Self::ReplacementSizeMismatch { expected, actual } => write!(
+                f,
+                "replacement size mismatch: expected {expected} bytes, got {actual}"
+            ),
+            Self::CompressionDoesNotFit { encoded, capacity } => write!(
+                f,
+                "raw LZ4 block does not fit existing pcluster: encoded {encoded} bytes, capacity {capacity}"
+            ),
+            Self::CompressionValidationFailed => {
+                write!(f, "raw LZ4 round-trip validation failed")
             }
             Self::InvalidPath(reason) => write!(f, "invalid EROFS path: {reason}"),
             Self::PathNotFound(name) => write!(f, "EROFS path component not found: {name:?}"),
@@ -682,5 +1007,30 @@ mod tests {
     fn align8_is_checked_and_monotonic() {
         assert_eq!(align8(33).unwrap(), 40);
         assert_eq!(align8(40).unwrap(), 40);
+    }
+
+    #[test]
+    fn raw_lz4_block_round_trips_without_size_prefix() {
+        let mut input = vec![b'L'; 8192];
+        input[64..87].copy_from_slice(b"LOOM-STAGE11-ROUNDTRIP!");
+        let compressed = encode_lz4_block(&input).unwrap();
+        assert!(compressed.len() < 4096);
+        let decoded = decode_lz4_block(&compressed, input.len()).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn incompressible_block_exceeds_one_pcluster() {
+        let mut state = 0x4c4f_4f4d_u32;
+        let mut input = vec![0_u8; 8192];
+        for byte in &mut input {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        let compressed = encode_lz4_block(&input).unwrap();
+        assert!(compressed.len() > 4096);
+        assert_eq!(decode_lz4_block(&compressed, input.len()).unwrap(), input);
     }
 }
