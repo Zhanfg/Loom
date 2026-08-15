@@ -4,6 +4,7 @@ members = [
     "crates/loom-map",
     "crates/loom-pack",
     "crates/loom-ext4",
+    "crates/loom-txn",
     "crates/loom-cli",
 ]
 resolver = "2"
