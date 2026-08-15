@@ -77,9 +77,7 @@ pub fn compile_create_with_selinux_transaction(
         &created.shadow,
     )
     .map_err(Ext4Error::View)?;
-    let table_block = view
-        .block_mut(inode_table_block)
-        .map_err(Ext4Error::View)?;
+    let table_block = view.block_mut(inode_table_block).map_err(Ext4Error::View)?;
     let inode_end = inode_offset
         .checked_add(inode_size)
         .ok_or(Ext4Error::ArithmeticOverflow)?;

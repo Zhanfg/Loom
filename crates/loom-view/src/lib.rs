@@ -247,19 +247,15 @@ fn validate_block_size(block_size: u32) -> Result<(), ViewError> {
     Ok(())
 }
 
-fn read_origin_block(
-    origin: &mut File,
-    block_size: u32,
-    block: u64,
-) -> Result<Vec<u8>, ViewError> {
+fn read_origin_block(origin: &mut File, block_size: u32, block: u64) -> Result<Vec<u8>, ViewError> {
     let offset = block
         .checked_mul(u64::from(block_size))
         .ok_or(ViewError::ArithmeticOverflow)?;
-    origin.seek(SeekFrom::Start(offset)).map_err(ViewError::Io)?;
-    let mut bytes = vec![
-        0_u8;
-        usize::try_from(block_size).map_err(|_| ViewError::ArithmeticOverflow)?
-    ];
+    origin
+        .seek(SeekFrom::Start(offset))
+        .map_err(ViewError::Io)?;
+    let mut bytes =
+        vec![0_u8; usize::try_from(block_size).map_err(|_| ViewError::ArithmeticOverflow)?];
     origin.read_exact(&mut bytes).map_err(ViewError::Io)?;
     Ok(bytes)
 }
@@ -300,8 +296,12 @@ impl fmt::Display for ViewError {
                 f,
                 "shadow size {bytes} is not aligned to block size {block_size}"
             ),
-            Self::UnalignedShadowExtent => write!(f, "shadow extent is not filesystem-block aligned"),
-            Self::ShadowOutOfBounds => write!(f, "Loom map references bytes beyond the shadow pack"),
+            Self::UnalignedShadowExtent => {
+                write!(f, "shadow extent is not filesystem-block aligned")
+            }
+            Self::ShadowOutOfBounds => {
+                write!(f, "Loom map references bytes beyond the shadow pack")
+            }
             Self::DuplicateLogicalBlock(block) => {
                 write!(f, "compiled map contains duplicate logical block {block}")
             }
@@ -310,7 +310,10 @@ impl fmt::Display for ViewError {
                 "logical block {block} lies outside effective view with {block_count} blocks"
             ),
             Self::MissingPromotedBlock(block) => {
-                write!(f, "promoted logical block {block} disappeared from transaction state")
+                write!(
+                    f,
+                    "promoted logical block {block} disappeared from transaction state"
+                )
             }
             Self::ArithmeticOverflow => write!(f, "effective-view arithmetic overflow"),
             Self::Map(error) => write!(f, "effective-view Loom map error: {error}"),

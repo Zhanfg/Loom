@@ -12,10 +12,8 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 fn fixture(name: &str, blocks: u8) -> PathBuf {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "loom-view-{name}-{}-{id}.bin",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("loom-view-{name}-{}-{id}.bin", std::process::id()));
     let mut file = File::create(&path).unwrap();
     for block in 0..blocks {
         file.write_all(&vec![block; BLOCK_SIZE as usize]).unwrap();

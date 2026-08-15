@@ -698,6 +698,7 @@ pub enum Ext4Error {
     Io(io::Error),
     Map(loom_map::MapError),
     Checksum(checksum::ChecksumError),
+    View(loom_view::ViewError),
     InvalidFilesystem(&'static str),
     UnsupportedFilesystemFeature(&'static str),
     UnknownIncompatibleFeatures(u32),
@@ -735,6 +736,7 @@ impl fmt::Display for Ext4Error {
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::Map(error) => write!(f, "Loom map error: {error}"),
             Self::Checksum(error) => write!(f, "ext4 inode checksum error: {error}"),
+            Self::View(error) => write!(f, "Loom effective-view error: {error}"),
             Self::InvalidFilesystem(reason) => write!(f, "invalid ext4 filesystem: {reason}"),
             Self::UnsupportedFilesystemFeature(feature) => {
                 write!(f, "unsupported ext4 filesystem feature: {feature}")
@@ -790,6 +792,7 @@ impl std::error::Error for Ext4Error {
             Self::Io(error) => Some(error),
             Self::Map(error) => Some(error),
             Self::Checksum(error) => Some(error),
+            Self::View(error) => Some(error),
             _ => None,
         }
     }
