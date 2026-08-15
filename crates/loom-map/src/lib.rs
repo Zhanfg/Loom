@@ -125,10 +125,12 @@ impl LoomMap {
         Ok(map)
     }
 
+    #[must_use]
     pub fn total_sectors(&self) -> SectorCount {
         self.total_sectors
     }
 
+    #[must_use]
     pub fn extents(&self) -> &[Extent] {
         &self.extents
     }
