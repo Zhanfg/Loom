@@ -224,8 +224,8 @@ fn apply_shadow_map(
             .0
             .checked_mul(SECTOR_SIZE)
             .ok_or(TransactionError::ArithmeticOverflow)?;
-        let shadow_start = usize::try_from(shadow_start)
-            .map_err(|_| TransactionError::ArithmeticOverflow)?;
+        let shadow_start =
+            usize::try_from(shadow_start).map_err(|_| TransactionError::ArithmeticOverflow)?;
         let shadow_end =
             usize::try_from(shadow_end).map_err(|_| TransactionError::ArithmeticOverflow)?;
         let bytes = shadow
@@ -272,7 +272,8 @@ fn diff_effective_image(
         if origin_sector == effective_sector {
             continue;
         }
-        let shadow_start = u64::try_from(changed).map_err(|_| TransactionError::ArithmeticOverflow)?;
+        let shadow_start =
+            u64::try_from(changed).map_err(|_| TransactionError::ArithmeticOverflow)?;
         replacements.push(ReplacementExtent {
             logical_start: Sector(sector),
             sector_count: SectorCount(1),
@@ -350,7 +351,9 @@ impl fmt::Display for TransactionError {
             Self::Ext4(error) => write!(f, "ext4 transaction operation failed: {error}"),
             Self::Map(error) => write!(f, "transaction map failed: {error}"),
             Self::EmptyPlan => write!(f, "transaction plan contains no operations"),
-            Self::PlanLine { line, reason } => write!(f, "invalid transaction plan line {line}: {reason}"),
+            Self::PlanLine { line, reason } => {
+                write!(f, "invalid transaction plan line {line}: {reason}")
+            }
             Self::ArithmeticOverflow => write!(f, "transaction address arithmetic overflow"),
             Self::ShadowOutOfBounds => write!(f, "compiled shadow extent lies outside shadow pack"),
             Self::ImageSizeMismatch { origin, effective } => write!(
