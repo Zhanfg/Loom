@@ -1,0 +1,34 @@
+name: stage9-wire
+
+on:
+  push:
+    branches:
+      - feat/stage9-erofs-flat-plain
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage9-erofs-flat-plain
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Wire CLI and refresh workspace lockfile
+        run: |
+          sed -i '/mod stage7_command;/a\mod stage9_command;' crates/loom-cli/src/main.rs
+          sed -i '/"ext4-create-selinux" => stage7_command::command(&mut args)?,/a\        "erofs-replace" => stage9_command::command(\&mut args)?,' crates/loom-cli/src/main.rs
+          cargo fmt --all
+          cargo generate-lockfile
+      - name: Commit wiring
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.lock crates/loom-cli/src/main.rs crates/loom-cli/src/stage9_command.rs crates/loom-erofs
+          git commit -m 'feat(erofs): wire Stage 9 compiler and CLI'
+          git push origin HEAD:feat/stage9-erofs-flat-plain
