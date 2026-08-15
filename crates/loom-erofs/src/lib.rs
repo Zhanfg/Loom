@@ -11,9 +11,9 @@ const SUPERBLOCK_OFFSET: u64 = 1024;
 const SUPERBLOCK_SIZE: usize = 128;
 const EROFS_MAGIC: u32 = 0xe0f5_e1e2;
 const DIRENT_SIZE: usize = 12;
-const MODE_TYPE_MASK: u16 = 0o170000;
-const MODE_DIRECTORY: u16 = 0o040000;
-const MODE_REGULAR: u16 = 0o100000;
+const MODE_TYPE_MASK: u16 = 0o170_000;
+const MODE_DIRECTORY: u16 = 0o040_000;
+const MODE_REGULAR: u16 = 0o100_000;
 const DATA_FLAT_PLAIN: u8 = 0;
 const DATA_FLAT_INLINE: u8 = 2;
 
