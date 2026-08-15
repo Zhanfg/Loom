@@ -57,3 +57,12 @@ jobs:
 
       - name: Stage 1.1 sparse-file rejection
         run: bash tests/integration/stage1_ext4_sparse_reject.sh
+
+      - name: Stage 2 inode resize
+        run: bash tests/integration/stage2_ext4_inode_resize.sh
+
+      - name: Stage 2 allocation-boundary rejection
+        run: bash tests/integration/stage2_ext4_resize_reject.sh
+
+      - name: Stage 2 block-size matrix
+        run: bash tests/integration/stage2_ext4_block_sizes.sh
