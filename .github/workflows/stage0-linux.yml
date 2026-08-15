@@ -54,3 +54,6 @@ jobs:
 
       - name: Stage 1.1 sparse block delta
         run: bash tests/integration/stage1_ext4_block_delta.sh
+
+      - name: Stage 1.1 sparse-file rejection
+        run: bash tests/integration/stage1_ext4_sparse_reject.sh
