@@ -25,6 +25,7 @@ const DATA_FLAT_PLAIN: u8 = 0;
 const DATA_FLAT_INLINE: u8 = 2;
 const DATA_COMPRESSED_COMPACT: u8 = 3;
 const MAP_HEADER_SIZE: u64 = 8;
+const LCLUSTER_PLAIN: u16 = 0;
 const LCLUSTER_HEAD1: u16 = 1;
 const LCLUSTER_NONHEAD: u16 = 2;
 const LCLUSTER_TYPE_MASK: u16 = 3;
@@ -57,6 +58,7 @@ pub(crate) struct CompiledCore {
 struct Head {
     lcn: usize,
     pcluster: u64,
+    kind: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -240,7 +242,15 @@ pub(crate) fn compile_lz4(
         let extent = replacement
             .get(start..end)
             .ok_or(CoreError::UnexpectedEndOfStructure)?;
-        let (block, encoded_len) = encode_extent(head.lcn, extent)?;
+        let (block, encoded_len) = match head.kind {
+            LCLUSTER_HEAD1 => encode_extent(head.lcn, extent)?,
+            LCLUSTER_PLAIN => encode_plain_extent(extent)?,
+            _ => {
+                return Err(CoreError::InvalidFilesystem(
+                    "recovered ordinary compact head has an unsupported type",
+                ))
+            }
+        };
         encoded_blocks.push(block);
         encoded_bytes.push(encoded_len);
     }
@@ -376,6 +386,17 @@ pub(crate) fn compile_big_lz4(
         encoded_spans,
         encoded_bytes,
     )
+}
+
+fn encode_plain_extent(extent: &[u8]) -> Result<(Vec<u8>, usize), CoreError> {
+    if extent.is_empty() || extent.len() > BLOCK_BYTES {
+        return Err(CoreError::UnsupportedInode(
+            "zero-offset PLAIN extent must occupy one non-empty logical block",
+        ));
+    }
+    let mut block = vec![0_u8; BLOCK_BYTES];
+    block[..extent.len()].copy_from_slice(extent);
+    Ok((block, extent.len()))
 }
 
 fn encode_extent(head_lcn: usize, extent: &[u8]) -> Result<(Vec<u8>, usize), CoreError> {
@@ -596,11 +617,11 @@ fn validate_compatible_topology(
     if origin
         .heads
         .iter()
-        .map(|head| head.lcn)
-        .ne(replacement.heads.iter().map(|head| head.lcn))
+        .map(|head| (head.lcn, head.kind))
+        .ne(replacement.heads.iter().map(|head| (head.lcn, head.kind)))
     {
         return Err(CoreError::IncompatibleReplacement(
-            "compressed HEAD-lcluster topology differs",
+            "compressed head-lcluster/type topology differs",
         ));
     }
     Ok(())
@@ -882,12 +903,29 @@ impl Image {
                         ));
                     }
                     let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;
-                    heads.push(Head { lcn, pcluster });
+                    heads.push(Head {
+                        lcn,
+                        pcluster,
+                        kind: LCLUSTER_HEAD1,
+                    });
+                }
+                LCLUSTER_PLAIN => {
+                    if lcn + 1 != total || entry.low != 0 {
+                        return Err(CoreError::UnsupportedInode(
+                            "compact core supports only a zero-offset PLAIN EOF lcluster",
+                        ));
+                    }
+                    let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;
+                    heads.push(Head {
+                        lcn,
+                        pcluster,
+                        kind: LCLUSTER_PLAIN,
+                    });
                 }
                 LCLUSTER_NONHEAD => {}
                 _ => {
                     return Err(CoreError::UnsupportedInode(
-                        "compact core supports only HEAD1 and NONHEAD entries",
+                        "compact core supports only EOF PLAIN, HEAD1 and NONHEAD entries",
                     ))
                 }
             }
@@ -1701,6 +1739,7 @@ mod tests {
             heads: vec![Head {
                 lcn: 0,
                 pcluster: 10,
+                kind: LCLUSTER_HEAD1,
             }],
         };
         let mut relocated = single.clone();
@@ -1708,6 +1747,39 @@ mod tests {
         assert!(validate_compatible_topology(&single, &relocated).is_ok());
     }
 
+    #[test]
+    fn plain_tail_is_raw_and_zero_padded() {
+        let tail = vec![0x5a_u8; 3973];
+        let (block, encoded) = encode_plain_extent(&tail).unwrap();
+        assert_eq!(encoded, tail.len());
+        assert_eq!(&block[..tail.len()], tail.as_slice());
+        assert!(block[tail.len()..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn topology_compatibility_rejects_head_type_changes() {
+        let origin = Topology {
+            nid: 1,
+            logical_size: 8192,
+            algorithm: 0,
+            advise: ADVISE_COMPACTED_2B,
+            logical_lclusters: 2,
+            compact_2b_entries: 0,
+            heads: vec![Head {
+                lcn: 0,
+                pcluster: 10,
+                kind: LCLUSTER_HEAD1,
+            }],
+        };
+        let mut replacement = origin.clone();
+        replacement.heads[0].kind = LCLUSTER_PLAIN;
+        assert!(matches!(
+            validate_compatible_topology(&origin, &replacement),
+            Err(CoreError::IncompatibleReplacement(
+                "compressed head-lcluster/type topology differs"
+            ))
+        ));
+    }
     #[test]
     fn later_extent_codec_failure_happens_before_view_construction() {
         let good = vec![b'Z'; 32768];
