@@ -402,6 +402,11 @@ impl Ext4Image {
             GD_INODE_BITMAP_CSUM_HI_END,
         )?;
 
+        let free_blocks = descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?;
+        let free_inodes = descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?;
+        let itable_unused =
+            descriptor_u32_count(&descriptor, GD_ITABLE_UNUSED_LO, GD_ITABLE_UNUSED_HI)?;
+
         Ok(GroupState {
             group,
             descriptor_block,
@@ -413,13 +418,9 @@ impl Ext4Image {
             inode_table_block,
             block_bitmap,
             inode_bitmap,
-            free_blocks: descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?,
-            free_inodes: descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?,
-            itable_unused: descriptor_u32_count(
-                &descriptor,
-                GD_ITABLE_UNUSED_LO,
-                GD_ITABLE_UNUSED_HI,
-            )?,
+            free_blocks,
+            free_inodes,
+            itable_unused,
         })
     }
 
