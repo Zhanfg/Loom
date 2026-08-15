@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+pub use compact_index::{
+    compile_pcluster_swap as compile_compact_pcluster_swap, CompiledSwap as CompiledCompactSwap,
+    IndexError as CompactIndexError,
+};
+mod compact_index;
 pub use compressed::{
     compile_full_pcluster_swap, compile_lz4_replacement, CompiledLz4Replacement,
     CompiledPclusterSwap, CompressedError,
