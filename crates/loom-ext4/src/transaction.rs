@@ -150,17 +150,19 @@ pub fn compile_create_with_selinux_transaction(
     let inode_end = inode_offset
         .checked_add(inode_size)
         .ok_or(Ext4Error::ArithmeticOverflow)?;
-    let raw_inode = table_block
-        .get_mut(inode_offset..inode_end)
-        .ok_or(Ext4Error::InvalidFilesystem(
-            "created inode crosses transaction inode-table block",
-        ))?;
+    let raw_inode =
+        table_block
+            .get_mut(inode_offset..inode_end)
+            .ok_or(Ext4Error::InvalidFilesystem(
+                "created inode crosses transaction inode-table block",
+            ))?;
 
     verify_inode_checksum(raw_inode, checksum_seed, created.inode).map_err(Ext4Error::Checksum)?;
     write_empty_ibody_selinux_xattr(raw_inode, &value)?;
     rewrite_inode_checksum(raw_inode, checksum_seed, created.inode).map_err(Ext4Error::Checksum)?;
 
-    let block_size = usize::try_from(editor.block_size).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+    let block_size =
+        usize::try_from(editor.block_size).map_err(|_| Ext4Error::ArithmeticOverflow)?;
     let shadow_blocks = editor.shadow.len() / block_size;
     Ok(CompiledCreateSelinuxTransaction {
         map: editor.map,
@@ -215,8 +217,8 @@ fn inode_record_location(
     let table_block = table_start
         .checked_add(byte_offset / block_size)
         .ok_or(Ext4Error::ArithmeticOverflow)?;
-    let offset = usize::try_from(byte_offset % block_size)
-        .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+    let offset =
+        usize::try_from(byte_offset % block_size).map_err(|_| Ext4Error::ArithmeticOverflow)?;
     let end = offset
         .checked_add(usize::from(image.superblock.inode_size))
         .ok_or(Ext4Error::ArithmeticOverflow)?;
@@ -266,12 +268,13 @@ fn write_empty_ibody_selinux_xattr(raw_inode: &mut [u8], value: &[u8]) -> Result
     let terminator_end = entry_end
         .checked_add(XATTR_END_MARKER)
         .ok_or(Ext4Error::ArithmeticOverflow)?;
-    let value_unaligned = raw_inode
-        .len()
-        .checked_sub(value.len())
-        .ok_or(Ext4Error::UnsupportedInodeFeature(
-            "security.selinux value exceeds inode xattr space",
-        ))?;
+    let value_unaligned =
+        raw_inode
+            .len()
+            .checked_sub(value.len())
+            .ok_or(Ext4Error::UnsupportedInodeFeature(
+                "security.selinux value exceeds inode xattr space",
+            ))?;
     let value_start = value_unaligned & !3_usize;
     if value_start < terminator_end || value_start < first_entry {
         return Err(Ext4Error::UnsupportedInodeFeature(

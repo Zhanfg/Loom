@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod stage7_command;
+
 use loom_ext4::{
     compile_create_file, compile_grow_with_block_allocation, compile_remove_file,
     compile_resize_within_allocation, compile_same_size_replacement, compile_selinux_xattr,
@@ -35,6 +37,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "ext4-create" => command_ext4_create(&mut args)?,
         "ext4-remove" => command_ext4_remove(&mut args)?,
         "ext4-selinux" => command_ext4_selinux(&mut args)?,
+        "ext4-create-selinux" => stage7_command::command(&mut args)?,
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command {other:?}").into()),
     }
