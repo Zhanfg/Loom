@@ -2,8 +2,8 @@
 
 use super::checksum::{crc32c, rewrite_inode_checksum};
 use super::{
-    read_exact_at, read_u32, Ext4Error, Ext4Image, Inode, INODE_INLINE_DATA_FL,
-    INODE_VERITY_FL, MODE_REGULAR, SECTOR_SIZE, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
+    read_exact_at, read_u32, Ext4Error, Ext4Image, Inode, INODE_INLINE_DATA_FL, INODE_VERITY_FL,
+    MODE_REGULAR, SECTOR_SIZE, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
 use loom_map::{LoomMap, ReplacementExtent};
 use loom_types::{Sector, SectorCount};
@@ -158,12 +158,8 @@ impl Ext4Image {
 
         for (file_block_index, physical_block) in blocks.iter().copied().enumerate() {
             let origin_block = self.read_block(physical_block)?;
-            let effective_block = materialize_file_block(
-                &origin_block,
-                replacement,
-                file_block_index,
-                block_size,
-            )?;
+            let effective_block =
+                materialize_file_block(&origin_block, replacement, file_block_index, block_size)?;
             if effective_block == origin_block {
                 continue;
             }
