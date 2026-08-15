@@ -1,0 +1,28 @@
+name: stage7-format
+
+on:
+  push:
+    branches:
+      - feat/stage7-ext4-transactions
+
+permissions:
+  contents: write
+
+jobs:
+  format:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage7-ext4-transactions
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add .
+          git commit -m 'style: apply rustfmt to Stage 7 transaction compiler'
+          git push origin HEAD:feat/stage7-ext4-transactions
