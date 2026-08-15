@@ -1,0 +1,77 @@
+name: stage4-ownership-fix
+
+on:
+  push:
+    branches:
+      - feat/stage4-ext4-create-file
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage4-ext4-create-file
+      - name: Move descriptor accounting before ownership transfer
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/loom-ext4/src/create.rs')
+          s = p.read_text()
+          old = '''        Ok(GroupState {
+            group,
+            descriptor_block,
+            descriptor_offset,
+            descriptor_block_bytes,
+            descriptor,
+            block_bitmap_block,
+            inode_bitmap_block,
+            inode_table_block,
+            block_bitmap,
+            inode_bitmap,
+            free_blocks: descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?,
+            free_inodes: descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?,
+            itable_unused: descriptor_u32_count(
+                &descriptor,
+                GD_ITABLE_UNUSED_LO,
+                GD_ITABLE_UNUSED_HI,
+            )?,
+        })'''
+          new = '''        let free_blocks =
+            descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?;
+        let free_inodes =
+            descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?;
+        let itable_unused =
+            descriptor_u32_count(&descriptor, GD_ITABLE_UNUSED_LO, GD_ITABLE_UNUSED_HI)?;
+
+        Ok(GroupState {
+            group,
+            descriptor_block,
+            descriptor_offset,
+            descriptor_block_bytes,
+            descriptor,
+            block_bitmap_block,
+            inode_bitmap_block,
+            inode_table_block,
+            block_bitmap,
+            inode_bitmap,
+            free_blocks,
+            free_inodes,
+            itable_unused,
+        })'''
+          if old not in s:
+              raise SystemExit('expected GroupState constructor not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          cargo fmt --all
+      - name: Commit fix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/loom-ext4/src/create.rs
+          git commit -m 'fix(ext4): compute Stage 4 descriptor counts before move'
+          git push origin HEAD:feat/stage4-ext4-create-file
