@@ -138,7 +138,7 @@ pub fn compile_create_file(
 
 impl Ext4Image {
     #[allow(clippy::too_many_lines)] // explicit one-generation ext4 metadata transaction
-    fn compile_create_file(
+    pub(crate) fn compile_create_file(
         &mut self,
         target_path: &str,
         payload: &[u8],

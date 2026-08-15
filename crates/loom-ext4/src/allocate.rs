@@ -110,7 +110,7 @@ pub fn compile_grow_with_block_allocation(
 
 impl Ext4Image {
     #[allow(clippy::too_many_lines)] // transaction orchestration; helpers own the individual mutations
-    fn compile_one_block_growth(
+    pub(crate) fn compile_one_block_growth(
         &mut self,
         inode_number: u32,
         replacement: &[u8],

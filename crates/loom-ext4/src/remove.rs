@@ -115,7 +115,10 @@ pub fn compile_remove_file(
 
 impl Ext4Image {
     #[allow(clippy::too_many_lines)] // one explicit immutable ext4 metadata transaction
-    fn compile_remove_file(&mut self, target_path: &str) -> Result<CompiledRemoveFile, Ext4Error> {
+    pub(crate) fn compile_remove_file(
+        &mut self,
+        target_path: &str,
+    ) -> Result<CompiledRemoveFile, Ext4Error> {
         let (parent_path, name) = split_parent(target_path)?;
         let inode_number = self.resolve_path(target_path)?;
         let target_inode = self.read_inode(inode_number)?;

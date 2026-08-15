@@ -65,7 +65,7 @@ pub fn compile_resize_within_allocation(
 }
 
 impl Ext4Image {
-    fn compile_resize(
+    pub(crate) fn compile_resize(
         &mut self,
         inode_number: u32,
         replacement: &[u8],

@@ -99,10 +99,12 @@ impl Ext4Image {
                     "inode record crosses inode-table filesystem block",
                 ))?;
 
-        verify_inode_checksum(raw_inode, checksum_seed, inode_number).map_err(Ext4Error::Checksum)?;
+        verify_inode_checksum(raw_inode, checksum_seed, inode_number)
+            .map_err(Ext4Error::Checksum)?;
         reject_external_xattr(raw_inode, self.superblock.has_64bit)?;
         write_empty_ibody_selinux_xattr(raw_inode, value)?;
-        rewrite_inode_checksum(raw_inode, checksum_seed, inode_number).map_err(Ext4Error::Checksum)?;
+        rewrite_inode_checksum(raw_inode, checksum_seed, inode_number)
+            .map_err(Ext4Error::Checksum)?;
 
         let sectors_per_block = u64::from(self.superblock.block_size) / SECTOR_SIZE;
         let shadow = table_shadow;
@@ -114,11 +116,9 @@ impl Ext4Image {
             sector_count: SectorCount(sectors_per_block),
             shadow_start: Sector(0),
         };
-        let map = LoomMap::from_replacements(
-            SectorCount(self.image_bytes / SECTOR_SIZE),
-            &[replacement],
-        )
-        .map_err(Ext4Error::Map)?;
+        let map =
+            LoomMap::from_replacements(SectorCount(self.image_bytes / SECTOR_SIZE), &[replacement])
+                .map_err(Ext4Error::Map)?;
 
         Ok(CompiledSelinuxXattr {
             map,
