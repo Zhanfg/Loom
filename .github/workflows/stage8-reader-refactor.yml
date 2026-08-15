@@ -16,50 +16,8 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: feat/stage8-sparse-overlay-workspace
-      - name: Generalize ext4 image input
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          lib = Path('crates/loom-ext4/src/lib.rs')
-          s = lib.read_text()
-
-          marker = '''#[derive(Debug)]
-pub struct CompiledReplacement {'''
-          insertion = '''/// Seekable read source consumed by the ext4 compiler.\npub trait ImageReader: Read + Seek {}\n\nimpl<T: Read + Seek> ImageReader for T {}\n\n/// One compiler session over an arbitrary immutable effective-image reader.\npub struct Ext4Session {\n    image: Ext4Image,\n}\n\nimpl Ext4Session {\n    /// Opens an ext4 compiler session over a virtual image reader.\n    ///\n    /// # Errors\n    /// Returns [`Ext4Error`] when the supplied image is malformed or unsupported.\n    pub fn from_reader<R>(reader: R, image_bytes: u64) -> Result<Self, Ext4Error>\n    where\n        R: ImageReader + 'static,\n    {\n        Ok(Self {\n            image: Ext4Image::from_reader(Box::new(reader), image_bytes)?,\n        })\n    }\n\n    /// Compiles a same-size replacement against the session's current effective view.\n    ///\n    /// # Errors\n    /// Returns [`Ext4Error`] when the path or replacement is invalid.\n    pub fn replace(\n        &mut self,\n        target_path: &str,\n        replacement: &[u8],\n    ) -> Result<CompiledReplacement, Ext4Error> {\n        let inode = self.image.resolve_path(target_path)?;\n        self.image.compile_regular_replacement(inode, replacement)\n    }\n\n    /// Compiles a within-allocation resize against the current effective view.\n    ///\n    /// # Errors\n    /// Returns [`Ext4Error`] when the resize violates ext4 Stage 2 invariants.\n    pub fn resize(\n        &mut self,\n        target_path: &str,\n        replacement: &[u8],\n    ) -> Result<CompiledResize, Ext4Error> {\n        let inode = self.image.resolve_path(target_path)?;\n        self.image.compile_resize(inode, replacement)\n    }\n\n    /// Compiles one-block growth against the current effective view.\n    ///\n    /// # Errors\n    /// Returns [`Ext4Error`] when allocator or extent invariants are not satisfied.\n    pub fn grow(\n        &mut self,\n        target_path: &str,\n        replacement: &[u8],\n    ) -> Result<CompiledAllocationGrow, Ext4Error> {\n        let inode = self.image.resolve_path(target_path)?;\n        self.image.compile_one_block_growth(inode, replacement)\n    }\n\n    /// Compiles creation of one regular file against the current effective view.\n    ///\n    /// # Errors\n    /// Returns [`Ext4Error`] when allocation or directory invariants are not satisfied.\n    pub fn create(\n        &mut self,\n        target_path: &str,\n        payload: &[u8],\n    ) -> Result<CompiledCreateFile, Ext4Error> {\n        self.image.compile_create_file(target_path, payload)\n    }\n\n    /// Compiles removal of one regular file from the current effective view.\n    ///\n    /// # Errors\n    /// Returns [`Ext4Error`] when removal invariants are not satisfied.\n    pub fn remove(&mut self, target_path: &str) -> Result<CompiledRemoveFile, Ext4Error> {\n        self.image.compile_remove_file(target_path)\n    }\n\n    /// Compiles an in-inode `security.selinux` xattr against the current effective view.\n    ///\n    /// # Errors\n    /// Returns [`Ext4Error`] when the xattr cannot be represented safely.\n    pub fn selinux(\n        &mut self,\n        target_path: &str,\n        value: &[u8],\n    ) -> Result<CompiledSelinuxXattr, Ext4Error> {\n        self.image.compile_selinux_xattr_bytes(target_path, value)\n    }\n}\n\n#[derive(Debug)]\npub struct CompiledReplacement {'''
-          if insertion not in s:
-              if marker not in s:
-                  raise SystemExit('CompiledReplacement marker not found')
-              s = s.replace(marker, insertion, 1)
-
-          s = s.replace('''struct Ext4Image {\n    file: File,''', '''struct Ext4Image {\n    file: Box<dyn ImageReader>,''', 1)
-
-          old_open = '''    fn open(path: &Path) -> Result<Self, Ext4Error> {\n        let mut file = File::open(path).map_err(Ext4Error::Io)?;\n        let image_bytes = file.metadata().map_err(Ext4Error::Io)?.len();\n        if image_bytes % SECTOR_SIZE != 0 {\n            return Err(Ext4Error::InvalidFilesystem(\n                "origin size is not a multiple of 512 bytes",\n            ));\n        }\n\n        let mut bytes = [0_u8; SUPERBLOCK_SIZE];\n        read_exact_at(&mut file, SUPERBLOCK_OFFSET, &mut bytes)?;\n        let superblock = Superblock::parse(&bytes)?;\n        let fs_bytes = superblock\n            .blocks_count\n            .checked_mul(u64::from(superblock.block_size))\n            .ok_or(Ext4Error::ArithmeticOverflow)?;\n        if fs_bytes > image_bytes {\n            return Err(Ext4Error::InvalidFilesystem(\n                "filesystem block count exceeds origin size",\n            ));\n        }\n\n        Ok(Self {\n            file,\n            image_bytes,\n            superblock,\n        })\n    }\n'''
-          new_open = '''    fn open(path: &Path) -> Result<Self, Ext4Error> {\n        let file = File::open(path).map_err(Ext4Error::Io)?;\n        let image_bytes = file.metadata().map_err(Ext4Error::Io)?.len();\n        Self::from_reader(Box::new(file), image_bytes)\n    }\n\n    fn from_reader(\n        mut file: Box<dyn ImageReader>,\n        image_bytes: u64,\n    ) -> Result<Self, Ext4Error> {\n        if image_bytes % SECTOR_SIZE != 0 {\n            return Err(Ext4Error::InvalidFilesystem(\n                "origin size is not a multiple of 512 bytes",\n            ));\n        }\n\n        let mut bytes = [0_u8; SUPERBLOCK_SIZE];\n        read_exact_at(&mut file, SUPERBLOCK_OFFSET, &mut bytes)?;\n        let superblock = Superblock::parse(&bytes)?;\n        let fs_bytes = superblock\n            .blocks_count\n            .checked_mul(u64::from(superblock.block_size))\n            .ok_or(Ext4Error::ArithmeticOverflow)?;\n        if fs_bytes > image_bytes {\n            return Err(Ext4Error::InvalidFilesystem(\n                "filesystem block count exceeds origin size",\n            ));\n        }\n\n        Ok(Self {\n            file,\n            image_bytes,\n            superblock,\n        })\n    }\n'''
-          if old_open not in s:
-              raise SystemExit('Ext4Image::open block not found')
-          s = s.replace(old_open, new_open, 1)
-
-          old_read = 'fn read_exact_at(file: &mut File, offset: u64, buffer: &mut [u8]) -> Result<(), Ext4Error> {'
-          new_read = 'fn read_exact_at<R: Read + Seek + ?Sized>(file: &mut R, offset: u64, buffer: &mut [u8]) -> Result<(), Ext4Error> {'
-          if old_read not in s:
-              raise SystemExit('read_exact_at signature not found')
-          s = s.replace(old_read, new_read, 1)
-          lib.write_text(s)
-
-          method_changes = {
-              'crates/loom-ext4/src/allocate.rs': ('    fn compile_one_block_growth(\n', '    pub(crate) fn compile_one_block_growth(\n'),
-              'crates/loom-ext4/src/resize.rs': ('    fn compile_resize(\n', '    pub(crate) fn compile_resize(\n'),
-              'crates/loom-ext4/src/create.rs': ('    fn compile_create_file(\n', '    pub(crate) fn compile_create_file(\n'),
-              'crates/loom-ext4/src/remove.rs': ('    fn compile_remove_file(\n', '    pub(crate) fn compile_remove_file(\n'),
-          }
-          for file_name, (old, new) in method_changes.items():
-              p = Path(file_name)
-              text = p.read_text()
-              if old not in text:
-                  raise SystemExit(f'method marker not found in {file_name}')
-              p.write_text(text.replace(old, new, 1))
-          PY
+      - name: Apply source refactor
+        run: python3 scripts/stage8_reader_refactor.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
