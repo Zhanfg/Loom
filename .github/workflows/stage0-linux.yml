@@ -1,4 +1,4 @@
-name: stage0-linux
+name: stage-linux
 
 on:
   push:
@@ -42,3 +42,18 @@ jobs:
 
       - name: Stage 0 ext4 sparse substitution
         run: bash tests/integration/stage0_ext4_dm_linear.sh
+
+      - name: Stage 1 ext4 path compiler
+        run: bash tests/integration/stage1_ext4_compiler.sh
+
+      - name: Stage 1 partial final block
+        run: bash tests/integration/stage1_ext4_partial_block.sh
+
+      - name: Stage 1.1 ext4 block-size matrix
+        run: bash tests/integration/stage1_ext4_block_sizes.sh
+
+      - name: Stage 1.1 sparse block delta
+        run: bash tests/integration/stage1_ext4_block_delta.sh
+
+      - name: Stage 1.1 sparse-file rejection
+        run: bash tests/integration/stage1_ext4_sparse_reject.sh

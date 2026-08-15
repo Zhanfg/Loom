@@ -1,18 +1,12 @@
 [package]
-name = "loom-cli"
+name = "loom-ext4"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[[bin]]
-name = "loom"
-path = "src/main.rs"
-
 [dependencies]
-loom-ext4 = { path = "../loom-ext4" }
 loom-map = { path = "../loom-map" }
-loom-pack = { path = "../loom-pack" }
 loom-types = { path = "../loom-types" }
 
 [lints]

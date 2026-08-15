@@ -23,6 +23,10 @@ pub struct Extent {
 }
 
 impl Extent {
+    /// Returns the exclusive logical end sector.
+    ///
+    /// # Errors
+    /// Returns [`ExtentError::Overflow`] if the extent end cannot be represented.
     pub fn logical_end(self) -> Result<Sector, ExtentError> {
         self.logical_start
             .0
@@ -31,6 +35,10 @@ impl Extent {
             .ok_or(ExtentError::Overflow)
     }
 
+    /// Returns the exclusive backing-source end sector.
+    ///
+    /// # Errors
+    /// Returns [`ExtentError::Overflow`] if the source end cannot be represented.
     pub fn source_end(self) -> Result<Sector, ExtentError> {
         self.source_start
             .0
@@ -39,6 +47,10 @@ impl Extent {
             .ok_or(ExtentError::Overflow)
     }
 
+    /// Validates extent length and checked address arithmetic.
+    ///
+    /// # Errors
+    /// Returns [`ExtentError`] for zero-length extents or arithmetic overflow.
     pub fn validate(self) -> Result<(), ExtentError> {
         if self.sector_count.0 == 0 {
             return Err(ExtentError::ZeroLength);
