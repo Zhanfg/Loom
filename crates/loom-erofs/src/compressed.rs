@@ -53,14 +53,13 @@ struct Superblock {
     block_size: u32,
     root_nid: u64,
     meta_block: u64,
-    feature_incompat: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct Inode {
     nid: u64,
-    inode_offset: u64,
-    inode_size: u64,
+    offset: u64,
+    isize: u64,
     xattr_size: u64,
     mode: u16,
     size: u64,
@@ -76,7 +75,7 @@ impl Inode {
 
 struct Image {
     file: File,
-    image_bytes: u64,
+    bytes: u64,
     sb: Superblock,
 }
 
@@ -160,7 +159,7 @@ impl Image {
         let sb = read_superblock(&mut file, image_bytes)?;
         Ok(Self {
             file,
-            image_bytes,
+            bytes: image_bytes,
             sb,
         })
     }
@@ -177,7 +176,7 @@ impl Image {
                     .ok_or(CompressedError::ArithmeticOverflow)?,
             )
             .ok_or(CompressedError::ArithmeticOverflow)?;
-        ensure_range(self.image_bytes, inode_offset, 32)?;
+        ensure_range(self.bytes, inode_offset, 32)?;
         let mut compact = [0_u8; 32];
         read_exact_at(&mut self.file, inode_offset, &mut compact)?;
         let format = read_u16(&compact, 0)?;
@@ -199,7 +198,7 @@ impl Image {
         let xattr_size = xattr_ibody_size(xattr_icount)?;
         let mode = read_u16(&compact, 4)?;
         let size = if extended {
-            ensure_range(self.image_bytes, inode_offset, 64)?;
+            ensure_range(self.bytes, inode_offset, 64)?;
             let mut raw = [0_u8; 64];
             read_exact_at(&mut self.file, inode_offset, &mut raw)?;
             read_u64(&raw, 8)?
@@ -208,8 +207,8 @@ impl Image {
         };
         Ok(Inode {
             nid,
-            inode_offset,
-            inode_size,
+            offset: inode_offset,
+            isize: inode_size,
             xattr_size,
             mode,
             size,
@@ -288,12 +287,12 @@ impl Image {
         }
 
         let body_end = inode
-            .inode_offset
-            .checked_add(inode.inode_size)
+            .offset
+            .checked_add(inode.isize)
             .and_then(|value| value.checked_add(inode.xattr_size))
             .ok_or(CompressedError::ArithmeticOverflow)?;
         let header_offset = align8(body_end)?;
-        ensure_range(self.image_bytes, header_offset, MAP_HEADER_SIZE)?;
+        ensure_range(self.bytes, header_offset, MAP_HEADER_SIZE)?;
         let mut header = [0_u8; 8];
         read_exact_at(&mut self.file, header_offset, &mut header)?;
         let advise = read_u16(&header, 4)?;
@@ -319,7 +318,7 @@ impl Image {
             .and_then(|value| value.checked_add(FULL_INDEX_GAP))
             .ok_or(CompressedError::ArithmeticOverflow)?;
         ensure_range(
-            self.image_bytes,
+            self.bytes,
             index_offset,
             u64::try_from(FULL_INDEX_SIZE).map_err(|_| CompressedError::ArithmeticOverflow)?,
         )?;
@@ -340,7 +339,7 @@ impl Image {
             ));
         }
         let pcluster = u64::from(read_u32(&index, 4)?);
-        if pcluster >= self.image_bytes / u64::from(self.sb.block_size) {
+        if pcluster >= self.bytes / u64::from(self.sb.block_size) {
             return Err(CompressedError::InvalidFilesystem(
                 "compressed pcluster lies beyond image",
             ));
@@ -361,7 +360,7 @@ impl Image {
         let offset = block
             .checked_mul(block_size)
             .ok_or(CompressedError::ArithmeticOverflow)?;
-        ensure_range(self.image_bytes, offset, block_size)?;
+        ensure_range(self.bytes, offset, block_size)?;
         let mut bytes = vec![
             0_u8;
             usize::try_from(block_size)
@@ -404,7 +403,6 @@ fn read_superblock(file: &mut File, image_bytes: u64) -> Result<Superblock, Comp
         block_size,
         root_nid: u64::from(read_u16(&raw, 0x0e)?),
         meta_block: u64::from(read_u32(&raw, 0x28)?),
-        feature_incompat,
     })
 }
 
