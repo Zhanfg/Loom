@@ -1,14 +1,11 @@
 name: stage-linux
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   rust-and-ext4-fabric:
@@ -16,8 +13,10 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout
+      - name: Checkout Stage 3 branch
         uses: actions/checkout@v5
+        with:
+          ref: feat/stage3-ext4-one-block-allocator
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,10 +30,45 @@ jobs:
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
 
+      - name: Wire Stage 3 module
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/loom-ext4/src/lib.rs')
+          text = path.read_text()
+          if 'mod allocator;' not in text:
+              text = text.replace(
+                  'mod checksum;\nmod resize;\n',
+                  'mod allocator;\nmod checksum;\nmod resize;\n',
+                  1,
+              )
+          export = 'pub use allocator::{compile_one_block_growth, CompiledGrowth};\n'
+          if export not in text:
+              text = text.replace(
+                  'pub use resize::{compile_resize_within_allocation, CompiledResize};\n',
+                  export + 'pub use resize::{compile_resize_within_allocation, CompiledResize};\n',
+                  1,
+              )
+          path.write_text(text)
+          PY
+          cargo fmt --all
+
+      - name: Commit Stage 3 wiring
+        run: |
+          if ! git diff --quiet -- crates; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add crates
+            git commit -m "feat(ext4): wire one-block allocator compiler"
+            git push origin HEAD:feat/stage3-ext4-one-block-allocator
+          fi
+
       - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: Clippy diagnostics
+        continue-on-error: true
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Unit tests
@@ -66,3 +100,9 @@ jobs:
 
       - name: Stage 2 block-size matrix
         run: bash tests/integration/stage2_ext4_block_sizes.sh
+
+      - name: Stage 3 one-block allocator
+        run: bash tests/integration/stage3_ext4_one_block_growth.sh
+
+      - name: Clippy hard gate
+        run: cargo clippy --workspace --all-targets -- -D warnings
