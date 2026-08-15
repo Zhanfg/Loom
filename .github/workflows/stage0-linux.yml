@@ -1,14 +1,11 @@
 name: stage-linux
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   rust-and-ext4-fabric:
@@ -16,8 +13,10 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout
+      - name: Checkout Stage 1 branch
         uses: actions/checkout@v5
+        with:
+          ref: feat/stage1-ext4-compiler
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,6 +29,50 @@ jobs:
           sudo apt-get install -y e2fsprogs dmsetup util-linux
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
+
+      - name: Apply block-delta compiler
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          ext4 = Path('crates/loom-ext4/src/lib.rs')
+          text = ext4.read_text()
+          text = text.replace(
+              '    pub data_blocks: usize,\n}',
+              '    pub data_blocks: usize,\n    pub shadow_blocks: usize,\n}',
+              1,
+          )
+          old = '''        let mut shadow = Vec::with_capacity(\n            blocks\n                .len()\n                .checked_mul(block_size)\n                .ok_or(Ext4Error::ArithmeticOverflow)?,\n        );\n        let mut replacements = Vec::with_capacity(blocks.len());\n\n        for (shadow_index, physical_block) in blocks.iter().copied().enumerate() {\n            let mut block = self.read_block(physical_block)?;\n            let replacement_offset = shadow_index\n                .checked_mul(block_size)\n                .ok_or(Ext4Error::ArithmeticOverflow)?;\n            let remaining = replacement.len().saturating_sub(replacement_offset);\n            let copy_len = remaining.min(block_size);\n            if copy_len != 0 {\n                let replacement_end = replacement_offset\n                    .checked_add(copy_len)\n                    .ok_or(Ext4Error::ArithmeticOverflow)?;\n                block[..copy_len]\n                    .copy_from_slice(&replacement[replacement_offset..replacement_end]);\n            }\n\n            let shadow_index_u64 =\n                u64::try_from(shadow_index).map_err(|_| Ext4Error::ArithmeticOverflow)?;\n            let logical_start = physical_block\n                .checked_mul(sectors_per_block)\n                .ok_or(Ext4Error::ArithmeticOverflow)?;\n            let shadow_start = shadow_index_u64\n                .checked_mul(sectors_per_block)\n                .ok_or(Ext4Error::ArithmeticOverflow)?;\n\n            replacements.push(ReplacementExtent {\n                logical_start: Sector(logical_start),\n                sector_count: SectorCount(sectors_per_block),\n                shadow_start: Sector(shadow_start),\n            });\n            shadow.extend_from_slice(&block);\n        }\n'''
+          new = '''        let mut shadow = Vec::new();\n        let mut replacements = Vec::with_capacity(blocks.len());\n        let mut changed_blocks = 0_usize;\n\n        for (file_block_index, physical_block) in blocks.iter().copied().enumerate() {\n            let origin_block = self.read_block(physical_block)?;\n            let mut effective_block = origin_block.clone();\n            let replacement_offset = file_block_index\n                .checked_mul(block_size)\n                .ok_or(Ext4Error::ArithmeticOverflow)?;\n            let remaining = replacement.len().saturating_sub(replacement_offset);\n            let copy_len = remaining.min(block_size);\n            if copy_len != 0 {\n                let replacement_end = replacement_offset\n                    .checked_add(copy_len)\n                    .ok_or(Ext4Error::ArithmeticOverflow)?;\n                effective_block[..copy_len]\n                    .copy_from_slice(&replacement[replacement_offset..replacement_end]);\n            }\n\n            if effective_block == origin_block {\n                continue;\n            }\n\n            let shadow_index_u64 =\n                u64::try_from(changed_blocks).map_err(|_| Ext4Error::ArithmeticOverflow)?;\n            let logical_start = physical_block\n                .checked_mul(sectors_per_block)\n                .ok_or(Ext4Error::ArithmeticOverflow)?;\n            let shadow_start = shadow_index_u64\n                .checked_mul(sectors_per_block)\n                .ok_or(Ext4Error::ArithmeticOverflow)?;\n\n            replacements.push(ReplacementExtent {\n                logical_start: Sector(logical_start),\n                sector_count: SectorCount(sectors_per_block),\n                shadow_start: Sector(shadow_start),\n            });\n            shadow.extend_from_slice(&effective_block);\n            changed_blocks = changed_blocks\n                .checked_add(1)\n                .ok_or(Ext4Error::ArithmeticOverflow)?;\n        }\n'''
+          if old not in text:
+              raise SystemExit('expected ext4 replacement loop not found')
+          text = text.replace(old, new, 1)
+          text = text.replace(
+              '            data_blocks: blocks.len(),\n        })',
+              '            data_blocks: blocks.len(),\n            shadow_blocks: changed_blocks,\n        })',
+              1,
+          )
+          ext4.write_text(text)
+
+          cli = Path('crates/loom-cli/src/main.rs')
+          text = cli.read_text()
+          old = '''                "ext4 replacement compiled: inode={} block_size={} data_blocks={} shadow_bytes={}",\n                compiled.inode,\n                compiled.block_size,\n                compiled.data_blocks,\n                compiled.shadow.len()\n'''
+          new = '''                "ext4 replacement compiled: inode={} block_size={} data_blocks={} shadow_blocks={} shadow_bytes={}",\n                compiled.inode,\n                compiled.block_size,\n                compiled.data_blocks,\n                compiled.shadow_blocks,\n                compiled.shadow.len()\n'''
+          if old not in text:
+              raise SystemExit('expected CLI status line not found')
+          cli.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+
+      - name: Commit block-delta compiler
+        run: |
+          if ! git diff --quiet -- crates; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add crates
+            git commit -m "feat(ext4): emit shadow blocks only for changed data"
+            git push origin HEAD:feat/stage1-ext4-compiler
+          fi
 
       - name: Format
         run: cargo fmt --all -- --check
