@@ -84,6 +84,15 @@ struct GroupDescriptorLocation {
     flags: u16,
 }
 
+struct InodeGrowthPlan<'a> {
+    inode_number: u32,
+    inode: &'a Inode,
+    old_block: u64,
+    new_block: u64,
+    checksum_seed: u32,
+    sectors_per_block: u64,
+}
+
 /// Grows a one-block ext4 regular file by exactly one newly allocated data block.
 ///
 /// Stage 3 keeps the pre-existing data block byte-for-byte identical and mutates
@@ -182,16 +191,15 @@ impl Ext4Image {
             new_data,
         )?;
 
-        self.append_growth_inode_shadow(
+        let inode_plan = InodeGrowthPlan {
             inode_number,
-            &inode,
-            blocks[0],
-            allocated_block,
-            geometry.checksum_seed,
+            inode: &inode,
+            old_block: blocks[0],
+            new_block: allocated_block,
+            checksum_seed: geometry.checksum_seed,
             sectors_per_block,
-            &mut shadow,
-            &mut replacements,
-        )?;
+        };
+        self.append_growth_inode_shadow(&inode_plan, &mut shadow, &mut replacements)?;
 
         self.update_block_bitmap_checksum_and_descriptor(
             descriptor,
@@ -213,20 +221,13 @@ impl Ext4Image {
         let map = LoomMap::from_replacements(SectorCount(total_sectors), &replacements)
             .map_err(Ext4Error::Map)?;
 
-        Ok(CompiledGrowth {
+        Ok(build_compiled_growth(
             map,
             shadow,
-            block_size: self.superblock.block_size,
-            inode: inode_number,
-            original_data_blocks: 1,
-            effective_data_blocks: 2,
-            new_data_blocks: 1,
-            existing_data_shadow_blocks: 0,
-            inode_metadata_blocks: 1,
-            allocator_metadata_blocks: 3,
-            shadow_blocks: 5,
+            self.superblock.block_size,
+            inode_number,
             allocated_block,
-        })
+        ))
     }
 
     fn allocation_geometry(&mut self) -> Result<AllocationGeometry, Ext4Error> {
@@ -345,16 +346,12 @@ impl Ext4Image {
 
     fn append_growth_inode_shadow(
         &mut self,
-        inode_number: u32,
-        inode: &Inode,
-        old_block: u64,
-        new_block: u64,
-        checksum_seed: u32,
-        sectors_per_block: u64,
+        plan: &InodeGrowthPlan<'_>,
         shadow: &mut Vec<u8>,
         replacements: &mut Vec<ReplacementExtent>,
     ) -> Result<(), Ext4Error> {
-        let (inode_table_block, inode_offset) = self.inode_record_location_stage3(inode_number)?;
+        let (inode_table_block, inode_offset) =
+            self.inode_record_location_stage3(plan.inode_number)?;
         let mut inode_table_shadow = self.read_block(inode_table_block)?;
         let inode_size = usize::from(self.superblock.inode_size);
         let inode_end = inode_offset
@@ -364,17 +361,22 @@ impl Ext4Image {
             .get_mut(inode_offset..inode_end)
             .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
 
-        update_extent_root_for_one_block(raw_inode, &inode.block, old_block, new_block)?;
+        update_extent_root_for_one_block(
+            raw_inode,
+            &plan.inode.block,
+            plan.old_block,
+            plan.new_block,
+        )?;
         write_u64_split(raw_inode, INODE_SIZE_LO, INODE_SIZE_HIGH, 8192)?;
-        increment_inode_blocks(raw_inode, sectors_per_block)?;
-        rewrite_inode_checksum(raw_inode, checksum_seed, inode_number)
+        increment_inode_blocks(raw_inode, plan.sectors_per_block)?;
+        rewrite_inode_checksum(raw_inode, plan.checksum_seed, plan.inode_number)
             .map_err(Ext4Error::Checksum)?;
 
         append_shadow_block(
             shadow,
             replacements,
             inode_table_block,
-            sectors_per_block,
+            plan.sectors_per_block,
             &inode_table_shadow,
         )
     }
@@ -448,7 +450,7 @@ impl Ext4Image {
             descriptor,
             GD_BLOCK_BITMAP_CSUM_LO,
             GD_BLOCK_BITMAP_CSUM_HI,
-            geometry.descriptor_size >= GD_BLOCK_BITMAP_CSUM_HI_END as u16,
+            usize::from(geometry.descriptor_size) >= GD_BLOCK_BITMAP_CSUM_HI_END,
             bitmap_checksum,
         )?;
         rewrite_group_descriptor_checksum(descriptor, location.group, geometry.checksum_seed)?;
@@ -486,6 +488,29 @@ impl Ext4Image {
         write_u32(raw_super, SUPER_CHECKSUM, checksum)?;
 
         append_shadow_block(shadow, replacements, super_block, sectors_per_block, &block)
+    }
+}
+
+fn build_compiled_growth(
+    map: LoomMap,
+    shadow: Vec<u8>,
+    block_size: u32,
+    inode: u32,
+    allocated_block: u64,
+) -> CompiledGrowth {
+    CompiledGrowth {
+        map,
+        shadow,
+        block_size,
+        inode,
+        original_data_blocks: 1,
+        effective_data_blocks: 2,
+        new_data_blocks: 1,
+        existing_data_shadow_blocks: 0,
+        inode_metadata_blocks: 1,
+        allocator_metadata_blocks: 3,
+        shadow_blocks: 5,
+        allocated_block,
     }
 }
 
