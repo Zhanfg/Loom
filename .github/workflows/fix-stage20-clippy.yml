@@ -71,6 +71,18 @@ jobs:
                   raise SystemExit(f'{name}: truncating test cast fragment missing')
               s = s.replace(old, new, 1)
               p.write_text(s)
+
+          p = Path('crates/loom-cli/src/stage12_command.rs')
+          s = p.read_text()
+          if '    compiled: CompiledCompactSwap,\n' not in s:
+              raise SystemExit('stage12_command.rs write_compiled signature missing')
+          s = s.replace(
+              '    compiled: CompiledCompactSwap,\n',
+              '    compiled: &CompiledCompactSwap,\n',
+              1,
+          )
+          s = s.replace('    write_compiled(\n        compiled,\n', '    write_compiled(\n        &compiled,\n')
+          p.write_text(s)
           PY
       - name: Verify remediation
         run: |
