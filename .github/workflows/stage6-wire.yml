@@ -1,0 +1,32 @@
+name: stage6-wire
+
+on:
+  push:
+    branches:
+      - feat/stage6-ext4-selinux-xattr
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage6-ext4-selinux-xattr
+      - name: Wire xattr module
+        run: python3 -c "from pathlib import Path; p=Path('crates/loom-ext4/src/lib.rs'); s=p.read_text(); old='mod remove;\\nmod resize;'; new='mod remove;\\nmod resize;\\nmod xattr;'; assert old in s; s=s.replace(old,new,1); old2='pub use remove::{compile_remove_file, CompiledRemoveFile};\\npub use resize::{compile_resize_within_allocation, CompiledResize};'; new2='pub use remove::{compile_remove_file, CompiledRemoveFile};\\npub use resize::{compile_resize_within_allocation, CompiledResize};\\npub use xattr::{compile_selinux_xattr, CompiledSelinuxXattr};'; assert old2 in s; p.write_text(s.replace(old2,new2,1))"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format and commit
+        run: |
+          cargo fmt --all
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/loom-ext4/src/lib.rs crates/loom-ext4/src/xattr.rs crates/loom-ext4/src/checksum.rs
+          git commit -m 'feat(ext4): wire Stage 6 SELinux xattr compiler'
+          git push origin HEAD:feat/stage6-ext4-selinux-xattr
