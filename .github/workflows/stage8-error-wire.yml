@@ -1,0 +1,29 @@
+name: stage8-error-wire
+on:
+  push:
+    branches: [feat/stage8-effective-block-store]
+permissions:
+  contents: write
+jobs:
+  wire:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage8-effective-block-store
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Add view error variant
+        run: |
+          python3 -c "from pathlib import Path; p=Path('crates/loom-ext4/src/lib.rs'); s=p.read_text(); a='    Checksum(checksum::ChecksumError),\\n'; s=s if '    View(loom_view::ViewError),\\n' in s else s.replace(a,a+'    View(loom_view::ViewError),\\n',1); a='            Self::Checksum(error) => write!(f, \"ext4 inode checksum error: {error}\"),\\n'; s=s if '            Self::View(error) => write!(f, \"Loom effective-view error: {error}\"),\\n' in s else s.replace(a,a+'            Self::View(error) => write!(f, \"Loom effective-view error: {error}\"),\\n',1); a='            Self::Checksum(error) => Some(error),\\n'; s=s if '            Self::View(error) => Some(error),\\n' in s else s.replace(a,a+'            Self::View(error) => Some(error),\\n',1); p.write_text(s)"
+          cargo fmt --all
+          cargo check --workspace
+      - name: Commit
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Cargo.lock crates/loom-ext4/src/lib.rs crates/loom-ext4/src/transaction.rs crates/loom-view
+          git commit -m 'feat(view): integrate generic effective block store'
+          git push origin HEAD:feat/stage8-effective-block-store
