@@ -402,9 +402,7 @@ impl Ext4Image {
         let end = offset
             .checked_add(usize::from(self.superblock.inode_size))
             .ok_or(Ext4Error::ArithmeticOverflow)?;
-        if end
-            > usize::try_from(block_size).map_err(|_| Ext4Error::ArithmeticOverflow)?
-        {
+        if end > usize::try_from(block_size).map_err(|_| Ext4Error::ArithmeticOverflow)? {
             return Err(Ext4Error::InvalidFilesystem(
                 "inode record crosses inode-table filesystem block",
             ));
@@ -487,13 +485,7 @@ impl Ext4Image {
         let checksum = crc32c(u32::MAX, &raw_super[..SUPER_CHECKSUM]);
         write_u32(raw_super, SUPER_CHECKSUM, checksum)?;
 
-        append_shadow_block(
-            shadow,
-            replacements,
-            super_block,
-            sectors_per_block,
-            &block,
-        )
+        append_shadow_block(shadow, replacements, super_block, sectors_per_block, &block)
     }
 }
 
@@ -514,7 +506,9 @@ fn validate_allocator_inode(inode_number: u32, inode: &Inode) -> Result<(), Ext4
         return Err(Ext4Error::UnsupportedInodeFeature("fs-verity"));
     }
     if inode.flags & INODE_HUGE_FILE_FL != 0 {
-        return Err(Ext4Error::UnsupportedInodeFeature("huge-file i_blocks encoding"));
+        return Err(Ext4Error::UnsupportedInodeFeature(
+            "huge-file i_blocks encoding",
+        ));
     }
     Ok(())
 }
@@ -529,8 +523,7 @@ fn block_group_for(
         .ok_or(Ext4Error::InvalidFilesystem(
             "data block precedes first_data_block",
         ))?;
-    u32::try_from(relative / u64::from(blocks_per_group))
-        .map_err(|_| Ext4Error::ArithmeticOverflow)
+    u32::try_from(relative / u64::from(blocks_per_group)).map_err(|_| Ext4Error::ArithmeticOverflow)
 }
 
 fn find_and_set_free_block(
@@ -587,9 +580,7 @@ fn update_extent_root_for_one_block(
             "inode extent root changed during compilation",
         ));
     }
-    if read_u16(root, 0)? != EXT4_EXTENT_MAGIC
-        || read_u16(root, 6)? != 0
-        || read_u16(root, 2)? != 1
+    if read_u16(root, 0)? != EXT4_EXTENT_MAGIC || read_u16(root, 6)? != 0 || read_u16(root, 2)? != 1
     {
         return Err(Ext4Error::UnsupportedInodeFeature(
             "Stage 3 requires one depth-0 extent",
@@ -677,11 +668,9 @@ fn decrement_group_free_blocks(descriptor: &mut [u8], has_64bit: bool) -> Result
         0
     };
     let current = (high << 16) | low;
-    let updated = current
-        .checked_sub(1)
-        .ok_or(Ext4Error::InvalidFilesystem(
-            "group free-block count underflow",
-        ))?;
+    let updated = current.checked_sub(1).ok_or(Ext4Error::InvalidFilesystem(
+        "group free-block count underflow",
+    ))?;
     let bytes = updated.to_le_bytes();
     write_u16(
         descriptor,
@@ -706,11 +695,9 @@ fn decrement_super_free_blocks(raw_super: &mut [u8], has_64bit: bool) -> Result<
         0
     };
     let current = (high << 32) | low;
-    let updated = current
-        .checked_sub(1)
-        .ok_or(Ext4Error::InvalidFilesystem(
-            "superblock free-block count underflow",
-        ))?;
+    let updated = current.checked_sub(1).ok_or(Ext4Error::InvalidFilesystem(
+        "superblock free-block count underflow",
+    ))?;
     let bytes = updated.to_le_bytes();
     write_u32(
         raw_super,
@@ -751,11 +738,7 @@ fn write_checksum_low_high(
     checksum: u32,
 ) -> Result<(), Ext4Error> {
     let bytes = checksum.to_le_bytes();
-    write_u16(
-        target,
-        low_offset,
-        u16::from_le_bytes([bytes[0], bytes[1]]),
-    )?;
+    write_u16(target, low_offset, u16::from_le_bytes([bytes[0], bytes[1]]))?;
     if has_high {
         write_u16(
             target,
