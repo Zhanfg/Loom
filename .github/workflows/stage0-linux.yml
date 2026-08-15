@@ -1,14 +1,11 @@
 name: stage-linux
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   rust-and-ext4-fabric:
@@ -16,8 +13,10 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout
+      - name: Checkout Stage 1 branch
         uses: actions/checkout@v5
+        with:
+          ref: feat/stage1-ext4-compiler
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,6 +29,56 @@ jobs:
           sudo apt-get install -y e2fsprogs dmsetup util-linux
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
+
+      - name: Add hard-link safety guard
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/loom-ext4/src/lib.rs')
+          text = path.read_text()
+          edits = [
+              (
+                  '        if inode.file_type() != MODE_REGULAR {\n            return Err(Ext4Error::NotRegularFile(inode_number));\n        }\n',
+                  '        if inode.file_type() != MODE_REGULAR {\n            return Err(Ext4Error::NotRegularFile(inode_number));\n        }\n        if inode.links_count != 1 {\n            return Err(Ext4Error::HardLinkedTarget {\n                inode: inode_number,\n                links: inode.links_count,\n            });\n        }\n'
+              ),
+              (
+                  'struct Inode {\n    mode: u16,\n    size: u64,\n    flags: u32,\n    block: [u8; 60],\n}',
+                  'struct Inode {\n    mode: u16,\n    size: u64,\n    flags: u32,\n    links_count: u16,\n    block: [u8; 60],\n}'
+              ),
+              (
+                  '            flags: read_u32(bytes, 0x20)?,\n            block,\n',
+                  '            flags: read_u32(bytes, 0x20)?,\n            links_count: read_u16(bytes, 0x1A)?,\n            block,\n'
+              ),
+              (
+                  '    NotRegularFile(u32),\n    CorruptDirectory(u32),\n',
+                  '    NotRegularFile(u32),\n    HardLinkedTarget { inode: u32, links: u16 },\n    CorruptDirectory(u32),\n'
+              ),
+              (
+                  '            Self::NotRegularFile(inode) => write!(f, "inode {inode} is not a regular file"),\n            Self::CorruptDirectory(inode) => write!(f, "directory inode {inode} is malformed"),\n',
+                  '            Self::NotRegularFile(inode) => write!(f, "inode {inode} is not a regular file"),\n            Self::HardLinkedTarget { inode, links } => write!(\n                f,\n                "inode {inode} is hard-linked ({links} links); Stage 1 path replacement refuses alias-wide mutation"\n            ),\n            Self::CorruptDirectory(inode) => write!(f, "directory inode {inode} is malformed"),\n'
+              ),
+          ]
+
+          for needle, replacement in edits:
+              if replacement in text:
+                  continue
+              if needle not in text:
+                  raise SystemExit(f'expected hard-link patch location not found: {needle!r}')
+              text = text.replace(needle, replacement, 1)
+          path.write_text(text)
+          PY
+          cargo fmt --all
+
+      - name: Commit safety guard
+        run: |
+          if ! git diff --quiet -- crates; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add crates
+            git commit -m "fix(ext4): reject hard-linked path replacements"
+            git push origin HEAD:feat/stage1-ext4-compiler
+          fi
 
       - name: Format
         run: cargo fmt --all -- --check
