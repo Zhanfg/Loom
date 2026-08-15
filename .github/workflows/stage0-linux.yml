@@ -31,8 +31,16 @@ jobs:
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
 
-      - name: Format
-        run: cargo fmt --all -- --check
+      - name: Apply rustfmt
+        run: cargo fmt --all
+
+      - name: Upload rustfmt result
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage1-rustfmt-sources
+          path: crates
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -45,3 +53,6 @@ jobs:
 
       - name: Stage 1 ext4 path compiler
         run: bash tests/integration/stage1_ext4_compiler.sh
+
+      - name: Formatting gate
+        run: git diff --exit-code -- crates
