@@ -1,0 +1,13 @@
+[package]
+name = "loom-erofs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+loom-map = { path = "../loom-map" }
+loom-view = { path = "../loom-view" }
+
+[lints]
+workspace = true

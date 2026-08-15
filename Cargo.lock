@@ -6,10 +6,19 @@ version = 3
 name = "loom-cli"
 version = "0.1.0"
 dependencies = [
+ "loom-erofs",
  "loom-ext4",
  "loom-map",
  "loom-pack",
  "loom-types",
+]
+
+[[package]]
+name = "loom-erofs"
+version = "0.1.0"
+dependencies = [
+ "loom-map",
+ "loom-view",
 ]
 
 [[package]]

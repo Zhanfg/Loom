@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 jobs:
-  rust-and-ext4-fabric:
+  rust-and-filesystem-fabric:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -27,9 +27,10 @@ jobs:
       - name: Install Linux test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs dmsetup util-linux
+          sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
+          sudo modprobe erofs || true
 
       - name: Format
         run: cargo fmt --all -- --check
@@ -84,3 +85,6 @@ jobs:
 
       - name: Stage 7 effective-view transaction
         run: bash tests/integration/stage7_ext4_transaction_view.sh
+
+      - name: Stage 9 EROFS flat-plain weaving
+        run: bash tests/integration/stage9_erofs_flat_plain.sh
