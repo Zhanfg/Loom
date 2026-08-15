@@ -1,11 +1,14 @@
 name: stage-linux
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   rust-and-ext4-fabric:
@@ -13,10 +16,8 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout Stage 2 branch
+      - name: Checkout
         uses: actions/checkout@v5
-        with:
-          ref: feat/stage2-ext4-inode-resize
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,88 +31,10 @@ jobs:
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
 
-      - name: Wire Stage 2 into ext4 core
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          checksum = Path('crates/loom-ext4/src/checksum.rs')
-          text = checksum.read_text()
-          text = text.replace(
-              'pub(crate) enum ChecksumError {',
-              'pub enum ChecksumError {',
-              1,
-          )
-          checksum.write_text(text)
-
-          lib = Path('crates/loom-ext4/src/lib.rs')
-          text = lib.read_text()
-
-          edits = [
-              (
-                  '#![forbid(unsafe_code)]\n\n',
-                  '#![forbid(unsafe_code)]\n\nmod checksum;\nmod resize;\n\npub use resize::{compile_resize_within_allocation, CompiledResize};\n\n'
-              ),
-              (
-                  'const INCOMPAT_FLEX_BG: u32 = 0x0200;\n',
-                  'const INCOMPAT_FLEX_BG: u32 = 0x0200;\nconst INCOMPAT_CSUM_SEED: u32 = 0x2000;\n'
-              ),
-              (
-                  '    INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;\n',
-                  '    INCOMPAT_FILETYPE\n        | INCOMPAT_EXTENTS\n        | INCOMPAT_64BIT\n        | INCOMPAT_FLEX_BG\n        | INCOMPAT_CSUM_SEED;\n'
-              ),
-              (
-                  '        if inode_size < 128 || !inode_size.is_power_of_two() {\n            return Err(Ext4Error::InvalidFilesystem("invalid inode size"));\n        }\n',
-                  '        if inode_size < 128 || !inode_size.is_power_of_two() {\n            return Err(Ext4Error::InvalidFilesystem("invalid inode size"));\n        }\n        if u32::from(inode_size) > block_size {\n            return Err(Ext4Error::InvalidFilesystem(\n                "inode size exceeds filesystem block size",\n            ));\n        }\n'
-              ),
-              (
-                  '    Map(loom_map::MapError),\n',
-                  '    Map(loom_map::MapError),\n    Checksum(checksum::ChecksumError),\n'
-              ),
-              (
-                  '    ReplacementSizeMismatch { original: u64, replacement: u64 },\n',
-                  '    ReplacementSizeMismatch { original: u64, replacement: u64 },\n    ResizeSizeUnchanged(u64),\n    ResizeCrossesAllocationBoundary {\n        original_size: u64,\n        effective_size: u64,\n        allocated_blocks: u64,\n        required_blocks: u64,\n    },\n'
-              ),
-              (
-                  '            Self::Map(error) => write!(f, "Loom map error: {error}"),\n',
-                  '            Self::Map(error) => write!(f, "Loom map error: {error}"),\n            Self::Checksum(error) => write!(f, "ext4 inode checksum error: {error}"),\n'
-              ),
-              (
-                  '            Self::ReplacementSizeMismatch {\n                original,\n                replacement,\n            } => write!(\n                f,\n                "replacement size {replacement} does not match original size {original}"\n            ),\n',
-                  '            Self::ReplacementSizeMismatch {\n                original,\n                replacement,\n            } => write!(\n                f,\n                "replacement size {replacement} does not match original size {original}"\n            ),\n            Self::ResizeSizeUnchanged(size) => {\n                write!(f, "resize replacement keeps the existing size {size}")\n            }\n            Self::ResizeCrossesAllocationBoundary {\n                original_size,\n                effective_size,\n                allocated_blocks,\n                required_blocks,\n            } => write!(\n                f,\n                "Stage 2 resize {original_size} -> {effective_size} bytes changes the logical allocation boundary: allocated={allocated_blocks} required={required_blocks}"\n            ),\n'
-              ),
-              (
-                  '            Self::Map(error) => Some(error),\n',
-                  '            Self::Map(error) => Some(error),\n            Self::Checksum(error) => Some(error),\n'
-              ),
-          ]
-
-          for needle, replacement in edits:
-              if replacement in text:
-                  continue
-              if needle not in text:
-                  raise SystemExit(f'expected Stage 2 wiring point not found: {needle!r}')
-              text = text.replace(needle, replacement, 1)
-
-          lib.write_text(text)
-          PY
-          cargo fmt --all
-
-      - name: Commit Stage 2 wiring
-        run: |
-          if ! git diff --quiet -- crates; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add crates
-            git commit -m "feat(ext4): wire inode-resize metadata shadow"
-            git push origin HEAD:feat/stage2-ext4-inode-resize
-          fi
-
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        continue-on-error: true
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Unit tests
@@ -137,6 +60,3 @@ jobs:
 
       - name: Stage 2 inode resize
         run: bash tests/integration/stage2_ext4_inode_resize.sh
-
-      - name: Clippy hard gate
-        run: cargo clippy --workspace --all-targets -- -D warnings
