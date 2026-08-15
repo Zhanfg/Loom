@@ -56,8 +56,10 @@ for i in $(seq 1 40); do printf 'key_%02d=value_%02d\n' "$i" "$i" >> "$PAYLOAD";
 [[ "$(stat -c %s "$PAYLOAD")" -lt 4096 ]]
 
 debugfs -R 'stat /system/etc' "$STOCK" 2>/dev/null | grep -q 'Type: directory'
-if debugfs -R 'stat /system/etc/loom.conf' "$STOCK" 2>&1 | grep -qv 'File not found'; then
+STOCK_TARGET_STAT="$(debugfs -R 'stat /system/etc/loom.conf' "$STOCK" 2>&1 || true)"
+if ! grep -q 'File not found' <<<"$STOCK_TARGET_STAT"; then
   echo 'stock unexpectedly already contains target path' >&2
+  printf '%s\n' "$STOCK_TARGET_STAT" >&2
   exit 1
 fi
 
@@ -99,7 +101,8 @@ EFFECTIVE_FREE_INODES="$(sudo dumpe2fs -h "/dev/mapper/$MAPPER" 2>/dev/null | aw
 
 STOCK_HASH_AFTER="$(sha256sum "$STOCK" | awk '{print $1}')"
 [[ "$STOCK_HASH_BEFORE" == "$STOCK_HASH_AFTER" ]]
-debugfs -R 'stat /system/etc/loom.conf' "$STOCK" 2>&1 | grep -q 'File not found'
+STOCK_TARGET_AFTER="$(debugfs -R 'stat /system/etc/loom.conf' "$STOCK" 2>&1 || true)"
+grep -q 'File not found' <<<"$STOCK_TARGET_AFTER"
 
 printf '%s\n' \
   'Stage 4 ext4 create-file PASS' \
