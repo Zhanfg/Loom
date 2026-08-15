@@ -1,5 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod checksum;
+mod resize;
+
+pub use resize::{compile_resize_within_allocation, CompiledResize};
+
 use loom_map::{LoomMap, ReplacementExtent};
 use loom_types::{Sector, SectorCount};
 use std::fmt;
@@ -20,11 +25,12 @@ const INCOMPAT_META_BG: u32 = 0x0010;
 const INCOMPAT_EXTENTS: u32 = 0x0040;
 const INCOMPAT_64BIT: u32 = 0x0080;
 const INCOMPAT_FLEX_BG: u32 = 0x0200;
+const INCOMPAT_CSUM_SEED: u32 = 0x2000;
 const INCOMPAT_INLINE_DATA: u32 = 0x8000;
 const INCOMPAT_ENCRYPT: u32 = 0x1_0000;
 const INCOMPAT_CASEFOLD: u32 = 0x2_0000;
 const SUPPORTED_INCOMPAT: u32 =
-    INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG;
+    INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_64BIT | INCOMPAT_FLEX_BG | INCOMPAT_CSUM_SEED;
 
 const RO_COMPAT_BIGALLOC: u32 = 0x0200;
 const RO_COMPAT_ORPHAN_PRESENT: u32 = 0x1_0000;
@@ -547,6 +553,11 @@ impl Superblock {
         if inode_size < 128 || !inode_size.is_power_of_two() {
             return Err(Ext4Error::InvalidFilesystem("invalid inode size"));
         }
+        if u32::from(inode_size) > block_size {
+            return Err(Ext4Error::InvalidFilesystem(
+                "inode size exceeds filesystem block size",
+            ));
+        }
         let inodes_per_group = read_u32(bytes, 0x28)?;
         if inodes_per_group == 0 {
             return Err(Ext4Error::InvalidFilesystem(
@@ -676,6 +687,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, Ext4Error> {
 pub enum Ext4Error {
     Io(io::Error),
     Map(loom_map::MapError),
+    Checksum(checksum::ChecksumError),
     InvalidFilesystem(&'static str),
     UnsupportedFilesystemFeature(&'static str),
     UnknownIncompatibleFeatures(u32),
@@ -685,11 +697,24 @@ pub enum Ext4Error {
     InvalidInode(u32),
     NotDirectory(u32),
     NotRegularFile(u32),
-    HardLinkedTarget { inode: u32, links: u16 },
+    HardLinkedTarget {
+        inode: u32,
+        links: u16,
+    },
     CorruptDirectory(u32),
     CorruptExtentTree,
     SparseFileUnsupported,
-    ReplacementSizeMismatch { original: u64, replacement: u64 },
+    ReplacementSizeMismatch {
+        original: u64,
+        replacement: u64,
+    },
+    ResizeSizeUnchanged(u64),
+    ResizeCrossesAllocationBoundary {
+        original_size: u64,
+        effective_size: u64,
+        allocated_blocks: u64,
+        required_blocks: u64,
+    },
     UnexpectedEndOfStructure,
     ArithmeticOverflow,
 }
@@ -699,6 +724,7 @@ impl fmt::Display for Ext4Error {
         match self {
             Self::Io(error) => write!(f, "I/O error: {error}"),
             Self::Map(error) => write!(f, "Loom map error: {error}"),
+            Self::Checksum(error) => write!(f, "ext4 inode checksum error: {error}"),
             Self::InvalidFilesystem(reason) => write!(f, "invalid ext4 filesystem: {reason}"),
             Self::UnsupportedFilesystemFeature(feature) => {
                 write!(f, "unsupported ext4 filesystem feature: {feature}")
@@ -730,6 +756,18 @@ impl fmt::Display for Ext4Error {
                 f,
                 "replacement size {replacement} does not match original size {original}"
             ),
+            Self::ResizeSizeUnchanged(size) => {
+                write!(f, "resize replacement keeps the existing size {size}")
+            }
+            Self::ResizeCrossesAllocationBoundary {
+                original_size,
+                effective_size,
+                allocated_blocks,
+                required_blocks,
+            } => write!(
+                f,
+                "Stage 2 resize {original_size} -> {effective_size} bytes changes the logical allocation boundary: allocated={allocated_blocks} required={required_blocks}"
+            ),
             Self::UnexpectedEndOfStructure => write!(f, "unexpected end of ext4 structure"),
             Self::ArithmeticOverflow => write!(f, "integer overflow while parsing ext4"),
         }
@@ -741,6 +779,7 @@ impl std::error::Error for Ext4Error {
         match self {
             Self::Io(error) => Some(error),
             Self::Map(error) => Some(error),
+            Self::Checksum(error) => Some(error),
             _ => None,
         }
     }

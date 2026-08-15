@@ -104,7 +104,7 @@ fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<(), Checksum
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChecksumError {
+pub enum ChecksumError {
     InodeTooSmall(usize),
     InvalidExtraIsize(usize),
     OutOfBounds,
@@ -141,6 +141,9 @@ mod tests {
         let mut combined = Vec::new();
         combined.extend_from_slice(&ino.to_le_bytes());
         combined.extend_from_slice(&generation.to_le_bytes());
-        assert_eq!(inode_seed(fs_seed, ino, generation), crc32c(fs_seed, &combined));
+        assert_eq!(
+            inode_seed(fs_seed, ino, generation),
+            crc32c(fs_seed, &combined)
+        );
     }
 }
