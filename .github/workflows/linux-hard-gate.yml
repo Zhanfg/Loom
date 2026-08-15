@@ -37,38 +37,17 @@ jobs:
 
           def once(old, new):
               global text
-              assert text.count(old) == 1, old[:160]
+              assert text.count(old) == 1, old[:180]
               text = text.replace(old, new, 1)
 
           once(
-              block([
-                  '    pub(crate) head_lclusters: Vec<usize>,',
-                  '    pub(crate) encoded_bytes: Vec<usize>,',
-              ]),
-              block([
-                  '    pub(crate) head_lclusters: Vec<usize>,',
-                  '    pub(crate) head_cluster_offsets: Vec<usize>,',
-                  '    pub(crate) encoded_bytes: Vec<usize>,',
-              ]),
+              block(['    pub(crate) head_lclusters: Vec<usize>,', '    pub(crate) encoded_bytes: Vec<usize>,']),
+              block(['    pub(crate) head_lclusters: Vec<usize>,', '    pub(crate) head_cluster_offsets: Vec<usize>,', '    pub(crate) encoded_bytes: Vec<usize>,']),
           )
           once(
-              block([
-                  'struct Head {',
-                  '    lcn: usize,',
-                  '    pcluster: u64,',
-                  '    kind: u16,',
-                  '}',
-              ]),
-              block([
-                  'struct Head {',
-                  '    lcn: usize,',
-                  '    pcluster: u64,',
-                  '    kind: u16,',
-                  '    clusterofs: usize,',
-                  '}',
-              ]),
+              block(['struct Head {', '    lcn: usize,', '    pcluster: u64,', '    kind: u16,', '}']),
+              block(['struct Head {', '    lcn: usize,', '    pcluster: u64,', '    kind: u16,', '    clusterofs: usize,', '}']),
           )
-
           once(
               block([
                   '        let start = head',
@@ -92,101 +71,117 @@ jobs:
                   '        };',
               ]),
           )
-
           once(
               '            "zero-offset PLAIN extent must occupy one non-empty logical block",',
               '            "PLAIN extent must occupy one non-empty physical block",',
           )
 
+          old_compile_blocks = block([
+              '    let mut view = EffectiveBlockStore::open(origin_path, BLOCK_SIZE).map_err(CoreError::View)?;',
+              '    let mut origin_pclusters = Vec::with_capacity(topology.heads.len());',
+              '    let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());',
+              '    let mut head_lclusters = Vec::with_capacity(topology.heads.len());',
+          ])
+          new_compile_blocks = block([
+              '    let mut view = EffectiveBlockStore::open(origin_path, BLOCK_SIZE).map_err(CoreError::View)?;',
+              '    let mut origin_pclusters = Vec::with_capacity(topology.heads.len());',
+              '    let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());',
+              '    let mut head_lclusters = Vec::with_capacity(topology.heads.len());',
+              '    let mut head_cluster_offsets = Vec::with_capacity(topology.heads.len());',
+          ])
+          once(old_compile_blocks, new_compile_blocks)
           once(
-              block([
-                  '    let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());',
-                  '    let mut head_lclusters = Vec::with_capacity(topology.heads.len());',
-              ]),
-              block([
-                  '    let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());',
-                  '    let mut head_lclusters = Vec::with_capacity(topology.heads.len());',
-                  '    let mut head_cluster_offsets = Vec::with_capacity(topology.heads.len());',
-              ]),
-          )
-          once(
-              block([
-                  '        replacement_pclusters.push(replacement_head.pcluster);',
-                  '        head_lclusters.push(origin_head.lcn);',
-              ]),
-              block([
-                  '        replacement_pclusters.push(replacement_head.pcluster);',
-                  '        head_lclusters.push(origin_head.lcn);',
-                  '        head_cluster_offsets.push(origin_head.clusterofs);',
-              ]),
-          )
-          once(
-              block([
-                  '        replacement_pclusters,',
-                  '        head_lclusters,',
-                  '        encoded_bytes,',
-                  '        logical_lclusters: topology.logical_lclusters,',
-              ]),
-              block([
-                  '        replacement_pclusters,',
-                  '        head_lclusters,',
-                  '        head_cluster_offsets,',
-                  '        encoded_bytes,',
-                  '        logical_lclusters: topology.logical_lclusters,',
-              ]),
+              block(['        replacement_pclusters.push(replacement_head.pcluster);', '        head_lclusters.push(origin_head.lcn);']),
+              block(['        replacement_pclusters.push(replacement_head.pcluster);', '        head_lclusters.push(origin_head.lcn);', '        head_cluster_offsets.push(origin_head.clusterofs);']),
           )
 
-          # Big-pcluster extents always begin on lcluster boundaries in the currently
-          # supported bigpcl2 topology, so expose a parallel all-zero offset vector.
-          once(
-              block([
-                  '        replacement_pclusters,',
-                  '        head_lclusters,',
-                  '        encoded_bytes,',
-                  '        logical_lclusters: topology.logical_lclusters,',
-                  '        compact_2b_entries: topology.compact_2b_entries,',
-                  '        shadow_blocks: compiled.shadow_blocks,',
-                  '    })',
-                  '}',
-                  '',
-                  'fn validate_compatible_topology(',
-              ]),
-              block([
-                  '        replacement_pclusters,',
-                  '        head_cluster_offsets: vec![0; head_lclusters.len()],',
-                  '        head_lclusters,',
-                  '        encoded_bytes,',
-                  '        logical_lclusters: topology.logical_lclusters,',
-                  '        compact_2b_entries: topology.compact_2b_entries,',
-                  '        shadow_blocks: compiled.shadow_blocks,',
-                  '    })',
-                  '}',
-                  '',
-                  'fn validate_compatible_topology(',
-              ]),
-          )
+          old_ordinary_result = block([
+              '    Ok(CompiledCore {',
+              '        map: compiled.map,',
+              '        shadow: compiled.shadow,',
+              '        block_size: compiled.block_size,',
+              '        origin_nid: topology.nid,',
+              '        origin_pclusters,',
+              '        replacement_pclusters,',
+              '        head_lclusters,',
+              '        encoded_bytes,',
+              '        logical_lclusters: topology.logical_lclusters,',
+              '        compact_2b_entries: topology.compact_2b_entries,',
+              '        shadow_blocks: compiled.shadow_blocks,',
+              '    })',
+              '}',
+              '',
+              'fn compile_big_spans(',
+          ])
+          new_ordinary_result = block([
+              '    Ok(CompiledCore {',
+              '        map: compiled.map,',
+              '        shadow: compiled.shadow,',
+              '        block_size: compiled.block_size,',
+              '        origin_nid: topology.nid,',
+              '        origin_pclusters,',
+              '        replacement_pclusters,',
+              '        head_lclusters,',
+              '        head_cluster_offsets,',
+              '        encoded_bytes,',
+              '        logical_lclusters: topology.logical_lclusters,',
+              '        compact_2b_entries: topology.compact_2b_entries,',
+              '        shadow_blocks: compiled.shadow_blocks,',
+              '    })',
+              '}',
+              '',
+              'fn compile_big_spans(',
+          ])
+          once(old_ordinary_result, new_ordinary_result)
+
+          old_big_result = block([
+              '    Ok(CompiledCore {',
+              '        map: compiled.map,',
+              '        shadow: compiled.shadow,',
+              '        block_size: compiled.block_size,',
+              '        origin_nid: topology.nid,',
+              '        origin_pclusters,',
+              '        replacement_pclusters,',
+              '        head_lclusters,',
+              '        encoded_bytes,',
+              '        logical_lclusters: topology.logical_lclusters,',
+              '        compact_2b_entries: topology.compact_2b_entries,',
+              '        shadow_blocks: compiled.shadow_blocks,',
+              '    })',
+              '}',
+              '',
+              'fn validate_compatible_topology(',
+          ])
+          new_big_result = block([
+              '    Ok(CompiledCore {',
+              '        map: compiled.map,',
+              '        shadow: compiled.shadow,',
+              '        block_size: compiled.block_size,',
+              '        origin_nid: topology.nid,',
+              '        origin_pclusters,',
+              '        replacement_pclusters,',
+              '        head_cluster_offsets: vec![0; head_lclusters.len()],',
+              '        head_lclusters,',
+              '        encoded_bytes,',
+              '        logical_lclusters: topology.logical_lclusters,',
+              '        compact_2b_entries: topology.compact_2b_entries,',
+              '        shadow_blocks: compiled.shadow_blocks,',
+              '    })',
+              '}',
+              '',
+              'fn validate_compatible_topology(',
+          ])
+          once(old_big_result, new_big_result)
 
           once(
               '.map(|head| (head.lcn, head.kind))\n        .ne(replacement.heads.iter().map(|head| (head.lcn, head.kind)))',
               '.map(|head| (head.lcn, head.kind, head.clusterofs))\n        .ne(replacement.heads.iter().map(|head| (head.lcn, head.kind, head.clusterofs)))',
           )
+          once('            "compressed head-lcluster/type topology differs",', '            "compressed head-lcluster/type/offset topology differs",')
           once(
-              '            "compressed head-lcluster/type topology differs",',
-              '            "compressed head-lcluster/type/offset topology differs",',
+              block(['        let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;', '        if heads.len() != compressed_blocks {']),
+              block(['        let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;', '        validate_head_logical_offsets(&heads, inode.size)?;', '        if heads.len() != compressed_blocks {']),
           )
-
-          once(
-              block([
-                  '        let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;',
-                  '        if heads.len() != compressed_blocks {',
-              ]),
-              block([
-                  '        let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;',
-                  '        validate_head_logical_offsets(&heads, inode.size)?;',
-                  '        if heads.len() != compressed_blocks {',
-              ]),
-          )
-
           once(
               block([
                   '                    heads.push(Head {',
@@ -238,10 +233,7 @@ jobs:
               ]),
           )
 
-          marker = block([
-              'fn validate_nonheads(',
-              '    entries: &[CompactEntry],',
-          ])
+          marker = block(['fn validate_nonheads(', '    entries: &[CompactEntry],'])
           helpers = block([
               'fn head_logical_offset(head: &Head) -> Result<usize, CoreError> {',
               '    head.lcn',
@@ -285,21 +277,14 @@ jobs:
           assert text.count(marker) == 1
           text = text.replace(marker, helpers + marker, 1)
 
-          # Update existing test Head literals with explicit zero offsets.
           text = text.replace(
               '                kind: LCLUSTER_HEAD1,\n            }],',
               '                kind: LCLUSTER_HEAD1,\n                clusterofs: 0,\n            }],',
           )
           assert text.count('kind: LCLUSTER_HEAD1,\n                clusterofs: 0,') >= 2
-          once(
-              '                "compressed head-lcluster/type topology differs"',
-              '                "compressed head-lcluster/type/offset topology differs"',
-          )
+          once('                "compressed head-lcluster/type topology differs"', '                "compressed head-lcluster/type/offset topology differs"')
 
-          marker = block([
-              '    #[test]',
-              '    fn later_extent_codec_failure_happens_before_view_construction() {',
-          ])
+          test_marker = block(['    #[test]', '    fn later_extent_codec_failure_happens_before_view_construction() {'])
           extra_test = block([
               '    #[test]',
               '    fn nonzero_plain_eof_offset_is_part_of_logical_topology() {',
@@ -322,9 +307,8 @@ jobs:
               '    }',
               '',
           ])
-          assert text.count(marker) == 1
-          text = text.replace(marker, extra_test + marker, 1)
-
+          assert text.count(test_marker) == 1
+          text = text.replace(test_marker, extra_test + test_marker, 1)
           path.write_text(text)
           PY
           cargo fmt --all
