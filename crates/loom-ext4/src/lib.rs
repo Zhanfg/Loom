@@ -5,11 +5,13 @@ mod checksum;
 mod create;
 mod remove;
 mod resize;
+mod xattr;
 
 pub use allocate::{compile_grow_with_block_allocation, CompiledAllocationGrow};
 pub use create::{compile_create_file, CompiledCreateFile};
 pub use remove::{compile_remove_file, CompiledRemoveFile};
 pub use resize::{compile_resize_within_allocation, CompiledResize};
+pub use xattr::{compile_selinux_xattr, CompiledSelinuxXattr};
 
 use loom_map::{LoomMap, ReplacementExtent};
 use loom_types::{Sector, SectorCount};

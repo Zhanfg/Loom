@@ -2,8 +2,8 @@
 
 use super::checksum::{crc32c, rewrite_inode_checksum, verify_inode_checksum};
 use super::{
-    read_exact_at, read_u16, read_u32, Ext4Error, Ext4Image, INODE_INLINE_DATA_FL,
-    INODE_VERITY_FL, MODE_REGULAR, SECTOR_SIZE, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
+    read_exact_at, read_u16, read_u32, Ext4Error, Ext4Image, INODE_INLINE_DATA_FL, INODE_VERITY_FL,
+    MODE_REGULAR, SECTOR_SIZE, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
 use loom_map::{LoomMap, ReplacementExtent};
 use loom_types::{Sector, SectorCount};
@@ -83,11 +83,12 @@ pub fn compile_selinux_xattr(
     let inode_end = inode_offset
         .checked_add(inode_size)
         .ok_or(Ext4Error::ArithmeticOverflow)?;
-    let raw_inode = table_shadow
-        .get_mut(inode_offset..inode_end)
-        .ok_or(Ext4Error::InvalidFilesystem(
-            "inode record crosses inode-table filesystem block",
-        ))?;
+    let raw_inode =
+        table_shadow
+            .get_mut(inode_offset..inode_end)
+            .ok_or(Ext4Error::InvalidFilesystem(
+                "inode record crosses inode-table filesystem block",
+            ))?;
 
     verify_inode_checksum(raw_inode, checksum_seed, inode_number).map_err(Ext4Error::Checksum)?;
     reject_external_xattr(raw_inode, image.superblock.has_64bit)?;
@@ -104,11 +105,9 @@ pub fn compile_selinux_xattr(
         sector_count: SectorCount(sectors_per_block),
         shadow_start: Sector(0),
     };
-    let map = LoomMap::from_replacements(
-        SectorCount(image.image_bytes / SECTOR_SIZE),
-        &[replacement],
-    )
-    .map_err(Ext4Error::Map)?;
+    let map =
+        LoomMap::from_replacements(SectorCount(image.image_bytes / SECTOR_SIZE), &[replacement])
+            .map_err(Ext4Error::Map)?;
 
     Ok(CompiledSelinuxXattr {
         map,
@@ -164,8 +163,8 @@ impl Ext4Image {
         let table_block = table_start
             .checked_add(byte_offset / block_size)
             .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let offset = usize::try_from(byte_offset % block_size)
-            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let offset =
+            usize::try_from(byte_offset % block_size).map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let end = offset
             .checked_add(usize::from(self.superblock.inode_size))
             .ok_or(Ext4Error::ArithmeticOverflow)?;
@@ -232,12 +231,13 @@ fn write_empty_ibody_selinux_xattr(raw_inode: &mut [u8], value: &[u8]) -> Result
     let terminator_end = entry_end
         .checked_add(XATTR_END_MARKER)
         .ok_or(Ext4Error::ArithmeticOverflow)?;
-    let value_unaligned = raw_inode
-        .len()
-        .checked_sub(value.len())
-        .ok_or(Ext4Error::UnsupportedInodeFeature(
-            "security.selinux value exceeds inode xattr space",
-        ))?;
+    let value_unaligned =
+        raw_inode
+            .len()
+            .checked_sub(value.len())
+            .ok_or(Ext4Error::UnsupportedInodeFeature(
+                "security.selinux value exceeds inode xattr space",
+            ))?;
     let value_start = value_unaligned & !3_usize;
     if value_start < terminator_end || value_start < first_entry {
         return Err(Ext4Error::UnsupportedInodeFeature(
@@ -250,8 +250,8 @@ fn write_empty_ibody_selinux_xattr(raw_inode: &mut [u8], value: &[u8]) -> Result
     let value_size_u32 = u32::try_from(value.len()).map_err(|_| Ext4Error::ArithmeticOverflow)?;
 
     write_u32(raw_inode, xattr_start, XATTR_MAGIC)?;
-    raw_inode[first_entry] = u8::try_from(SELINUX_DISK_NAME.len())
-        .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+    raw_inode[first_entry] =
+        u8::try_from(SELINUX_DISK_NAME.len()).map_err(|_| Ext4Error::ArithmeticOverflow)?;
     raw_inode[first_entry + 1] = XATTR_SECURITY_INDEX;
     write_u16(raw_inode, first_entry + 2, value_offset_u16)?;
     write_u32(raw_inode, first_entry + 4, 0)?;
