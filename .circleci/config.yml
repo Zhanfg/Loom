@@ -2,25 +2,23 @@ version: 2.1
 
 jobs:
   linux-filesystem-fabric:
-    docker:
-      - image: cimg/rust:1.97.1
+    machine:
+      image: ubuntu-2404:current
     resource_class: large
     steps:
       - checkout
 
       - run:
-          name: Install Linux test dependencies
+          name: Prepare Linux filesystem test host
           command: |
             sudo apt-get update
-            sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux kmod
+            sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux kmod curl
+            sudo modprobe loop || true
             sudo modprobe dm_mod || true
             sudo modprobe dm_linear || true
             sudo modprobe erofs || true
-
-      - run:
-          name: Install Rust components
-          command: |
-            rustup component add rustfmt clippy
+            sudo losetup --find >/dev/null
+            sudo dmsetup version
 
       - restore_cache:
           keys:
@@ -28,84 +26,24 @@ jobs:
             - loom-cargo-v1-
 
       - run:
-          name: Format
-          command: cargo fmt --all -- --check
+          name: Install Rust toolchain
+          command: |
+            if ! command -v rustup >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+                sh -s -- -y --profile minimal --default-toolchain none
+            fi
+            echo 'export PATH="$HOME/.cargo/bin:$PATH"' >> "$BASH_ENV"
+            source "$BASH_ENV"
+            rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+            rustup default stable
+            rustc --version
+            cargo --version
 
       - run:
-          name: Clippy
-          command: cargo clippy --workspace --all-targets -- -D warnings
-
-      - run:
-          name: Unit tests
-          command: cargo test --workspace
-
-      - run:
-          name: Stage 8 effective block store
-          command: cargo test -p loom-view --test effective_store
-
-      - run:
-          name: Stage 0 ext4 sparse substitution
-          command: bash tests/integration/stage0_ext4_dm_linear.sh
-
-      - run:
-          name: Stage 1 ext4 path compiler
-          command: bash tests/integration/stage1_ext4_compiler.sh
-
-      - run:
-          name: Stage 1 partial final block
-          command: bash tests/integration/stage1_ext4_partial_block.sh
-
-      - run:
-          name: Stage 1.1 ext4 block-size matrix
-          command: bash tests/integration/stage1_ext4_block_sizes.sh
-
-      - run:
-          name: Stage 1.1 sparse block delta
-          command: bash tests/integration/stage1_ext4_block_delta.sh
-
-      - run:
-          name: Stage 1.1 sparse-file rejection
-          command: bash tests/integration/stage1_ext4_sparse_reject.sh
-
-      - run:
-          name: Stage 2 inode resize
-          command: bash tests/integration/stage2_ext4_inode_resize.sh
-
-      - run:
-          name: Stage 2 allocation-boundary rejection
-          command: bash tests/integration/stage2_ext4_resize_reject.sh
-
-      - run:
-          name: Stage 2 block-size matrix
-          command: bash tests/integration/stage2_ext4_block_sizes.sh
-
-      - run:
-          name: Stage 3 block allocation weaving
-          command: bash tests/integration/stage3_ext4_block_allocation.sh
-
-      - run:
-          name: Stage 4 create-file weaving
-          command: bash tests/integration/stage4_ext4_create_file.sh
-
-      - run:
-          name: Stage 5 remove-file weaving
-          command: bash tests/integration/stage5_ext4_remove_file.sh
-
-      - run:
-          name: Stage 6 SELinux xattr weaving
-          command: bash tests/integration/stage6_ext4_selinux_xattr.sh
-
-      - run:
-          name: Stage 7 effective-view transaction
-          command: bash tests/integration/stage7_ext4_transaction_view.sh
-
-      - run:
-          name: Stage 9 EROFS flat-plain weaving
-          command: bash tests/integration/stage9_erofs_flat_plain.sh
-
-      - run:
-          name: Stage 10 compressed EROFS pcluster swap
-          command: bash tests/integration/stage10_erofs_compressed_pcluster.sh
+          name: Linux filesystem hard gate
+          command: |
+            source "$BASH_ENV"
+            bash tests/ci/linux-hard-gate.sh
 
       - save_cache:
           key: loom-cargo-v1-{{ checksum "Cargo.lock" }}
