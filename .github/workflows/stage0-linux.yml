@@ -1,11 +1,14 @@
 name: stage-linux
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   rust-and-ext4-fabric:
@@ -13,10 +16,8 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout Stage 3 branch
+      - name: Checkout
         uses: actions/checkout@v5
-        with:
-          ref: feat/stage3-ext4-one-block-allocator
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -29,82 +30,6 @@ jobs:
           sudo apt-get install -y e2fsprogs dmsetup util-linux
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
-
-      - name: Refactor allocator quality gates
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('crates/loom-ext4/src/allocator.rs')
-          text = path.read_text()
-
-          marker = '''struct GroupDescriptorLocation {\n    group: u32,\n    descriptor_block: u64,\n    descriptor_offset: usize,\n    block_bitmap: u64,\n    free_blocks: u32,\n    flags: u16,\n}\n'''
-          addition = '''\nstruct InodeGrowthPlan<'a> {\n    inode_number: u32,\n    inode: &'a Inode,\n    old_block: u64,\n    new_block: u64,\n    checksum_seed: u32,\n    sectors_per_block: u64,\n}\n'''
-          if addition.strip() not in text:
-              if marker not in text:
-                  raise SystemExit('group descriptor marker not found')
-              text = text.replace(marker, marker + addition, 1)
-
-          old_call = '''        self.append_growth_inode_shadow(\n            inode_number,\n            &inode,\n            blocks[0],\n            allocated_block,\n            geometry.checksum_seed,\n            sectors_per_block,\n            &mut shadow,\n            &mut replacements,\n        )?;\n'''
-          new_call = '''        let inode_plan = InodeGrowthPlan {\n            inode_number,\n            inode: &inode,\n            old_block: blocks[0],\n            new_block: allocated_block,\n            checksum_seed: geometry.checksum_seed,\n            sectors_per_block,\n        };\n        self.append_growth_inode_shadow(&inode_plan, &mut shadow, &mut replacements)?;\n'''
-          if new_call not in text:
-              if old_call not in text:
-                  raise SystemExit('growth inode call not found')
-              text = text.replace(old_call, new_call, 1)
-
-          old_result = '''        Ok(CompiledGrowth {\n            map,\n            shadow,\n            block_size: self.superblock.block_size,\n            inode: inode_number,\n            original_data_blocks: 1,\n            effective_data_blocks: 2,\n            new_data_blocks: 1,\n            existing_data_shadow_blocks: 0,\n            inode_metadata_blocks: 1,\n            allocator_metadata_blocks: 3,\n            shadow_blocks: 5,\n            allocated_block,\n        })\n'''
-          new_result = '''        Ok(build_compiled_growth(\n            map,\n            shadow,\n            self.superblock.block_size,\n            inode_number,\n            allocated_block,\n        ))\n'''
-          if new_result not in text:
-              if old_result not in text:
-                  raise SystemExit('compiled growth result not found')
-              text = text.replace(old_result, new_result, 1)
-
-          old_sig = '''    fn append_growth_inode_shadow(\n        &mut self,\n        inode_number: u32,\n        inode: &Inode,\n        old_block: u64,\n        new_block: u64,\n        checksum_seed: u32,\n        sectors_per_block: u64,\n        shadow: &mut Vec<u8>,\n        replacements: &mut Vec<ReplacementExtent>,\n    ) -> Result<(), Ext4Error> {\n        let (inode_table_block, inode_offset) = self.inode_record_location_stage3(inode_number)?;\n'''
-          new_sig = '''    fn append_growth_inode_shadow(\n        &mut self,\n        plan: &InodeGrowthPlan<'_>,\n        shadow: &mut Vec<u8>,\n        replacements: &mut Vec<ReplacementExtent>,\n    ) -> Result<(), Ext4Error> {\n        let (inode_table_block, inode_offset) =\n            self.inode_record_location_stage3(plan.inode_number)?;\n'''
-          if new_sig not in text:
-              if old_sig not in text:
-                  raise SystemExit('append inode signature not found')
-              text = text.replace(old_sig, new_sig, 1)
-
-          replacements = {
-              'update_extent_root_for_one_block(raw_inode, &inode.block, old_block, new_block)?;':
-                  'update_extent_root_for_one_block(\n            raw_inode,\n            &plan.inode.block,\n            plan.old_block,\n            plan.new_block,\n        )?;',
-              'increment_inode_blocks(raw_inode, sectors_per_block)?;':
-                  'increment_inode_blocks(raw_inode, plan.sectors_per_block)?;',
-              'rewrite_inode_checksum(raw_inode, checksum_seed, inode_number)':
-                  'rewrite_inode_checksum(raw_inode, plan.checksum_seed, plan.inode_number)',
-              '            sectors_per_block,\n            &inode_table_shadow,\n        )\n    }\n\n    fn inode_record_location_stage3':
-                  '            plan.sectors_per_block,\n            &inode_table_shadow,\n        )\n    }\n\n    fn inode_record_location_stage3',
-              '            geometry.descriptor_size >= GD_BLOCK_BITMAP_CSUM_HI_END as u16,':
-                  '            usize::from(geometry.descriptor_size) >= GD_BLOCK_BITMAP_CSUM_HI_END,',
-          }
-          for old, new in replacements.items():
-              if new in text:
-                  continue
-              if old not in text:
-                  raise SystemExit(f'allocator refactor target not found: {old!r}')
-              text = text.replace(old, new, 1)
-
-          helper_marker = '''fn validate_allocator_inode(inode_number: u32, inode: &Inode) -> Result<(), Ext4Error> {\n'''
-          helper = '''fn build_compiled_growth(\n    map: LoomMap,\n    shadow: Vec<u8>,\n    block_size: u32,\n    inode: u32,\n    allocated_block: u64,\n) -> CompiledGrowth {\n    CompiledGrowth {\n        map,\n        shadow,\n        block_size,\n        inode,\n        original_data_blocks: 1,\n        effective_data_blocks: 2,\n        new_data_blocks: 1,\n        existing_data_shadow_blocks: 0,\n        inode_metadata_blocks: 1,\n        allocator_metadata_blocks: 3,\n        shadow_blocks: 5,\n        allocated_block,\n    }\n}\n\n'''
-          if helper.strip() not in text:
-              if helper_marker not in text:
-                  raise SystemExit('helper insertion marker not found')
-              text = text.replace(helper_marker, helper + helper_marker, 1)
-
-          path.write_text(text)
-          PY
-          cargo fmt --all
-
-      - name: Commit allocator refactor
-        run: |
-          if ! git diff --quiet -- crates; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add crates
-            git commit -m "refactor(ext4): tighten Stage 3 allocator structure"
-            git push origin HEAD:feat/stage3-ext4-one-block-allocator
-          fi
 
       - name: Format
         run: cargo fmt --all -- --check
