@@ -91,6 +91,7 @@ struct InodeGrowthPlan<'a> {
     new_block: u64,
     checksum_seed: u32,
     sectors_per_block: u64,
+    effective_size: u64,
 }
 
 /// Grows a one-block ext4 regular file by exactly one newly allocated data block.
@@ -119,12 +120,6 @@ impl Ext4Image {
         inode_number: u32,
         replacement: &[u8],
     ) -> Result<CompiledGrowth, Ext4Error> {
-        if self.superblock.block_size != 4096 {
-            return Err(Ext4Error::UnsupportedFilesystemFeature(
-                "Stage 3 allocator currently requires 4096-byte ext4 blocks",
-            ));
-        }
-
         let inode = self.read_inode(inode_number)?;
         validate_allocator_inode(inode_number, &inode)?;
         let blocks = self.file_blocks(&inode)?;
@@ -198,6 +193,9 @@ impl Ext4Image {
             new_block: allocated_block,
             checksum_seed: geometry.checksum_seed,
             sectors_per_block,
+            effective_size: u64::from(self.superblock.block_size)
+                .checked_mul(2)
+                .ok_or(Ext4Error::ArithmeticOverflow)?,
         };
         self.append_growth_inode_shadow(&inode_plan, &mut shadow, &mut replacements)?;
 
@@ -367,7 +365,12 @@ impl Ext4Image {
             plan.old_block,
             plan.new_block,
         )?;
-        write_u64_split(raw_inode, INODE_SIZE_LO, INODE_SIZE_HIGH, 8192)?;
+        write_u64_split(
+            raw_inode,
+            INODE_SIZE_LO,
+            INODE_SIZE_HIGH,
+            plan.effective_size,
+        )?;
         increment_inode_blocks(raw_inode, plan.sectors_per_block)?;
         rewrite_inode_checksum(raw_inode, plan.checksum_seed, plan.inode_number)
             .map_err(Ext4Error::Checksum)?;
