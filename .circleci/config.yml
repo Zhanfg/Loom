@@ -12,7 +12,7 @@ jobs:
           name: Prepare Linux filesystem test host
           command: |
             sudo apt-get update
-            sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux kmod curl
+            sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux kmod curl python3
             sudo modprobe loop || true
             sudo modprobe dm_mod || true
             sudo modprobe dm_linear || true
