@@ -66,6 +66,13 @@ open(sys.argv[3], 'wb').write(xorshift_payload())
 PY
 
 cp "$ORIGINAL" "$ORIGIN_ROOT/000payload.bin"
+
+# Keep path traversal orthogonal to big-pcluster self-encoding. Force the EROFS root
+# directory onto ordinary data blocks instead of an inline directory tail.
+for i in $(seq -w 0 499); do
+  : > "$ORIGIN_ROOT/z_dummy_${i}_for_directory_growth"
+done
+
 mkfs.erofs -b 4096 -C 8192 -zlz4 -E noinline_data -T 0 \
   --max-extent-bytes 32768 "$ORIGIN_IMG" "$ORIGIN_ROOT" >/dev/null
 fsck.erofs "$ORIGIN_IMG" >/dev/null
