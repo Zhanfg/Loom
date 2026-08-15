@@ -118,7 +118,8 @@ impl Ext4Image {
         validate_target_inode(inode_number, &inode)?;
 
         let block_size_u64 = u64::from(self.superblock.block_size);
-        let block_size = usize::try_from(block_size_u64).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let block_size =
+            usize::try_from(block_size_u64).map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let sectors_per_block = block_size_u64 / SECTOR_SIZE;
         let original_blocks = self.file_blocks(&inode)?;
         if original_blocks.is_empty() {
@@ -145,12 +146,15 @@ impl Ext4Image {
 
         let metadata = self.read_allocator_metadata()?;
         let preferred_group = block_group_for(
-            *original_blocks.last().ok_or(Ext4Error::ArithmeticOverflow)?,
+            *original_blocks
+                .last()
+                .ok_or(Ext4Error::ArithmeticOverflow)?,
             metadata.first_data_block,
             metadata.blocks_per_group,
         )?;
         let mut group = self.find_allocatable_group(preferred_group, &metadata)?;
-        let allocated_block = allocate_bitmap_bit(&mut group, &metadata, self.superblock.blocks_count)?;
+        let allocated_block =
+            allocate_bitmap_bit(&mut group, &metadata, self.superblock.blocks_count)?;
 
         let mut shadow = Vec::new();
         let mut replacements = Vec::new();
@@ -298,10 +302,11 @@ impl Ext4Image {
                 "invalid ext4 blocks_per_group for Stage 3",
             ));
         }
-        let bitmap_bytes = usize::try_from(blocks_per_group / 8)
-            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
-        if bitmap_bytes > usize::try_from(self.superblock.block_size)
-            .map_err(|_| Ext4Error::ArithmeticOverflow)?
+        let bitmap_bytes =
+            usize::try_from(blocks_per_group / 8).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        if bitmap_bytes
+            > usize::try_from(self.superblock.block_size)
+                .map_err(|_| Ext4Error::ArithmeticOverflow)?
         {
             return Err(Ext4Error::InvalidFilesystem(
                 "block bitmap exceeds filesystem block size",
@@ -352,11 +357,10 @@ impl Ext4Image {
             if state.free_blocks == 0 {
                 continue;
             }
-            if find_free_bit(&state.bitmap, valid_blocks_in_group(
-                group,
-                metadata,
-                self.superblock.blocks_count,
-            )?)
+            if find_free_bit(
+                &state.bitmap,
+                valid_blocks_in_group(group, metadata, self.superblock.blocks_count)?,
+            )
             .is_some()
             {
                 return Ok(state);
@@ -387,10 +391,9 @@ impl Ext4Image {
         let descriptor_block = descriptor_start_block
             .checked_add(descriptor_byte_offset / u64::from(self.superblock.block_size))
             .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let descriptor_offset = usize::try_from(
-            descriptor_byte_offset % u64::from(self.superblock.block_size),
-        )
-        .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let descriptor_offset =
+            usize::try_from(descriptor_byte_offset % u64::from(self.superblock.block_size))
+                .map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let descriptor_end = descriptor_offset
             .checked_add(descriptor_size)
             .ok_or(Ext4Error::ArithmeticOverflow)?;
@@ -479,11 +482,9 @@ impl Ext4Image {
         let inode_end = inode_offset
             .checked_add(inode_size)
             .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let raw_inode = inode_table_shadow
-            .get_mut(inode_offset..inode_end)
-            .ok_or(Ext4Error::InvalidFilesystem(
-                "inode record crosses inode-table filesystem block",
-            ))?;
+        let raw_inode = inode_table_shadow.get_mut(inode_offset..inode_end).ok_or(
+            Ext4Error::InvalidFilesystem("inode record crosses inode-table filesystem block"),
+        )?;
 
         if inode.flags & EXT4_HUGE_FILE_FL != 0 {
             return Err(Ext4Error::UnsupportedInodeFeature(
@@ -496,13 +497,11 @@ impl Ext4Image {
             ));
         }
         let blocks_lo = read_u32(raw_inode, INODE_BLOCKS_LO)?;
-        let sectors_u32 = u32::try_from(sectors_per_block)
-            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let sectors_u32 =
+            u32::try_from(sectors_per_block).map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let new_blocks_lo = blocks_lo
             .checked_add(sectors_u32)
-            .ok_or(Ext4Error::UnsupportedInodeFeature(
-                "i_blocks_lo overflow",
-            ))?;
+            .ok_or(Ext4Error::UnsupportedInodeFeature("i_blocks_lo overflow"))?;
         write_u32(raw_inode, INODE_BLOCKS_LO, new_blocks_lo)?;
 
         write_u64_split(raw_inode, INODE_SIZE_LO, INODE_SIZE_HI, effective_size)?;
@@ -591,13 +590,13 @@ fn block_group_for(
     first_data_block: u64,
     blocks_per_group: u32,
 ) -> Result<u32, Ext4Error> {
-    let relative = physical_block
-        .checked_sub(first_data_block)
-        .ok_or(Ext4Error::InvalidFilesystem(
-            "file data block precedes first_data_block",
-        ))?;
-    u32::try_from(relative / u64::from(blocks_per_group))
-        .map_err(|_| Ext4Error::ArithmeticOverflow)
+    let relative =
+        physical_block
+            .checked_sub(first_data_block)
+            .ok_or(Ext4Error::InvalidFilesystem(
+                "file data block precedes first_data_block",
+            ))?;
+    u32::try_from(relative / u64::from(blocks_per_group)).map_err(|_| Ext4Error::ArithmeticOverflow)
 }
 
 fn valid_blocks_in_group(
@@ -648,7 +647,8 @@ fn allocate_bitmap_bit(
         .get_mut(byte_index)
         .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
     *byte |= 1_u8 << shift;
-    group.first_block
+    group
+        .first_block
         .checked_add(u64::from(bit))
         .ok_or(Ext4Error::ArithmeticOverflow)
 }
@@ -735,8 +735,8 @@ fn verify_block_bitmap_checksum(
     checksum_seed: u32,
     blocks_per_group: u32,
 ) -> Result<(), Ext4Error> {
-    let bitmap_len = usize::try_from(blocks_per_group / 8)
-        .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+    let bitmap_len =
+        usize::try_from(blocks_per_group / 8).map_err(|_| Ext4Error::ArithmeticOverflow)?;
     let region = bitmap
         .get(..bitmap_len)
         .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
@@ -778,8 +778,8 @@ fn inode_record_location(
     let table_block = table_start
         .checked_add(byte_offset / block_size)
         .ok_or(Ext4Error::ArithmeticOverflow)?;
-    let offset = usize::try_from(byte_offset % block_size)
-        .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+    let offset =
+        usize::try_from(byte_offset % block_size).map_err(|_| Ext4Error::ArithmeticOverflow)?;
     let end = offset
         .checked_add(usize::from(image.superblock.inode_size))
         .ok_or(Ext4Error::ArithmeticOverflow)?;
@@ -869,7 +869,11 @@ fn append_inline_extent(
     write_u16(root, new_offset + 4, 1)?;
     write_u16(root, new_offset + 6, (allocated_block >> 32) as u16)?;
     write_u32(root, new_offset + 8, allocated_block as u32)?;
-    write_u16(root, 2, u16::try_from(entries + 1).map_err(|_| Ext4Error::ArithmeticOverflow)?)?;
+    write_u16(
+        root,
+        2,
+        u16::try_from(entries + 1).map_err(|_| Ext4Error::ArithmeticOverflow)?,
+    )?;
     Ok(())
 }
 
