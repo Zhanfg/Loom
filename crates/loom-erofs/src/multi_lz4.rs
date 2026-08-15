@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[path = "big_index.rs"]
+mod big_index;
+
 const MIN_MATCH: usize = 4;
 const LAST_LITERALS: usize = 5;
 const MFLIMIT: usize = 12;
