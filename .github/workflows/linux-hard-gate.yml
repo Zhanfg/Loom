@@ -6,7 +6,6 @@ on:
   push:
     branches:
       - main
-      - 'feat/**'
 
 permissions:
   contents: read
@@ -34,7 +33,6 @@ jobs:
         run: |
           sudo modprobe loop || true
           sudo modprobe dm_mod || true
-          sudo modprobe dm_linear || true
           sudo modprobe erofs || true
           sudo losetup -f
           sudo dmsetup version
