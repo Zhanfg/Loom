@@ -3,6 +3,7 @@ members = [
     "crates/loom-types",
     "crates/loom-map",
     "crates/loom-pack",
+    "crates/loom-ext4",
     "crates/loom-cli",
 ]
 resolver = "2"
@@ -19,3 +20,4 @@ unsafe_code = "forbid"
 
 [workspace.lints.clippy]
 all = "warn"
+pedantic = "warn"
