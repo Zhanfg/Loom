@@ -31,18 +31,20 @@ jobs:
 
           path = Path('crates/loom-erofs/src/compact_core.rs')
           text = path.read_text()
-          directory_guard = '''        if directory.xattr_size != 0 {
-              return Err(CoreError::UnsupportedInode(
-                  "compact path traversal refuses directory xattrs",
-              ));
-          }
-'''
-          target_guard = '''    if inode.xattr_size != 0 {
-              return Err(CoreError::UnsupportedInode(
-                  "compact target must not carry xattrs",
-              ));
-          }
-'''
+          directory_guard = (
+              "        if directory.xattr_size != 0 {\n"
+              "            return Err(CoreError::UnsupportedInode(\n"
+              "                \"compact path traversal refuses directory xattrs\",\n"
+              "            ));\n"
+              "        }\n"
+          )
+          target_guard = (
+              "    if inode.xattr_size != 0 {\n"
+              "        return Err(CoreError::UnsupportedInode(\n"
+              "            \"compact target must not carry xattrs\",\n"
+              "        ));\n"
+              "    }\n"
+          )
           assert text.count(directory_guard) == 1
           assert text.count(target_guard) == 1
           text = text.replace(directory_guard, '', 1)
@@ -57,7 +59,7 @@ jobs:
         run: |
           git config user.name 'Loom Stage 26 maintainer'
           git config user.email 'actions@users.noreply.github.com'
-          git checkout HEAD^ -- .github/workflows/linux-hard-gate.yml
+          git checkout 79bf4392750a9bb5b25ae1fcaac36b89af6c50cc -- .github/workflows/linux-hard-gate.yml
           git add crates/loom-erofs/src/compact_core.rs .github/workflows/linux-hard-gate.yml
           git commit -m 'stage26: accept xattr-bearing compact EROFS paths'
           git push origin HEAD:feat/stage26-erofs-xattr-bearing-paths
