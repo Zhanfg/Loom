@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[path = "big_pcluster.rs"]
+mod big_pcluster;
 #[path = "compact_core.rs"]
 pub(crate) mod shared_core;
 
@@ -61,6 +63,46 @@ impl CompiledSwap {
             replacement_path,
         )?)
     }
+
+    /// Compiles the Stage 19 two-block compact big-pcluster oracle path.
+    ///
+    /// This preserves the existing scalar compact result shape while allowing the shadow to
+    /// contain two physical blocks. `encoded_bytes` reports the complete 8 KiB physical
+    /// footprint; Stage 20 will add Loom-owned encoding into that footprint.
+    ///
+    /// # Errors
+    /// Returns [`IndexError`] for malformed/unsupported big-pcluster metadata, CBLKCNT
+    /// mismatch, incompatible replacement topology, I/O, or effective-view failures.
+    pub fn compile_big_pcluster_oracle(
+        origin_path: &Path,
+        target_path: &str,
+        replacement_image_path: &Path,
+    ) -> Result<Self, IndexError> {
+        let compiled = big_pcluster::compile_big_pcluster_swap(
+            origin_path,
+            target_path,
+            replacement_image_path,
+        )
+        .map_err(map_big_error)?;
+        let block_size = usize::try_from(compiled.block_size)
+            .map_err(|_| CoreError::ArithmeticOverflow)?;
+        let encoded_bytes = compiled
+            .physical_blocks
+            .checked_mul(block_size)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        Ok(Self {
+            map: compiled.map,
+            shadow: compiled.shadow,
+            block_size: compiled.block_size,
+            origin_nid: compiled.origin_nid,
+            origin_pcluster: compiled.origin_pcluster,
+            replacement_pcluster: compiled.replacement_pcluster,
+            encoded_bytes,
+            logical_lclusters: compiled.logical_lclusters,
+            compact_2b_entries: compiled.compact_2b_entries,
+            shadow_blocks: compiled.shadow_blocks,
+        })
+    }
 }
 
 fn into_single(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
@@ -90,4 +132,25 @@ fn into_single(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
         compact_2b_entries: compiled.compact_2b_entries,
         shadow_blocks: compiled.shadow_blocks,
     })
+}
+
+fn map_big_error(error: big_pcluster::BigPclusterError) -> CoreError {
+    use big_pcluster::BigPclusterError as Big;
+    match error {
+        Big::Io(error) => CoreError::Io(error),
+        Big::View(error) => CoreError::View(error),
+        Big::BadMagic(magic) => CoreError::BadMagic(magic),
+        Big::InvalidFilesystem(reason) => CoreError::InvalidFilesystem(reason),
+        Big::UnsupportedFilesystem(reason) => CoreError::UnsupportedFilesystem(reason),
+        Big::UnsupportedInode(reason) => CoreError::UnsupportedInode(reason),
+        Big::IncompatibleReplacement(reason) => CoreError::IncompatibleReplacement(reason),
+        Big::InvalidPath(reason) => CoreError::InvalidPath(reason),
+        Big::PathNotFound(name) => CoreError::PathNotFound(name),
+        Big::NotDirectory(nid) => CoreError::NotDirectory(nid),
+        Big::NotRegularFile(nid) => CoreError::NotRegularFile(nid),
+        Big::CorruptDirectory => CoreError::CorruptDirectory,
+        Big::UnexpectedEndOfImage => CoreError::UnexpectedEndOfImage,
+        Big::UnexpectedEndOfStructure => CoreError::UnexpectedEndOfStructure,
+        Big::ArithmeticOverflow => CoreError::ArithmeticOverflow,
+    }
 }
