@@ -30,78 +30,35 @@ jobs:
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
 
-      - name: Add public Result API contracts
+      - name: Normalize must-use API contracts once
         run: |
           python3 - <<'PY'
           from pathlib import Path
 
-          replacements = {
-              Path('crates/loom-types/src/lib.rs'): [
-                  (
-                      '    pub fn logical_end(self) -> Result<Sector, ExtentError> {',
-                      '    /// Returns the exclusive logical end sector.\n    ///\n    /// # Errors\n    /// Returns [`ExtentError::Overflow`] if the extent end cannot be represented.\n    pub fn logical_end(self) -> Result<Sector, ExtentError> {'
-                  ),
-                  (
-                      '    pub fn source_end(self) -> Result<Sector, ExtentError> {',
-                      '    /// Returns the exclusive backing-source end sector.\n    ///\n    /// # Errors\n    /// Returns [`ExtentError::Overflow`] if the source end cannot be represented.\n    pub fn source_end(self) -> Result<Sector, ExtentError> {'
-                  ),
-                  (
-                      '    pub fn validate(self) -> Result<(), ExtentError> {',
-                      '    /// Validates extent length and checked address arithmetic.\n    ///\n    /// # Errors\n    /// Returns [`ExtentError`] for zero-length extents or arithmetic overflow.\n    pub fn validate(self) -> Result<(), ExtentError> {'
-                  ),
-              ],
-              Path('crates/loom-pack/src/lib.rs'): [
-                  (
-                      'pub fn pack_block(input: &[u8], block_size: usize) -> Result<Vec<u8>, PackError> {',
-                      '/// Pads one payload to exactly one shadow block.\n///\n/// # Errors\n/// Returns [`PackError`] when the block size is zero or the payload is larger than the block.\npub fn pack_block(input: &[u8], block_size: usize) -> Result<Vec<u8>, PackError> {'
-                  ),
-                  (
-                      'pub fn pack_file(\n',
-                      '/// Reads a payload, packs it to one block, and writes the block to disk.\n///\n/// # Errors\n/// Returns [`PackError`] for invalid block sizing or filesystem I/O failures.\npub fn pack_file(\n'
-                  ),
-              ],
-              Path('crates/loom-map/src/lib.rs'): [
-                  (
-                      '    pub fn single_replacement(\n',
-                      '    /// Builds a complete virtual-device map containing one shadow replacement.\n    ///\n    /// # Errors\n    /// Returns [`MapError`] when the replacement is empty, out of bounds, or overflows.\n    pub fn single_replacement(\n'
-                  ),
-                  (
-                      '    pub fn from_replacements(\n',
-                      '    /// Builds a complete virtual-device map from sparse shadow replacements.\n    ///\n    /// # Errors\n    /// Returns [`MapError`] for invalid, overlapping, out-of-bounds, or overflowing extents.\n    pub fn from_replacements(\n'
-                  ),
-                  (
-                      '    pub fn validate(&self) -> Result<(), MapError> {',
-                      '    /// Validates that the map covers the virtual device exactly once and without gaps.\n    ///\n    /// # Errors\n    /// Returns [`MapError`] if any extent is invalid or the map is not contiguous.\n    pub fn validate(&self) -> Result<(), MapError> {'
-                  ),
-                  (
-                      '    pub fn to_dm_linear_table(\n',
-                      '    /// Lowers this map to a Linux device-mapper linear table.\n    ///\n    /// # Errors\n    /// Returns [`MapError`] if the map is invalid or a backing-device name is unsafe.\n    pub fn to_dm_linear_table(\n'
-                  ),
-              ],
-              Path('crates/loom-ext4/src/lib.rs'): [
-                  (
-                      'pub fn compile_same_size_replacement(\n',
-                      '/// Compiles one same-size ext4 path replacement into shadow blocks and a Loom map.\n///\n/// The origin is opened read-only. Stage 1 deliberately rejects filesystem or inode\n/// features whose on-disk semantics are not modeled yet.\n///\n/// # Errors\n/// Returns [`Ext4Error`] for malformed/unsupported ext4 structures, invalid paths,\n/// size mismatches, mapping failures, or filesystem I/O errors.\npub fn compile_same_size_replacement(\n'
-                  ),
-              ],
-          }
-
-          for path, edits in replacements.items():
-              text = path.read_text()
-              changed = False
-              for needle, replacement in edits:
-                  if replacement in text:
-                      continue
-                  if needle not in text:
-                      raise SystemExit(f'expected API signature not found in {path}: {needle!r}')
-                  text = text.replace(needle, replacement, 1)
-                  changed = True
-              if changed:
-                  path.write_text(text)
+          path = Path('crates/loom-map/src/lib.rs')
+          text = path.read_text()
+          edits = [
+              (
+                  '    pub fn total_sectors(&self) -> SectorCount {',
+                  '    #[must_use]\n    pub fn total_sectors(&self) -> SectorCount {'
+              ),
+              (
+                  '    pub fn extents(&self) -> &[Extent] {',
+                  '    #[must_use]\n    pub fn extents(&self) -> &[Extent] {'
+              ),
+          ]
+          changed = False
+          for needle, replacement in edits:
+              if replacement in text:
+                  continue
+              if needle not in text:
+                  raise SystemExit(f'expected API signature not found: {needle!r}')
+              text = text.replace(needle, replacement, 1)
+              changed = True
+          if changed:
+              path.write_text(text)
           PY
-
-      - name: Apply rustfmt
-        run: cargo fmt --all
+          cargo fmt --all
 
       - name: Commit normalized sources
         run: |
@@ -109,11 +66,12 @@ jobs:
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add crates
-            git commit -m "style: normalize Stage 1 Rust APIs"
+            git commit -m "style: complete Stage 1 API contracts"
             git push origin HEAD:feat/stage1-ext4-compiler
           fi
 
-      - name: Clippy
+      - name: Clippy diagnostics
+        continue-on-error: true
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Unit tests
@@ -124,3 +82,6 @@ jobs:
 
       - name: Stage 1 ext4 path compiler
         run: bash tests/integration/stage1_ext4_compiler.sh
+
+      - name: Clippy hard gate
+        run: cargo clippy --workspace --all-targets -- -D warnings
