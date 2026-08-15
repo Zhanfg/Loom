@@ -1,0 +1,88 @@
+name: fix-stage20-clippy
+
+on:
+  push:
+    branches:
+      - feat/stage20-erofs-big-pcluster-self-encode
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage20-erofs-big-pcluster-self-encode
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply exact lint fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          lib = Path('crates/loom-erofs/src/lib.rs')
+          s = lib.read_text()
+          marker = 'mod multi_index;\n'
+          if 'mod multi_lz4;\n' not in s:
+              if marker not in s:
+                  raise SystemExit('lib.rs multi_index marker missing')
+              s = s.replace(marker, marker + 'mod multi_lz4;\n', 1)
+          lib.write_text(s)
+
+          for name in ['compact_core.rs', 'big_pcluster.rs']:
+              p = Path('crates/loom-erofs/src') / name
+              s = p.read_text()
+              old = '#[path = "multi_lz4.rs"]\nmod lz4;\n'
+              new = 'use crate::multi_lz4 as lz4;\n'
+              if old not in s:
+                  raise SystemExit(f'{name}: duplicate lz4 module declaration missing')
+              p.write_text(s.replace(old, new, 1))
+
+          p = Path('crates/loom-erofs/src/big_pcluster.rs')
+          s = p.read_text()
+          changes = [
+              ('    pub physical_blocks: usize,\n', ''),
+              ('        physical_blocks: extent.physical_blocks,\n', ''),
+              ('    replacement_span: Vec<u8>,\n', '    replacement_span: &[u8],\n'),
+              ('        replacement_span,\n        PROOF_PHYSICAL_BLOCKS', '        &replacement_span,\n        PROOF_PHYSICAL_BLOCKS'),
+              ('    compile_span(origin_path, extent, extent.pcluster, span, compressed.len())', '    compile_span(origin_path, extent, extent.pcluster, &span, compressed.len())'),
+          ]
+          for old, new in changes:
+              if old not in s:
+                  raise SystemExit('big_pcluster.rs source fragment missing: ' + repr(old))
+              s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          for name in ['multi_lz4.rs', 'compressed.rs']:
+              p = Path('crates/loom-erofs/src') / name
+              s = p.read_text()
+              old = '&& cursor - candidate <= usize::from(u16::MAX)'
+              new = '&& u16::try_from(cursor - candidate).is_ok()'
+              if old not in s:
+                  raise SystemExit(f'{name}: checked conversion fragment missing')
+              s = s.replace(old, new, 1)
+              old = '*byte = state as u8;'
+              new = '*byte = state.to_le_bytes()[0];'
+              if old not in s:
+                  raise SystemExit(f'{name}: truncating test cast fragment missing')
+              s = s.replace(old, new, 1)
+              p.write_text(s)
+          PY
+      - name: Verify remediation
+        run: |
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Commit remediation
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates
+          if git diff --cached --quiet; then
+            exit 0
+          fi
+          git commit -m 'refactor(erofs): satisfy strict Stage 20 Clippy gate'
+          git push origin HEAD:feat/stage20-erofs-big-pcluster-self-encode
