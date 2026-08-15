@@ -40,5 +40,6 @@ bash tests/integration/stage22_erofs_variable_cblkcnt.sh
 bash tests/integration/stage23_erofs_multi_big_oracle.sh
 bash tests/integration/stage24_erofs_multi_big_self_encode.sh
 bash tests/integration/stage25_erofs_mixed_cblkcnt.sh
+bash tests/integration/stage26_erofs_xattr_bearing_paths.sh
 
 printf '%s\n' 'Loom Linux filesystem hard gate PASS'

@@ -695,11 +695,6 @@ impl Image {
     }
 
     fn find_child(&mut self, directory: &Inode, name: &[u8]) -> Result<u64, CoreError> {
-        if directory.xattr_size != 0 {
-            return Err(CoreError::UnsupportedInode(
-                "compact path traversal refuses directory xattrs",
-            ));
-        }
         let block_size = u64::from(BLOCK_SIZE);
         let full_blocks = match directory.layout {
             DATA_FLAT_PLAIN => div_ceil(directory.size, block_size)?,
@@ -1035,11 +1030,6 @@ fn validate_target_inode(inode: &Inode) -> Result<usize, CoreError> {
     if inode.layout != DATA_COMPRESSED_COMPACT {
         return Err(CoreError::UnsupportedInode(
             "compact core requires EROFS_INODE_COMPRESSED_COMPACT",
-        ));
-    }
-    if inode.xattr_size != 0 {
-        return Err(CoreError::UnsupportedInode(
-            "compact target must not carry xattrs",
         ));
     }
     if inode.size < u64::from(BLOCK_SIZE) * 2 || inode.size % u64::from(BLOCK_SIZE) != 0 {
