@@ -10,6 +10,7 @@ LOOM="$REPO_ROOT/target/release/loom"
 WORK="$(mktemp -d)"
 ORIGIN_ROOT="$WORK/origin-root"
 REPLACEMENT_ROOT="$WORK/replacement-root"
+MISMATCH_ROOT="$WORK/mismatch-root"
 MOUNT_DIR="$WORK/mnt"
 ORIGIN_LOOP=""
 SHADOW_LOOP=""
@@ -26,54 +27,59 @@ cleanup() {
 trap cleanup EXIT
 trap 'rc=$?; printf "Stage 23 FAIL line=%s status=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit "$rc"' ERR
 
-mkdir -p "$ORIGIN_ROOT" "$REPLACEMENT_ROOT" "$MOUNT_DIR"
+mkdir -p "$ORIGIN_ROOT" "$REPLACEMENT_ROOT" "$MISMATCH_ROOT" "$MOUNT_DIR"
 ORIGINAL="$WORK/original.bin"
 REPLACEMENT="$WORK/replacement.bin"
+MISMATCH="$WORK/mismatch.bin"
 ORIGIN_IMG="$WORK/origin.erofs"
 REPLACEMENT_IMG="$WORK/replacement.erofs"
 MISMATCH_IMG="$WORK/mismatch.erofs"
 SHADOW="$WORK/shadow.pack"
 TABLE="$WORK/loom.table"
 
-python3 - "$ORIGINAL" "$REPLACEMENT" <<'PY'
+python3 - "$ORIGINAL" "$REPLACEMENT" "$MISMATCH" <<'PY'
 import random
 import sys
 
 SIZE = 32768
-PERIOD = 10000
 
-def build(seed_base, marker):
+def build(seed_base, marker, period_bytes):
     data = bytearray()
     for extent in range(3):
         rng = random.Random(seed_base + extent)
-        period = bytes(rng.randrange(256) for _ in range(PERIOD))
-        part = bytearray((period * 4)[:SIZE])
+        period = bytes(rng.randrange(256) for _ in range(period_bytes))
+        copies = (SIZE + period_bytes - 1) // period_bytes
+        part = bytearray((period * copies)[:SIZE])
         tag = marker + str(extent).encode()
         part[64:64 + len(tag)] = tag
         data.extend(part)
     return data
 
-open(sys.argv[1], 'wb').write(build(0x230100, b'LOOM-STAGE23-ORIGIN-'))
-open(sys.argv[2], 'wb').write(build(0x230200, b'LOOM-STAGE23-REPLACEMENT-'))
+# 10,000-byte periods encode to three physical blocks per 32 KiB logical extent.
+open(sys.argv[1], 'wb').write(build(0x230100, b'LOOM-STAGE23-ORIGIN-', 10000))
+open(sys.argv[2], 'wb').write(build(0x230200, b'LOOM-STAGE23-REPLACEMENT-', 10000))
+# A 6,000-byte period keeps the same three 32 KiB HEAD boundaries but encodes to two
+# physical blocks per extent. This isolates CBLKCNT footprint mismatch from extent splitting.
+open(sys.argv[3], 'wb').write(build(0x230300, b'LOOM-STAGE23-MISMATCH-', 6000))
 PY
 
 cp "$ORIGINAL" "$ORIGIN_ROOT/000payload.bin"
 cp "$REPLACEMENT" "$REPLACEMENT_ROOT/000payload.bin"
+cp "$MISMATCH" "$MISMATCH_ROOT/000payload.bin"
 for i in $(seq -w 0 499); do
   : > "$ORIGIN_ROOT/z_dummy_${i}_for_directory_growth"
   : > "$REPLACEMENT_ROOT/z_dummy_${i}_for_directory_growth"
+  : > "$MISMATCH_ROOT/z_dummy_${i}_for_directory_growth"
 done
 
-# 96 KiB logical file, forced into three 32 KiB variable-length extents. Each extent
-# has a 16 KiB max pcluster and the deterministic payload materializes as CBLKCNT=3.
+# All three images use the same 16 KiB pcluster cap and 32 KiB logical extent boundary.
+# Only payload compressibility differs, so the negative oracle isolates per-extent CBLKCNT.
 mkfs.erofs -b 4096 -C 16384 -zlz4 -E noinline_data -T 0 \
   --max-extent-bytes 32768 "$ORIGIN_IMG" "$ORIGIN_ROOT" >/dev/null
 mkfs.erofs -b 4096 -C 16384 -zlz4 -E noinline_data -T 0 \
   --max-extent-bytes 32768 "$REPLACEMENT_IMG" "$REPLACEMENT_ROOT" >/dev/null
-# Same logical shape with a smaller pcluster cap must be rejected as an incompatible
-# oracle footprint rather than partially materialized.
-mkfs.erofs -b 4096 -C 8192 -zlz4 -E noinline_data -T 0 \
-  --max-extent-bytes 32768 "$MISMATCH_IMG" "$REPLACEMENT_ROOT" >/dev/null
+mkfs.erofs -b 4096 -C 16384 -zlz4 -E noinline_data -T 0 \
+  --max-extent-bytes 32768 "$MISMATCH_IMG" "$MISMATCH_ROOT" >/dev/null
 
 fsck.erofs "$ORIGIN_IMG" >/dev/null
 fsck.erofs "$REPLACEMENT_IMG" >/dev/null
@@ -134,7 +140,7 @@ grep -q 'unexpected single-extent topology' "$WORK/scalar.err"
 [[ ! -e "$WORK/scalar.table" ]]
 printf '%s\n' 'Stage 23 scalar-adapter rejection PASS'
 
-# The multi oracle must compare every HEAD footprint, not only logical size/HEAD locations.
+# Same HEAD topology, but every replacement extent has a two-block CBLKCNT instead of three.
 rm -f "$WORK/mismatch.shadow" "$WORK/mismatch.table" "$WORK/mismatch.out" "$WORK/mismatch.err"
 if "$LOOM" erofs-compact-pcluster-swap --multi \
   "$ORIGIN_IMG" /000payload.bin "$MISMATCH_IMG" \
@@ -143,7 +149,6 @@ if "$LOOM" erofs-compact-pcluster-swap --multi \
   echo 'Stage 23 expected incompatible multi-big footprint rejection' >&2
   exit 1
 fi
-printf '%s\n' 'Stage 23 mismatch stderr:'
 cat "$WORK/mismatch.err"
 grep -Eq 'incompatible compact replacement: .*big-pcluster|big-pcluster .* differs' "$WORK/mismatch.err"
 [[ ! -e "$WORK/mismatch.shadow" ]]
@@ -163,7 +168,8 @@ printf '%s\n' \
   '  logical lclusters: 24' \
   '  HEAD lclusters: [0, 8, 16]' \
   '  big pclusters: 3' \
-  '  per-pcluster CBLKCNT blocks: [3, 3, 3]' \
+  '  origin/replacement CBLKCNT blocks: [3, 3, 3]' \
+  '  mismatch CBLKCNT blocks: [2, 2, 2]' \
   '  physical shadow blocks: 9' \
   '  shadow bytes: 36864' \
   '  scalar big adapter multi-extent rejection: PASS' \
