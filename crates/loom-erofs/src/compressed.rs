@@ -206,7 +206,8 @@ pub fn compile_lz4_replacement(
 
     let nid = origin.resolve_path(target_path)?;
     let extent = origin.read_two_lcluster_full_extent(nid)?;
-    let actual = u64::try_from(replacement.len()).map_err(|_| CompressedError::ArithmeticOverflow)?;
+    let actual =
+        u64::try_from(replacement.len()).map_err(|_| CompressedError::ArithmeticOverflow)?;
     if actual != extent.logical_size {
         return Err(CompressedError::ReplacementSizeMismatch {
             expected: extent.logical_size,
@@ -726,7 +727,7 @@ fn read_lz4_length(encoded: &[u8], input_pos: &mut usize) -> Result<usize, Compr
         let byte = *encoded
             .get(*input_pos)
             .ok_or(CompressedError::CompressionValidationFailed)?;
-        *input_pos = input_pos
+        *input_pos = (*input_pos)
             .checked_add(1)
             .ok_or(CompressedError::ArithmeticOverflow)?;
         total = total
@@ -1011,7 +1012,7 @@ mod tests {
     #[test]
     fn raw_lz4_block_round_trips_without_size_prefix() {
         let mut input = vec![b'L'; 8192];
-        input[64..87].copy_from_slice(b"LOOM-STAGE11-ROUNDTRIP");
+        input[64..87].copy_from_slice(b"LOOM-STAGE11-ROUNDTRIP!");
         let compressed = encode_lz4_block(&input).unwrap();
         assert!(compressed.len() < 4096);
         let decoded = decode_lz4_block(&compressed, input.len()).unwrap();
