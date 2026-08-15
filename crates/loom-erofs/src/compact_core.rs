@@ -29,8 +29,16 @@ const LCLUSTER_HEAD1: u16 = 1;
 const LCLUSTER_NONHEAD: u16 = 2;
 const LCLUSTER_TYPE_MASK: u16 = 3;
 const ADVISE_COMPACTED_2B: u16 = 0x0001;
+const ADVISE_BIG_PCLUSTER_1: u16 = 0x0002;
+const ADVISE_BIG_PCLUSTER_2: u16 = 0x0004;
+const BIG_ADVISE: u16 =
+    ADVISE_COMPACTED_2B | ADVISE_BIG_PCLUSTER_1 | ADVISE_BIG_PCLUSTER_2;
 const LZ4_ALGORITHM: u8 = 0;
 const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
+const FEATURE_BIG_PCLUSTER: u32 = 0x0000_0002;
+const SUPPORTED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER;
+const BIG_REQUIRED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER;
+const BIG_PROOF_PHYSICAL_BLOCKS: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct CompiledCore {
@@ -64,10 +72,21 @@ struct Topology {
     heads: Vec<Head>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BigTopology {
+    nid: u64,
+    logical_size: u64,
+    logical_lclusters: usize,
+    pcluster: u64,
+    physical_blocks: usize,
+    compact_2b_entries: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Superblock {
     root_nid: u64,
     meta_block: u64,
+    incompat: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +120,16 @@ struct CompactEntry {
     slot: usize,
     slots: usize,
     base_pblk: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MapHeader {
+    ebase: u64,
+    regions: CompactRegions,
+    advise: u16,
+    algorithm: u8,
+    secondary_algorithm: u8,
+    cluster_bits: u8,
 }
 
 struct Image {
@@ -184,6 +213,96 @@ pub(crate) fn compile_lz4(
         &generated_heads,
         encoded_blocks,
         encoded_bytes,
+    )
+}
+
+pub(crate) fn compile_big_oracle(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_image_path: &Path,
+) -> Result<CompiledCore, CoreError> {
+    let mut origin = Image::open(origin_path)?;
+    let mut replacement = Image::open(replacement_image_path)?;
+    let origin_nid = origin.resolve_path(target_path)?;
+    let replacement_nid = replacement.resolve_path(target_path)?;
+    let origin_topology = origin.read_big_topology(origin_nid)?;
+    let replacement_topology = replacement.read_big_topology(replacement_nid)?;
+    validate_big_compatible_topology(&origin_topology, &replacement_topology)?;
+
+    let replacement_span = replacement.read_span(
+        replacement_topology.pcluster,
+        replacement_topology.physical_blocks,
+    )?;
+    let encoded_bytes = replacement_topology
+        .physical_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    compile_big_span(
+        origin_path,
+        origin_topology,
+        replacement_topology.pcluster,
+        &replacement_span,
+        encoded_bytes,
+    )
+}
+
+pub(crate) fn compile_big_lz4(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_path: &Path,
+) -> Result<CompiledCore, CoreError> {
+    let replacement = fs::read(replacement_path).map_err(CoreError::Io)?;
+    let mut origin = Image::open(origin_path)?;
+    let origin_nid = origin.resolve_path(target_path)?;
+    let topology = origin.read_big_topology(origin_nid)?;
+    let actual = u64::try_from(replacement.len()).map_err(|_| CoreError::ArithmeticOverflow)?;
+    if actual != topology.logical_size {
+        return Err(CoreError::ReplacementSizeMismatch {
+            expected: topology.logical_size,
+            actual,
+        });
+    }
+
+    let capacity = topology
+        .physical_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    let compressed = lz4::encode(&replacement).map_err(|_| CoreError::CompressionValidationFailed)?;
+    if compressed.len() > capacity {
+        return Err(CoreError::CompressionDoesNotFit {
+            head_lcn: 0,
+            encoded: compressed.len(),
+            capacity,
+        });
+    }
+    if compressed.first().copied().unwrap_or(0) == 0 {
+        return Err(CoreError::CompressionValidationFailed);
+    }
+    if lz4::decode(&compressed, replacement.len())
+        .map_err(|_| CoreError::CompressionValidationFailed)?
+        != replacement
+    {
+        return Err(CoreError::CompressionValidationFailed);
+    }
+
+    let mut span = vec![0_u8; capacity];
+    let start = capacity
+        .checked_sub(compressed.len())
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    span[start..].copy_from_slice(&compressed);
+    if lz4::decode_0padding(&span, replacement.len())
+        .map_err(|_| CoreError::CompressionValidationFailed)?
+        != replacement
+    {
+        return Err(CoreError::CompressionValidationFailed);
+    }
+
+    compile_big_span(
+        origin_path,
+        topology,
+        topology.pcluster,
+        &span,
+        compressed.len(),
     )
 }
 
@@ -281,6 +400,65 @@ fn compile_blocks(
     })
 }
 
+fn compile_big_span(
+    origin_path: &Path,
+    topology: BigTopology,
+    replacement_pcluster: u64,
+    replacement_span: &[u8],
+    encoded_bytes: usize,
+) -> Result<CompiledCore, CoreError> {
+    let expected = topology
+        .physical_blocks
+        .checked_mul(BLOCK_BYTES)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    if replacement_span.len() != expected {
+        return Err(CoreError::InvalidFilesystem(
+            "big-pcluster replacement span length differs from CBLKCNT footprint",
+        ));
+    }
+
+    let mut view = EffectiveBlockStore::open(origin_path, BLOCK_SIZE).map_err(CoreError::View)?;
+    for block_index in 0..topology.physical_blocks {
+        let start = block_index
+            .checked_mul(BLOCK_BYTES)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let end = start
+            .checked_add(BLOCK_BYTES)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let logical_block = topology
+            .pcluster
+            .checked_add(u64::try_from(block_index).map_err(|_| CoreError::ArithmeticOverflow)?)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        view.block_mut(logical_block)
+            .map_err(CoreError::View)?
+            .copy_from_slice(
+                replacement_span
+                    .get(start..end)
+                    .ok_or(CoreError::UnexpectedEndOfStructure)?,
+            );
+    }
+    let compiled = view.finalize().map_err(CoreError::View)?;
+    if compiled.shadow_blocks != topology.physical_blocks {
+        return Err(CoreError::InvalidFilesystem(
+            "big-pcluster shadow block count differs from CBLKCNT",
+        ));
+    }
+
+    Ok(CompiledCore {
+        map: compiled.map,
+        shadow: compiled.shadow,
+        block_size: compiled.block_size,
+        origin_nid: topology.nid,
+        origin_pclusters: vec![topology.pcluster],
+        replacement_pclusters: vec![replacement_pcluster],
+        head_lclusters: vec![0],
+        encoded_bytes: vec![encoded_bytes],
+        logical_lclusters: topology.logical_lclusters,
+        compact_2b_entries: topology.compact_2b_entries,
+        shadow_blocks: compiled.shadow_blocks,
+    })
+}
+
 fn validate_compatible_topology(
     origin: &Topology,
     replacement: &Topology,
@@ -318,6 +496,21 @@ fn validate_compatible_topology(
     {
         return Err(CoreError::IncompatibleReplacement(
             "compressed HEAD-lcluster topology differs",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_big_compatible_topology(
+    origin: &BigTopology,
+    replacement: &BigTopology,
+) -> Result<(), CoreError> {
+    if origin.logical_size != replacement.logical_size
+        || origin.logical_lclusters != replacement.logical_lclusters
+        || origin.physical_blocks != replacement.physical_blocks
+    {
+        return Err(CoreError::IncompatibleReplacement(
+            "logical size/lcluster count or big-pcluster footprint differs",
         ));
     }
     Ok(())
@@ -429,6 +622,11 @@ impl Image {
     }
 
     fn read_topology(&mut self, nid: u64) -> Result<Topology, CoreError> {
+        if self.sb.incompat != FEATURE_LZ4_0PADDING {
+            return Err(CoreError::UnsupportedFilesystem(
+                "normal compact mode does not accept big-pcluster incompatible features",
+            ));
+        }
         let inode = self.read_inode(nid)?;
         let logical_lclusters = validate_target_inode(&inode)?;
         let compressed_blocks =
@@ -439,40 +637,25 @@ impl Image {
             ));
         }
 
-        let header_offset = align8(
-            inode
-                .offset
-                .checked_add(inode.isize)
-                .and_then(|value| value.checked_add(inode.xattr_size))
-                .ok_or(CoreError::ArithmeticOverflow)?,
-        )?;
-        ensure_range(self.bytes, header_offset, MAP_HEADER_SIZE)?;
-        let mut header = [0_u8; 8];
-        read_exact_at(&mut self.file, header_offset, &mut header)?;
-        let advise = read_u16(&header, 4)?;
-        if advise != ADVISE_COMPACTED_2B {
+        let map = self.read_map_header(&inode, logical_lclusters)?;
+        if map.advise != ADVISE_COMPACTED_2B {
             return Err(CoreError::UnsupportedInode(
                 "compact core requires only COMPACTED_2B advice",
             ));
         }
-        let algorithm = header[6] & 0x0f;
-        if algorithm != LZ4_ALGORITHM || header[6] >> 4 != 0 {
+        if map.algorithm != LZ4_ALGORITHM || map.secondary_algorithm != 0 {
             return Err(CoreError::UnsupportedInode(
                 "compact core supports only HEAD1 LZ4",
             ));
         }
-        if header[7] != 0 {
+        if map.cluster_bits != 0 {
             return Err(CoreError::UnsupportedInode(
                 "compact core requires 4 KiB logical clusters without packed fragments",
             ));
         }
 
-        let ebase = header_offset
-            .checked_add(MAP_HEADER_SIZE)
-            .ok_or(CoreError::ArithmeticOverflow)?;
-        let regions = compact_regions(ebase, logical_lclusters)?;
-        let entries = self.read_all_entries(ebase, logical_lclusters)?;
-        let heads = self.recover_heads(ebase, logical_lclusters, &entries)?;
+        let entries = self.read_all_entries(map.ebase, logical_lclusters)?;
+        let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;
         if heads.len() != compressed_blocks {
             return Err(CoreError::InvalidFilesystem(
                 "compressed block count does not match recovered HEAD count",
@@ -484,11 +667,87 @@ impl Image {
         Ok(Topology {
             nid,
             logical_size: inode.size,
-            algorithm,
-            advise,
+            algorithm: map.algorithm,
+            advise: map.advise,
             logical_lclusters,
-            compact_2b_entries: regions.compact_2b,
+            compact_2b_entries: map.regions.compact_2b,
             heads,
+        })
+    }
+
+    fn read_big_topology(&mut self, nid: u64) -> Result<BigTopology, CoreError> {
+        if self.sb.incompat != BIG_REQUIRED_INCOMPAT {
+            return Err(CoreError::UnsupportedFilesystem(
+                "big-pcluster proof requires only LZ4_0PADDING + big-pcluster incompatible features",
+            ));
+        }
+        let inode = self.read_inode(nid)?;
+        let logical_lclusters = validate_target_inode(&inode)?;
+        let physical_blocks =
+            usize::try_from(inode.data_word).map_err(|_| CoreError::ArithmeticOverflow)?;
+        if physical_blocks != BIG_PROOF_PHYSICAL_BLOCKS {
+            return Err(CoreError::UnsupportedInode(
+                "big-pcluster proof requires exactly two encoded physical blocks",
+            ));
+        }
+
+        let map = self.read_map_header(&inode, logical_lclusters)?;
+        if map.advise != BIG_ADVISE {
+            return Err(CoreError::UnsupportedInode(
+                "big-pcluster proof requires COMPACTED_2B plus both big-pcluster advice bits",
+            ));
+        }
+        if map.algorithm != LZ4_ALGORITHM
+            || map.secondary_algorithm != 0
+            || map.cluster_bits != 0
+        {
+            return Err(CoreError::UnsupportedInode(
+                "big-pcluster proof requires HEAD1 LZ4 with 4 KiB logical clusters",
+            ));
+        }
+
+        let entries = self.read_all_entries(map.ebase, logical_lclusters)?;
+        validate_big_single_extent(&entries, logical_lclusters)?;
+        let head = entries.first().ok_or(CoreError::InvalidFilesystem(
+            "compact index stream is empty",
+        ))?;
+        validate_block_span(head.base_pblk, physical_blocks, self.bytes)?;
+
+        Ok(BigTopology {
+            nid,
+            logical_size: inode.size,
+            logical_lclusters,
+            pcluster: head.base_pblk,
+            physical_blocks,
+            compact_2b_entries: map.regions.compact_2b,
+        })
+    }
+
+    fn read_map_header(
+        &mut self,
+        inode: &Inode,
+        logical_lclusters: usize,
+    ) -> Result<MapHeader, CoreError> {
+        let header_offset = align8(
+            inode
+                .offset
+                .checked_add(inode.isize)
+                .and_then(|value| value.checked_add(inode.xattr_size))
+                .ok_or(CoreError::ArithmeticOverflow)?,
+        )?;
+        ensure_range(self.bytes, header_offset, MAP_HEADER_SIZE)?;
+        let mut header = [0_u8; 8];
+        read_exact_at(&mut self.file, header_offset, &mut header)?;
+        let ebase = header_offset
+            .checked_add(MAP_HEADER_SIZE)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        Ok(MapHeader {
+            ebase,
+            regions: compact_regions(ebase, logical_lclusters)?,
+            advise: read_u16(&header, 4)?,
+            algorithm: header[6] & 0x0f,
+            secondary_algorithm: header[6] >> 4,
+            cluster_bits: header[7],
         })
     }
 
@@ -650,6 +909,21 @@ impl Image {
         read_exact_at(&mut self.file, offset, &mut bytes)?;
         Ok(bytes)
     }
+
+    fn read_span(&mut self, block: u64, count: usize) -> Result<Vec<u8>, CoreError> {
+        let mut span = Vec::with_capacity(
+            count
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(CoreError::ArithmeticOverflow)?,
+        );
+        for index in 0..count {
+            let physical = block
+                .checked_add(u64::try_from(index).map_err(|_| CoreError::ArithmeticOverflow)?)
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            span.extend_from_slice(&self.read_block(physical)?);
+        }
+        Ok(span)
+    }
 }
 
 fn validate_target_inode(inode: &Inode) -> Result<usize, CoreError> {
@@ -719,6 +993,54 @@ fn validate_nonheads(
     Ok(())
 }
 
+fn validate_big_single_extent(entries: &[CompactEntry], total: usize) -> Result<(), CoreError> {
+    let head = entries.first().ok_or(CoreError::InvalidFilesystem(
+        "compact index stream is empty",
+    ))?;
+    if head.kind != LCLUSTER_HEAD1 || head.low != 0 || head.slot != 0 {
+        return Err(CoreError::InvalidFilesystem(
+            "big-pcluster extent must begin with slot-0 zero-offset HEAD1",
+        ));
+    }
+    if total < 2 {
+        return Err(CoreError::UnsupportedInode(
+            "big pcluster needs a following index for CBLKCNT",
+        ));
+    }
+    let cblk = entries
+        .get(1)
+        .ok_or(CoreError::InvalidFilesystem("missing CBLKCNT index"))?;
+    if cblk.kind != LCLUSTER_NONHEAD
+        || cblk.low & D0_CBLKCNT == 0
+        || usize::from(cblk.low & !D0_CBLKCNT) != BIG_PROOF_PHYSICAL_BLOCKS
+    {
+        return Err(CoreError::InvalidFilesystem(
+            "first NONHEAD does not encode a two-block CBLKCNT",
+        ));
+    }
+    for (lcn, entry) in entries.iter().enumerate().skip(2) {
+        if entry.kind != LCLUSTER_NONHEAD || entry.low & D0_CBLKCNT != 0 {
+            return Err(CoreError::InvalidFilesystem(
+                "big-pcluster extent contains an unexpected entry after CBLKCNT",
+            ));
+        }
+        let expected = if entry.slot + 1 == entry.slots {
+            total
+                .checked_sub(lcn)
+                .ok_or(CoreError::ArithmeticOverflow)?
+        } else {
+            lcn
+        };
+        let expected = u16::try_from(expected).map_err(|_| CoreError::ArithmeticOverflow)?;
+        if entry.low != expected {
+            return Err(CoreError::InvalidFilesystem(
+                "NONHEAD lookback/lookahead disagrees with one-head big extent",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_head_blocks(heads: &[Head], image_bytes: u64) -> Result<(), CoreError> {
     let block_count = image_bytes / u64::from(BLOCK_SIZE);
     let mut previous = None;
@@ -736,6 +1058,20 @@ fn validate_head_blocks(heads: &[Head], image_bytes: u64) -> Result<(), CoreErro
             }
         }
         previous = Some(head.pcluster);
+    }
+    Ok(())
+}
+
+fn validate_block_span(block: u64, count: usize, image_bytes: u64) -> Result<(), CoreError> {
+    let count = u64::try_from(count).map_err(|_| CoreError::ArithmeticOverflow)?;
+    let end = block
+        .checked_add(count)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    let block_count = image_bytes / u64::from(BLOCK_SIZE);
+    if end > block_count {
+        return Err(CoreError::InvalidFilesystem(
+            "big pcluster extends beyond image",
+        ));
     }
     Ok(())
 }
@@ -847,7 +1183,7 @@ fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, CoreError>
         ));
     }
     let incompat = read_u32(&raw, 0x50)?;
-    if incompat & !FEATURE_LZ4_0PADDING != 0 {
+    if incompat & !SUPPORTED_INCOMPAT != 0 {
         return Err(CoreError::UnsupportedFilesystem(
             "compact image enables unsupported incompatible EROFS features",
         ));
@@ -865,6 +1201,7 @@ fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, CoreError>
     Ok(Superblock {
         root_nid: u64::from(read_u16(&raw, 0x0e)?),
         meta_block: u64::from(read_u32(&raw, 0x28)?),
+        incompat,
     })
 }
 
@@ -1060,7 +1397,9 @@ impl fmt::Display for CoreError {
                 f,
                 "raw LZ4 extent at HEAD lcluster {head_lcn} does not fit existing pcluster: encoded {encoded} bytes, capacity {capacity}"
             ),
-            Self::CompressionValidationFailed => write!(f, "compact raw LZ4 round-trip validation failed"),
+            Self::CompressionValidationFailed => {
+                write!(f, "compact raw LZ4 round-trip validation failed")
+            }
             Self::InvalidPath(reason) => write!(f, "invalid EROFS path: {reason}"),
             Self::PathNotFound(name) => write!(f, "EROFS path component not found: {name:?}"),
             Self::NotDirectory(nid) => write!(f, "EROFS nid {nid} is not a directory"),
@@ -1131,5 +1470,51 @@ mod tests {
             encode_extent(8, &bad),
             Err(CoreError::CompressionDoesNotFit { head_lcn: 8, .. })
         ));
+    }
+
+    #[test]
+    fn cblkcnt_marker_is_bit_11_of_compact_low_field() {
+        assert_eq!(D0_CBLKCNT, 0x0800);
+        assert_eq!((D0_CBLKCNT | 2) & !D0_CBLKCNT, 2);
+    }
+
+    #[test]
+    fn one_head_two_block_extent_accepts_cblkcnt() {
+        let entries = vec![
+            CompactEntry {
+                kind: LCLUSTER_HEAD1,
+                low: 0,
+                slot: 0,
+                slots: 2,
+                base_pblk: 100,
+            },
+            CompactEntry {
+                kind: LCLUSTER_NONHEAD,
+                low: D0_CBLKCNT | 2,
+                slot: 1,
+                slots: 2,
+                base_pblk: 100,
+            },
+            CompactEntry {
+                kind: LCLUSTER_NONHEAD,
+                low: 2,
+                slot: 0,
+                slots: 2,
+                base_pblk: 102,
+            },
+        ];
+        assert!(validate_big_single_extent(&entries, 3).is_ok());
+    }
+
+    #[test]
+    fn eight_kib_0padding_span_round_trips() {
+        let mut input = vec![b'P'; 32768];
+        input[64..84].copy_from_slice(b"LOOM-STAGE20-BIG-LZ4");
+        let encoded = lz4::encode(&input).unwrap();
+        assert!(encoded.len() < 8192);
+        let mut span = vec![0_u8; 8192];
+        let start = span.len() - encoded.len();
+        span[start..].copy_from_slice(&encoded);
+        assert_eq!(lz4::decode_0padding(&span, input.len()).unwrap(), input);
     }
 }
