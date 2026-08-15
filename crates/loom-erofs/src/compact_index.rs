@@ -22,13 +22,13 @@ const DATA_FLAT_PLAIN: u8 = 0;
 const DATA_FLAT_INLINE: u8 = 2;
 const DATA_COMPRESSED_COMPACT: u8 = 3;
 const MAP_HEADER_SIZE: u64 = 8;
-const COMPACT_PACK_SIZE: usize = 8;
 const LCLUSTER_HEAD1: u16 = 1;
 const LCLUSTER_NONHEAD: u16 = 2;
 const LCLUSTER_TYPE_MASK: u16 = 3;
 const ADVISE_COMPACTED_2B: u16 = 0x0001;
 const LZ4_ALGORITHM: u8 = 0;
 const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
+const MAX_SINGLE_EXTENT_LCLUSTERS: usize = 2048;
 
 const LZ4_MIN_MATCH: usize = 4;
 const LZ4_LAST_LITERALS: usize = 5;
@@ -45,6 +45,8 @@ pub struct CompiledSwap {
     pub origin_pcluster: u64,
     pub replacement_pcluster: u64,
     pub encoded_bytes: usize,
+    pub logical_lclusters: usize,
+    pub compact_2b_entries: usize,
     pub shadow_blocks: usize,
 }
 
@@ -55,6 +57,8 @@ struct Extent {
     pcluster: u64,
     algorithm: u8,
     advise: u16,
+    logical_lclusters: usize,
+    compact_2b_entries: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,18 +85,33 @@ impl Inode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactRegions {
+    initial_4b: usize,
+    compact_2b: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompactEntry {
+    kind: u16,
+    low: u16,
+    slot: usize,
+    slots: usize,
+    base_pblk: u64,
+}
+
 struct Image {
     file: File,
     bytes: u64,
     sb: Superblock,
 }
 
-/// Swaps one complete encoded pcluster for the minimal two-lcluster EROFS compact layout.
+/// Swaps one complete encoded pcluster for a single-extent compact EROFS file.
 ///
-/// Both images must use 4 KiB blocks, `COMPRESSED_COMPACT`, one encoded physical block,
-/// one two-entry 4-byte compact pack representing `HEAD1 + NONHEAD`, LZ4, zero HEAD
-/// cluster offset, and no compact features other than the standard `COMPACTED_2B` advise.
-/// The compact metadata itself is never modified.
+/// The supported proof shape uses 4 KiB blocks/lclusters, `COMPRESSED_COMPACT`, LZ4,
+/// `COMPACTED_2B`, one physical pcluster and one logical extent beginning at lcluster 0.
+/// The compact index stream may contain initial/trailing 4-byte entries and one or more
+/// true 16-entry 2-byte packs. Compact metadata itself is never modified.
 ///
 /// # Errors
 /// Returns [`IndexError`] for unsupported/corrupt layouts, incompatible replacement
@@ -106,8 +125,8 @@ pub fn compile_pcluster_swap(
     let mut replacement = Image::open(replacement_image_path)?;
     let origin_nid = origin.resolve_path(target_path)?;
     let replacement_nid = replacement.resolve_path(target_path)?;
-    let origin_extent = origin.read_minimal_extent(origin_nid)?;
-    let replacement_extent = replacement.read_minimal_extent(replacement_nid)?;
+    let origin_extent = origin.read_single_pcluster_extent(origin_nid)?;
+    let replacement_extent = replacement.read_single_pcluster_extent(replacement_nid)?;
 
     if origin_extent.logical_size != replacement_extent.logical_size {
         return Err(IndexError::IncompatibleReplacement(
@@ -122,6 +141,11 @@ pub fn compile_pcluster_swap(
     if origin_extent.advise != replacement_extent.advise {
         return Err(IndexError::IncompatibleReplacement(
             "compact map advice differs",
+        ));
+    }
+    if origin_extent.logical_lclusters != replacement_extent.logical_lclusters {
+        return Err(IndexError::IncompatibleReplacement(
+            "logical compact-index lengths differ",
         ));
     }
 
@@ -139,10 +163,7 @@ impl CompiledSwap {
     /// Encodes a plain replacement payload into the existing compact `0PADDING` LZ4 pcluster.
     ///
     /// The encoded LZ4 block is right-aligned in the 4 KiB physical pcluster and the
-    /// leading bytes are zero-filled, matching the EROFS `LZ4_0PADDING` on-disk layout.
-    /// The compact indexes remain authoritative and untouched. If the complete 8 KiB
-    /// logical replacement cannot fit in the existing one-block encoded footprint, this
-    /// operation fails closed.
+    /// leading bytes are zero-filled. Compact indexes remain authoritative and untouched.
     ///
     /// # Errors
     /// Returns [`IndexError`] for unsupported compact metadata, replacement-size mismatch,
@@ -155,7 +176,7 @@ impl CompiledSwap {
         let replacement = fs::read(replacement_path).map_err(IndexError::Io)?;
         let mut origin = Image::open(origin_path)?;
         let origin_nid = origin.resolve_path(target_path)?;
-        let extent = origin.read_minimal_extent(origin_nid)?;
+        let extent = origin.read_single_pcluster_extent(origin_nid)?;
         let actual = u64::try_from(replacement.len()).map_err(|_| IndexError::ArithmeticOverflow)?;
         if actual != extent.logical_size {
             return Err(IndexError::ReplacementSizeMismatch {
@@ -228,6 +249,8 @@ fn compile_shadow(
         origin_pcluster: extent.pcluster,
         replacement_pcluster,
         encoded_bytes,
+        logical_lclusters: extent.logical_lclusters,
+        compact_2b_entries: extent.compact_2b_entries,
         shadow_blocks: compiled.shadow_blocks,
     })
 }
@@ -339,9 +362,9 @@ impl Image {
         ))
     }
 
-    fn read_minimal_extent(&mut self, nid: u64) -> Result<Extent, IndexError> {
+    fn read_single_pcluster_extent(&mut self, nid: u64) -> Result<Extent, IndexError> {
         let inode = self.read_inode(nid)?;
-        self.validate_target_inode(&inode)?;
+        let logical_lclusters = self.validate_target_inode(&inode)?;
         let header_offset = align8(
             inode
                 .offset
@@ -349,7 +372,7 @@ impl Image {
                 .and_then(|value| value.checked_add(inode.xattr_size))
                 .ok_or(IndexError::ArithmeticOverflow)?,
         )?;
-        ensure_range(self.bytes, header_offset, MAP_HEADER_SIZE + 8)?;
+        ensure_range(self.bytes, header_offset, MAP_HEADER_SIZE)?;
 
         let mut header = [0_u8; 8];
         read_exact_at(&mut self.file, header_offset, &mut header)?;
@@ -371,21 +394,23 @@ impl Image {
             ));
         }
 
-        let pcluster = self.read_compact_pack(
-            header_offset
-                .checked_add(MAP_HEADER_SIZE)
-                .ok_or(IndexError::ArithmeticOverflow)?,
-        )?;
+        let ebase = header_offset
+            .checked_add(MAP_HEADER_SIZE)
+            .ok_or(IndexError::ArithmeticOverflow)?;
+        let regions = compact_regions(ebase, logical_lclusters)?;
+        let pcluster = self.validate_single_extent_indexes(ebase, logical_lclusters)?;
         Ok(Extent {
             nid,
             logical_size: inode.size,
             pcluster,
             algorithm,
             advise,
+            logical_lclusters,
+            compact_2b_entries: regions.compact_2b,
         })
     }
 
-    fn validate_target_inode(&self, inode: &Inode) -> Result<(), IndexError> {
+    fn validate_target_inode(&self, inode: &Inode) -> Result<usize, IndexError> {
         if inode.file_type() != MODE_REGULAR {
             return Err(IndexError::NotRegularFile(inode.nid));
         }
@@ -399,9 +424,16 @@ impl Image {
                 "compact target must not carry xattrs",
             ));
         }
-        if inode.size != u64::from(BLOCK_SIZE) * 2 {
+        if inode.size < u64::from(BLOCK_SIZE) * 2 || inode.size % u64::from(BLOCK_SIZE) != 0 {
             return Err(IndexError::UnsupportedInode(
-                "compact proof requires exactly two logical filesystem blocks",
+                "compact proof requires a whole-block file of at least two lclusters",
+            ));
+        }
+        let logical_lclusters = usize::try_from(inode.size / u64::from(BLOCK_SIZE))
+            .map_err(|_| IndexError::ArithmeticOverflow)?;
+        if logical_lclusters > MAX_SINGLE_EXTENT_LCLUSTERS {
+            return Err(IndexError::UnsupportedInode(
+                "single-pcluster proof caps lookback distance below CBLKCNT encoding",
             ));
         }
         if inode.data_word != 1 {
@@ -409,39 +441,110 @@ impl Image {
                 "compact proof requires exactly one encoded physical block",
             ));
         }
-        Ok(())
+        Ok(logical_lclusters)
     }
 
-    fn read_compact_pack(&mut self, offset: u64) -> Result<u64, IndexError> {
-        ensure_range(
-            self.bytes,
-            offset,
-            u64::try_from(COMPACT_PACK_SIZE).map_err(|_| IndexError::ArithmeticOverflow)?,
-        )?;
-        let mut pack = [0_u8; COMPACT_PACK_SIZE];
-        read_exact_at(&mut self.file, offset, &mut pack)?;
-
-        let head = read_u16(&pack, 0)?;
-        if compact_type(head) != LCLUSTER_HEAD1 || compact_value(head) != 0 {
+    fn validate_single_extent_indexes(
+        &mut self,
+        ebase: u64,
+        total: usize,
+    ) -> Result<u64, IndexError> {
+        let head = self.read_compact_entry(ebase, total, 0)?;
+        if head.kind != LCLUSTER_HEAD1 || head.low != 0 || head.slot != 0 {
             return Err(IndexError::UnsupportedInode(
-                "first compact entry must be HEAD1 with zero cluster offset",
+                "single compact extent must begin with slot-0 HEAD1 at offset zero",
             ));
         }
-        let nonhead = read_u16(&pack, 2)?;
-        if compact_type(nonhead) != LCLUSTER_NONHEAD || compact_value(nonhead) != 1 {
-            return Err(IndexError::UnsupportedInode(
-                "final compact NONHEAD must encode one-lcluster lookahead",
-            ));
-        }
-
-        let base = u64::from(read_u32(&pack, 4)?);
-        let pcluster = base.checked_add(1).ok_or(IndexError::ArithmeticOverflow)?;
+        let pcluster = head
+            .base_pblk
+            .checked_add(1)
+            .ok_or(IndexError::ArithmeticOverflow)?;
         if pcluster >= self.bytes / u64::from(BLOCK_SIZE) {
             return Err(IndexError::InvalidFilesystem(
                 "compact pcluster lies beyond image",
             ));
         }
+
+        for lcn in 1..total {
+            let entry = self.read_compact_entry(ebase, total, lcn)?;
+            if entry.kind != LCLUSTER_NONHEAD {
+                return Err(IndexError::UnsupportedInode(
+                    "single-pcluster compact proof requires NONHEAD after lcluster zero",
+                ));
+            }
+            let expected = if entry.slot + 1 == entry.slots {
+                total
+                    .checked_sub(lcn)
+                    .ok_or(IndexError::ArithmeticOverflow)?
+            } else {
+                lcn
+            };
+            let expected = u16::try_from(expected).map_err(|_| IndexError::ArithmeticOverflow)?;
+            if entry.low != expected {
+                return Err(IndexError::UnsupportedInode(
+                    "compact NONHEAD lookback/lookahead value does not match one-head extent",
+                ));
+            }
+        }
         Ok(pcluster)
+    }
+
+    fn read_compact_entry(
+        &mut self,
+        ebase: u64,
+        total: usize,
+        lcn: usize,
+    ) -> Result<CompactEntry, IndexError> {
+        if lcn >= total {
+            return Err(IndexError::InvalidFilesystem(
+                "compact lcluster index lies beyond logical file",
+            ));
+        }
+        let regions = compact_regions(ebase, total)?;
+        let (shift, pos) = compact_entry_position(ebase, regions, lcn)?;
+        let entry_bytes = 1_usize
+            .checked_shl(shift)
+            .ok_or(IndexError::ArithmeticOverflow)?;
+        let slots = if entry_bytes == 4 { 2 } else { 16 };
+        let pack_bytes = entry_bytes
+            .checked_mul(slots)
+            .ok_or(IndexError::ArithmeticOverflow)?;
+        let pack_bytes_u64 = u64::try_from(pack_bytes).map_err(|_| IndexError::ArithmeticOverflow)?;
+        let pack_start = pos - (pos % pack_bytes_u64);
+        ensure_range(self.bytes, pack_start, pack_bytes_u64)?;
+        let mut pack = vec![0_u8; pack_bytes];
+        read_exact_at(&mut self.file, pack_start, &mut pack)?;
+
+        let slot = usize::try_from((pos - pack_start) / u64::try_from(entry_bytes)
+            .map_err(|_| IndexError::ArithmeticOverflow)?)
+            .map_err(|_| IndexError::ArithmeticOverflow)?;
+        if slot >= slots {
+            return Err(IndexError::InvalidFilesystem(
+                "compact entry slot lies beyond pack",
+            ));
+        }
+        let encode_bits = (pack_bytes
+            .checked_mul(8)
+            .and_then(|bits| bits.checked_sub(32))
+            .ok_or(IndexError::ArithmeticOverflow)?)
+            / slots;
+        let bit_pos = encode_bits
+            .checked_mul(slot)
+            .ok_or(IndexError::ArithmeticOverflow)?;
+        let byte_pos = bit_pos / 8;
+        let word = read_u32(&pack, byte_pos)? >> (bit_pos & 7);
+        let low = u16::try_from(word & u32::from(OFFSET_MASK))
+            .map_err(|_| IndexError::ArithmeticOverflow)?;
+        let kind = u16::try_from((word >> BLOCK_BITS) & u32::from(LCLUSTER_TYPE_MASK))
+            .map_err(|_| IndexError::ArithmeticOverflow)?;
+        let base_pblk = u64::from(read_u32(&pack, pack_bytes - 4)?);
+        Ok(CompactEntry {
+            kind,
+            low,
+            slot,
+            slots,
+            base_pblk,
+        })
     }
 
     fn read_block(&mut self, block: u64) -> Result<Vec<u8>, IndexError> {
@@ -454,6 +557,74 @@ impl Image {
         read_exact_at(&mut self.file, offset, &mut bytes)?;
         Ok(bytes)
     }
+}
+
+fn compact_regions(ebase: u64, total: usize) -> Result<CompactRegions, IndexError> {
+    let modulo = usize::try_from(ebase % 32).map_err(|_| IndexError::ArithmeticOverflow)?;
+    let mut initial_4b = (32_usize
+        .checked_sub(modulo)
+        .ok_or(IndexError::ArithmeticOverflow)?)
+        / 4;
+    if initial_4b == 8 {
+        initial_4b = 0;
+    }
+    let compact_2b = if initial_4b < total {
+        ((total - initial_4b) / 16) * 16
+    } else {
+        0
+    };
+    Ok(CompactRegions {
+        initial_4b,
+        compact_2b,
+    })
+}
+
+fn compact_entry_position(
+    ebase: u64,
+    regions: CompactRegions,
+    lcn: usize,
+) -> Result<(u32, u64), IndexError> {
+    if lcn < regions.initial_4b {
+        let delta = u64::try_from(lcn.checked_mul(4).ok_or(IndexError::ArithmeticOverflow)?)
+            .map_err(|_| IndexError::ArithmeticOverflow)?;
+        return Ok((2, ebase.checked_add(delta).ok_or(IndexError::ArithmeticOverflow)?));
+    }
+
+    let initial_bytes = u64::try_from(
+        regions
+            .initial_4b
+            .checked_mul(4)
+            .ok_or(IndexError::ArithmeticOverflow)?,
+    )
+    .map_err(|_| IndexError::ArithmeticOverflow)?;
+    let mut pos = ebase
+        .checked_add(initial_bytes)
+        .ok_or(IndexError::ArithmeticOverflow)?;
+    let relative = lcn
+        .checked_sub(regions.initial_4b)
+        .ok_or(IndexError::ArithmeticOverflow)?;
+    if relative < regions.compact_2b {
+        let delta = u64::try_from(relative.checked_mul(2).ok_or(IndexError::ArithmeticOverflow)?)
+            .map_err(|_| IndexError::ArithmeticOverflow)?;
+        return Ok((1, pos.checked_add(delta).ok_or(IndexError::ArithmeticOverflow)?));
+    }
+
+    let compact_bytes = u64::try_from(
+        regions
+            .compact_2b
+            .checked_mul(2)
+            .ok_or(IndexError::ArithmeticOverflow)?,
+    )
+    .map_err(|_| IndexError::ArithmeticOverflow)?;
+    pos = pos
+        .checked_add(compact_bytes)
+        .ok_or(IndexError::ArithmeticOverflow)?;
+    let trailing = relative
+        .checked_sub(regions.compact_2b)
+        .ok_or(IndexError::ArithmeticOverflow)?;
+    let delta = u64::try_from(trailing.checked_mul(4).ok_or(IndexError::ArithmeticOverflow)?)
+        .map_err(|_| IndexError::ArithmeticOverflow)?;
+    Ok((2, pos.checked_add(delta).ok_or(IndexError::ArithmeticOverflow)?))
 }
 
 fn encode_lz4_block(input: &[u8]) -> Result<Vec<u8>, IndexError> {
@@ -674,14 +845,6 @@ fn read_lz4_length(encoded: &[u8], input_pos: &mut usize) -> Result<usize, Index
             return Ok(total);
         }
     }
-}
-
-fn compact_type(value: u16) -> u16 {
-    (value >> BLOCK_BITS) & LCLUSTER_TYPE_MASK
-}
-
-fn compact_value(value: u16) -> u16 {
-    value & OFFSET_MASK
 }
 
 fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, IndexError> {
@@ -935,11 +1098,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn minimal_pack_decodes_expected_types_and_offsets() {
-        assert_eq!(compact_type(0x1000), LCLUSTER_HEAD1);
-        assert_eq!(compact_value(0x1000), 0);
-        assert_eq!(compact_type(0x2001), LCLUSTER_NONHEAD);
-        assert_eq!(compact_value(0x2001), 1);
+    fn two_lclusters_stay_in_4b_compact_tail() {
+        for modulo in [0_u64, 8, 16, 24] {
+            let regions = compact_regions(64 + modulo, 2).unwrap();
+            assert_eq!(regions.compact_2b, 0);
+        }
+    }
+
+    #[test]
+    fn twenty_four_lclusters_force_one_2b_pack_for_every_alignment() {
+        for modulo in [0_u64, 8, 16, 24] {
+            let regions = compact_regions(64 + modulo, 24).unwrap();
+            assert_eq!(regions.compact_2b, 16);
+        }
     }
 
     #[test]
