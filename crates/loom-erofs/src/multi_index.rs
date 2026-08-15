@@ -4,6 +4,8 @@ use crate::compact_index::shared_core::{self, CompiledCore, CoreError};
 use loom_map::LoomMap;
 use std::path::Path;
 
+const BLOCK_BYTES: usize = 4096;
+
 pub type MultiIndexError = CoreError;
 
 #[derive(Debug)]
@@ -37,6 +39,25 @@ pub fn compile_multi_pcluster_swap(
     replacement_image_path: &Path,
 ) -> Result<CompiledMultiSwap, MultiIndexError> {
     from_core(shared_core::compile_oracle(
+        origin_path,
+        target_path,
+        replacement_image_path,
+    )?)
+}
+
+/// Compiles a compact EROFS oracle replacement over a validated multi-extent big-pcluster
+/// topology. CBLKCNT parsing and HEAD physical-address reconstruction remain owned by the
+/// unified compact core.
+///
+/// # Errors
+/// Returns [`MultiIndexError`] for malformed/unsupported big-pcluster topology, incompatible
+/// replacement images, I/O failures, or effective-view failures.
+pub fn compile_multi_big_pcluster_swap(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_image_path: &Path,
+) -> Result<CompiledMultiSwap, MultiIndexError> {
+    from_core(shared_core::compile_big_oracle(
         origin_path,
         target_path,
         replacement_image_path,
@@ -81,10 +102,19 @@ fn from_core(compiled: CompiledCore) -> Result<CompiledMultiSwap, MultiIndexErro
     if physical_pclusters != compiled.replacement_pclusters.len()
         || physical_pclusters != compiled.head_lclusters.len()
         || physical_pclusters != compiled.encoded_bytes.len()
-        || physical_pclusters != compiled.shadow_blocks
     {
         return Err(CoreError::InvalidFilesystem(
             "compact adapter received inconsistent compiled vectors",
+        ));
+    }
+
+    let expected_shadow_blocks = compiled.encoded_bytes.iter().try_fold(0_usize, |sum, bytes| {
+        sum.checked_add(bytes.div_ceil(BLOCK_BYTES))
+            .ok_or(CoreError::ArithmeticOverflow)
+    })?;
+    if expected_shadow_blocks != compiled.shadow_blocks {
+        return Err(CoreError::InvalidFilesystem(
+            "compiled shadow block count does not match encoded extent footprints",
         ));
     }
 
