@@ -40,6 +40,9 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
+      - name: Stage 8 effective block store
+        run: cargo test -p loom-view --test effective_store
+
       - name: Stage 0 ext4 sparse substitution
         run: bash tests/integration/stage0_ext4_dm_linear.sh
 
