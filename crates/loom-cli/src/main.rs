@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 
-use loom_ext4::{compile_resize_within_allocation, compile_same_size_replacement};
+use loom_ext4::{
+    compile_grow_with_block_allocation, compile_resize_within_allocation,
+    compile_same_size_replacement,
+};
 use loom_map::LoomMap;
 use loom_types::{Sector, SectorCount};
 use std::env;
@@ -28,6 +31,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "map-single" => command_map_single(&mut args)?,
         "ext4-replace" => command_ext4_replace(&mut args)?,
         "ext4-resize" => command_ext4_resize(&mut args)?,
+        "ext4-grow" => command_ext4_grow(&mut args)?,
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command {other:?}").into()),
     }
@@ -142,6 +146,44 @@ fn command_ext4_resize(args: &mut impl Iterator<Item = String>) -> Result<(), Bo
     Ok(())
 }
 
+fn command_ext4_grow(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let origin_image = required(args, "origin ext4 image")?;
+    let target_path = required(args, "target path")?;
+    let replacement = required(args, "replacement file")?;
+    let shadow_output = required(args, "shadow pack output")?;
+    let origin_device = required(args, "origin block device")?;
+    let shadow_device = required(args, "shadow block device")?;
+    let table_output = required(args, "dm table output")?;
+    ensure_no_extra_args(args)?;
+
+    let compiled = compile_grow_with_block_allocation(
+        Path::new(&origin_image),
+        &target_path,
+        Path::new(&replacement),
+    )?;
+    fs::write(&shadow_output, &compiled.shadow)?;
+    let table = compiled
+        .map
+        .to_dm_linear_table(&origin_device, &shadow_device)?;
+    fs::write(&table_output, table)?;
+
+    println!(
+        "ext4 grow compiled: inode={} original_size={} effective_size={} block_size={} original_data_blocks={} allocated_block={} allocation_group={} data_shadow_blocks={} metadata_blocks={} shadow_blocks={} shadow_bytes={}",
+        compiled.inode,
+        compiled.original_size,
+        compiled.effective_size,
+        compiled.block_size,
+        compiled.original_data_blocks,
+        compiled.allocated_block,
+        compiled.allocation_group,
+        compiled.data_shadow_blocks,
+        compiled.metadata_blocks,
+        compiled.shadow_blocks,
+        compiled.shadow.len()
+    );
+    Ok(())
+}
+
 fn required(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, Box<dyn Error>> {
     args.next()
         .ok_or_else(|| format!("missing required argument: {name}").into())
@@ -168,11 +210,12 @@ fn parse_usize(value: &str, name: &str) -> Result<usize, Box<dyn Error>> {
 
 fn print_usage() {
     eprintln!(
-        "Loom Stage 2\n\n\
+        "Loom Stage 3\n\n\
          Usage:\n\
            loom pack-block <input> <output-pack> <block-size>\n\
            loom map-single <total-sectors> <start-sector> <sector-count> <shadow-start-sector> \\\n<origin-device> <shadow-device> <output-table>\n\
            loom ext4-replace <origin-image> <target-path> <replacement> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
-           loom ext4-resize <origin-image> <target-path> <replacement> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n"
+           loom ext4-resize <origin-image> <target-path> <replacement> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
+           loom ext4-grow <origin-image> <target-path> <replacement> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n"
     );
 }
