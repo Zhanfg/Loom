@@ -1,0 +1,55 @@
+name: stage26-core-patch
+
+on:
+  push:
+    branches:
+      - feat/stage26-erofs-xattr-bearing-paths
+    paths:
+      - .github/workflows/stage26-core-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage26-erofs-xattr-bearing-paths
+      - name: Remove obsolete xattr refusals
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/loom-erofs/src/compact_core.rs')
+          text = path.read_text()
+
+          directory_guard = '''        if directory.xattr_size != 0 {
+              return Err(CoreError::UnsupportedInode(
+                  "compact path traversal refuses directory xattrs",
+              ));
+          }
+'''
+          target_guard = '''    if inode.xattr_size != 0 {
+              return Err(CoreError::UnsupportedInode(
+                  "compact target must not carry xattrs",
+              ));
+          }
+'''
+
+          assert text.count(directory_guard) == 1
+          assert text.count(target_guard) == 1
+          text = text.replace(directory_guard, '')
+          text = text.replace(target_guard, '')
+          path.write_text(text)
+          PY
+          cargo fmt --all
+      - name: Commit core patch and remove maintenance workflow
+        run: |
+          rm .github/workflows/stage26-core-patch.yml
+          git config user.name 'Axymorrsen'
+          git config user.email 'Axymosen@outlook.com'
+          git add crates/loom-erofs/src/compact_core.rs .github/workflows/stage26-core-patch.yml
+          git commit -m 'stage26: accept xattr-bearing compact EROFS paths'
+          git push origin HEAD:feat/stage26-erofs-xattr-bearing-paths
