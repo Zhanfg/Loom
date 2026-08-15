@@ -143,6 +143,8 @@ if "$LOOM" erofs-compact-pcluster-swap --multi \
   echo 'Stage 23 expected incompatible multi-big footprint rejection' >&2
   exit 1
 fi
+printf '%s\n' 'Stage 23 mismatch stderr:'
+cat "$WORK/mismatch.err"
 grep -Eq 'incompatible compact replacement: .*big-pcluster|big-pcluster .* differs' "$WORK/mismatch.err"
 [[ ! -e "$WORK/mismatch.shadow" ]]
 [[ ! -e "$WORK/mismatch.table" ]]
