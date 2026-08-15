@@ -25,22 +25,30 @@ jobs:
           s = p.read_text()
           marker = '        Ok(GroupState {\n'
           prefix = (
-              '        let free_blocks = descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?;\n'
-              '        let free_inodes = descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?;\n'
-              '        let itable_unused = descriptor_u32_count(&descriptor, GD_ITABLE_UNUSED_LO, GD_ITABLE_UNUSED_HI)?;\n\n'
+              '        let free_blocks =\n'
+              '            descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?;\n'
+              '        let free_inodes =\n'
+              '            descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?;\n'
+              '        let itable_unused =\n'
+              '            descriptor_u32_count(&descriptor, GD_ITABLE_UNUSED_LO, GD_ITABLE_UNUSED_HI)?;\n\n'
           )
           if prefix not in s:
               if marker not in s:
                   raise SystemExit('GroupState constructor marker not found')
               s = s.replace(marker, prefix + marker, 1)
-          s, n1 = re.subn(r'            free_blocks: descriptor_u32_count\(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI\)\?,\n', '            free_blocks,\n', s, count=1)
-          s, n2 = re.subn(r'            free_inodes: descriptor_u32_count\(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI\)\?,\n', '            free_inodes,\n', s, count=1)
-          s, n3 = re.subn(r'            itable_unused: descriptor_u32_count\(\n                &descriptor,\n                GD_ITABLE_UNUSED_LO,\n                GD_ITABLE_UNUSED_HI,\n            \)\?,\n', '            itable_unused,\n', s, count=1)
-          if (n1, n2, n3) != (1, 1, 1):
-              raise SystemExit(f'field rewrite mismatch: {(n1, n2, n3)}')
+          patterns = [
+              (r'            free_blocks: descriptor_u32_count\(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI\)\?,\n', '            free_blocks,\n'),
+              (r'            free_inodes: descriptor_u32_count\(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI\)\?,\n', '            free_inodes,\n'),
+              (r'            itable_unused: descriptor_u32_count\(\n                &descriptor,\n                GD_ITABLE_UNUSED_LO,\n                GD_ITABLE_UNUSED_HI,\n            \)\?,\n', '            itable_unused,\n'),
+          ]
+          counts = []
+          for pattern, replacement in patterns:
+              s, count = re.subn(pattern, replacement, s, count=1)
+              counts.append(count)
+          if counts != [1, 1, 1]:
+              raise SystemExit(f'field rewrite mismatch: {counts}')
           p.write_text(s)
           PY
-          cargo fmt --all
       - name: Commit fix
         run: |
           git config user.name github-actions[bot]
