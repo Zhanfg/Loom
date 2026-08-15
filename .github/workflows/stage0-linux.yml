@@ -69,3 +69,6 @@ jobs:
 
       - name: Stage 3 block allocation weaving
         run: bash tests/integration/stage3_ext4_block_allocation.sh
+
+      - name: Stage 4 create-file weaving
+        run: bash tests/integration/stage4_ext4_create_file.sh
