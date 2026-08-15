@@ -1,0 +1,66 @@
+name: stage4-call-fix
+
+on:
+  push:
+    branches:
+      - feat/stage4-ext4-create-file
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage4-ext4-create-file
+      - name: Repair exact inode-table call and constructor sites
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/loom-ext4/src/create.rs')
+          s = p.read_text()
+          old_call = (
+              '        append_shadow_block(\n'
+              '            &mut shadow,\n'
+              '            &mut replacements,\n'
+              '            sectors_per_block,\n'
+              '            &inode_table_shadow,\n'
+              '        )?;\n'
+          )
+          new_call = (
+              '        append_shadow_block(\n'
+              '            &mut shadow,\n'
+              '            &mut replacements,\n'
+              '            inode_table_block,\n'
+              '            sectors_per_block,\n'
+              '            &inode_table_shadow,\n'
+              '        )?;\n'
+          )
+          old_ctor = (
+              '            block_bitmap_block,\n'
+              '            inode_bitmap_block,\n'
+              '            inode_table_block,\n'
+              '            block_bitmap,\n'
+          )
+          new_ctor = (
+              '            block_bitmap_block,\n'
+              '            inode_bitmap_block,\n'
+              '            block_bitmap,\n'
+          )
+          if s.count(old_call) != 1:
+              raise SystemExit(f'expected one inode shadow call, got {s.count(old_call)}')
+          if s.count(old_ctor) != 1:
+              raise SystemExit(f'expected one GroupState constructor fragment, got {s.count(old_ctor)}')
+          s = s.replace(old_call, new_call, 1).replace(old_ctor, new_ctor, 1)
+          p.write_text(s)
+          PY
+      - name: Commit exact fix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/loom-ext4/src/create.rs
+          git commit -m 'fix(ext4): repair Stage 4 inode-table shadow wiring'
+          git push origin HEAD:feat/stage4-ext4-create-file
