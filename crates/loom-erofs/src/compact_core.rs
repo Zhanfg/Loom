@@ -730,9 +730,34 @@ impl Image {
             }
         }
         if directory.layout == DATA_FLAT_INLINE && directory.size % block_size != 0 {
-            return Err(CoreError::UnsupportedInode(
-                "target may lie in unsupported inline directory tail",
-            ));
+            let tail_len = usize::try_from(directory.size % block_size)
+                .map_err(|_| CoreError::ArithmeticOverflow)?;
+            let tail_offset = directory
+                .offset
+                .checked_add(directory.isize)
+                .and_then(|value| value.checked_add(directory.xattr_size))
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            let block_offset = usize::try_from(tail_offset % block_size)
+                .map_err(|_| CoreError::ArithmeticOverflow)?;
+            if block_offset
+                .checked_add(tail_len)
+                .ok_or(CoreError::ArithmeticOverflow)?
+                > BLOCK_BYTES
+            {
+                return Err(CoreError::InvalidFilesystem(
+                    "inline directory tail crosses its metadata block",
+                ));
+            }
+            ensure_range(
+                self.bytes,
+                tail_offset,
+                u64::try_from(tail_len).map_err(|_| CoreError::ArithmeticOverflow)?,
+            )?;
+            let mut tail = vec![0_u8; tail_len];
+            read_exact_at(&mut self.file, tail_offset, &mut tail)?;
+            if let Some(nid) = find_in_directory_block(&tail, name)? {
+                return Ok(nid);
+            }
         }
         Err(CoreError::PathNotFound(
             String::from_utf8_lossy(name).into_owned(),
