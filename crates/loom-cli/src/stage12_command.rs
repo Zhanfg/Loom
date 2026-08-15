@@ -1,25 +1,45 @@
 #![forbid(unsafe_code)]
 
-use loom_erofs::compile_compact_pcluster_swap;
+use loom_erofs::{compile_compact_pcluster_swap, CompiledCompactSwap};
 use std::error::Error;
 use std::fs;
 use std::path::Path;
 
 pub(crate) fn command(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
-    let origin_image = required(args, "origin compact EROFS image")?;
+    let first = required(args, "--encode or origin compact EROFS image")?;
+    let (encode, origin_image) = if first == "--encode" {
+        (true, required(args, "origin compact EROFS image")?)
+    } else {
+        (false, first)
+    };
     let target_path = required(args, "target path")?;
-    let replacement_image = required(args, "encoded replacement compact EROFS image")?;
+    let replacement = required(
+        args,
+        if encode {
+            "plain replacement payload"
+        } else {
+            "encoded replacement compact EROFS image"
+        },
+    )?;
     let shadow_output = required(args, "shadow pack output")?;
     let origin_device = required(args, "origin block device")?;
     let shadow_device = required(args, "shadow block device")?;
     let table_output = required(args, "dm table output")?;
     ensure_no_extra_args(args)?;
 
-    let compiled = compile_compact_pcluster_swap(
-        Path::new(&origin_image),
-        &target_path,
-        Path::new(&replacement_image),
-    )?;
+    let compiled = if encode {
+        CompiledCompactSwap::compile_lz4_replacement(
+            Path::new(&origin_image),
+            &target_path,
+            Path::new(&replacement),
+        )?
+    } else {
+        compile_compact_pcluster_swap(
+            Path::new(&origin_image),
+            &target_path,
+            Path::new(&replacement),
+        )?
+    };
     fs::write(&shadow_output, &compiled.shadow)?;
     let table = compiled
         .map
@@ -27,11 +47,13 @@ pub(crate) fn command(args: &mut impl Iterator<Item = String>) -> Result<(), Box
     fs::write(&table_output, table)?;
 
     println!(
-        "erofs compact pcluster swap compiled: origin_nid={} origin_pcluster={} replacement_pcluster={} block_size={} shadow_blocks={} shadow_bytes={}",
+        "erofs compact pcluster compiled: mode={} origin_nid={} origin_pcluster={} replacement_pcluster={} block_size={} encoded_bytes={} shadow_blocks={} shadow_bytes={}",
+        if encode { "encode" } else { "oracle" },
         compiled.origin_nid,
         compiled.origin_pcluster,
         compiled.replacement_pcluster,
         compiled.block_size,
+        compiled.encoded_bytes,
         compiled.shadow_blocks,
         compiled.shadow.len()
     );

@@ -27,5 +27,6 @@ bash tests/integration/stage9_erofs_flat_plain.sh
 bash tests/integration/stage10_erofs_compressed_pcluster.sh
 bash tests/integration/stage11_erofs_lz4_encoder.sh
 bash tests/integration/stage12_erofs_compact_pcluster.sh
+bash tests/integration/stage13_erofs_compact_lz4_encoder.sh
 
 printf '%s\n' 'Loom Linux filesystem hard gate PASS'
