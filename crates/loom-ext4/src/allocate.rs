@@ -109,6 +109,7 @@ pub fn compile_grow_with_block_allocation(
 }
 
 impl Ext4Image {
+    #[allow(clippy::too_many_lines)] // transaction orchestration; helpers own the individual mutations
     fn compile_one_block_growth(
         &mut self,
         inode_number: u32,
@@ -466,6 +467,7 @@ impl Ext4Image {
         })
     }
 
+    #[allow(clippy::too_many_arguments)] // all arguments are explicit ext4 accounting inputs
     fn build_grown_inode_block(
         &mut self,
         inode_number: u32,
@@ -530,9 +532,13 @@ impl Ext4Image {
             .ok_or(Ext4Error::InvalidFilesystem(
                 "superblock free-block count is already zero",
             ))?;
-        write_u32(&mut raw, SB_FREE_BLOCKS_LO, new_free as u32)?;
+        write_u32(&mut raw, SB_FREE_BLOCKS_LO, low_u32(new_free))?;
         if self.superblock.has_64bit {
-            write_u32(&mut raw, SB_FREE_BLOCKS_HI, (new_free >> 32) as u32)?;
+            write_u32(
+                &mut raw,
+                SB_FREE_BLOCKS_HI,
+                u32::try_from(new_free >> 32).map_err(|_| Ext4Error::ArithmeticOverflow)?,
+            )?;
         } else if new_free > u64::from(u32::MAX) {
             return Err(Ext4Error::InvalidFilesystem(
                 "32-bit filesystem has oversized free-block count",
@@ -660,12 +666,16 @@ fn rewrite_group_metadata(group: &mut GroupState, metadata: &FsMetadata) -> Resu
         .ok_or(Ext4Error::InvalidFilesystem(
             "group free-block count is already zero",
         ))?;
-    write_u16(&mut group.descriptor, GD_FREE_BLOCKS_LO, new_free as u16)?;
+    write_u16(
+        &mut group.descriptor,
+        GD_FREE_BLOCKS_LO,
+        low_u16(u64::from(new_free)),
+    )?;
     if group.descriptor.len() >= 64 {
         write_u16(
             &mut group.descriptor,
             GD_FREE_BLOCKS_HI,
-            (new_free >> 16) as u16,
+            u16::try_from(new_free >> 16).map_err(|_| Ext4Error::ArithmeticOverflow)?,
         )?;
     } else if new_free > u32::from(u16::MAX) {
         return Err(Ext4Error::InvalidFilesystem(
@@ -683,20 +693,24 @@ fn rewrite_group_metadata(group: &mut GroupState, metadata: &FsMetadata) -> Resu
     write_u16(
         &mut group.descriptor,
         GD_BLOCK_BITMAP_CSUM_LO,
-        bitmap_csum as u16,
+        low_u16(u64::from(bitmap_csum)),
     )?;
     if group.descriptor.len() >= GD_BITMAP_CSUM_HI_END {
         write_u16(
             &mut group.descriptor,
             GD_BLOCK_BITMAP_CSUM_HI,
-            (bitmap_csum >> 16) as u16,
+            u16::try_from(bitmap_csum >> 16).map_err(|_| Ext4Error::ArithmeticOverflow)?,
         )?;
     }
 
     write_u16(&mut group.descriptor, GD_CHECKSUM, 0)?;
     let mut descriptor_csum = crc32c(metadata.checksum_seed, &group.group.to_le_bytes());
     descriptor_csum = crc32c(descriptor_csum, &group.descriptor);
-    write_u16(&mut group.descriptor, GD_CHECKSUM, descriptor_csum as u16)?;
+    write_u16(
+        &mut group.descriptor,
+        GD_CHECKSUM,
+        low_u16(u64::from(descriptor_csum)),
+    )?;
 
     let descriptor_end = group
         .descriptor_offset
@@ -721,7 +735,7 @@ fn verify_group_descriptor_checksum(
     write_u16(&mut copy, GD_CHECKSUM, 0)?;
     let mut checksum = crc32c(checksum_seed, &group.to_le_bytes());
     checksum = crc32c(checksum, &copy);
-    if provided != checksum as u16 {
+    if provided != low_u16(u64::from(checksum)) {
         return Err(Ext4Error::InvalidFilesystem(
             "group descriptor checksum mismatch",
         ));
@@ -848,7 +862,11 @@ fn append_inline_extent(
         == allocated_block
         && last_len < 32_768
     {
-        write_u16(root, last_offset + 4, (last_len + 1) as u16)?;
+        write_u16(
+            root,
+            last_offset + 4,
+            u16::try_from(last_len + 1).map_err(|_| Ext4Error::ArithmeticOverflow)?,
+        )?;
         return Ok(());
     }
 
@@ -867,8 +885,12 @@ fn append_inline_extent(
     let logical = u32::try_from(original_blocks).map_err(|_| Ext4Error::ArithmeticOverflow)?;
     write_u32(root, new_offset, logical)?;
     write_u16(root, new_offset + 4, 1)?;
-    write_u16(root, new_offset + 6, (allocated_block >> 32) as u16)?;
-    write_u32(root, new_offset + 8, allocated_block as u32)?;
+    write_u16(
+        root,
+        new_offset + 6,
+        u16::try_from(allocated_block >> 32).map_err(|_| Ext4Error::ArithmeticOverflow)?,
+    )?;
+    write_u32(root, new_offset + 8, low_u32(allocated_block))?;
     write_u16(
         root,
         2,
@@ -963,6 +985,16 @@ fn append_shadow_block(
     Ok(())
 }
 
+fn low_u16(value: u64) -> u16 {
+    let bytes = value.to_le_bytes();
+    u16::from_le_bytes([bytes[0], bytes[1]])
+}
+
+fn low_u32(value: u64) -> u32 {
+    let bytes = value.to_le_bytes();
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])
+}
+
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<(), Ext4Error> {
     let end = offset.checked_add(2).ok_or(Ext4Error::ArithmeticOverflow)?;
     let target = bytes
@@ -987,8 +1019,12 @@ fn write_u64_split(
     high_offset: usize,
     value: u64,
 ) -> Result<(), Ext4Error> {
-    write_u32(bytes, low_offset, value as u32)?;
-    write_u32(bytes, high_offset, (value >> 32) as u32)
+    write_u32(bytes, low_offset, low_u32(value))?;
+    write_u32(
+        bytes,
+        high_offset,
+        u32::try_from(value >> 32).map_err(|_| Ext4Error::ArithmeticOverflow)?,
+    )
 }
 
 #[cfg(test)]
