@@ -48,7 +48,6 @@ pub(crate) struct CompiledCore {
     pub(crate) origin_pclusters: Vec<u64>,
     pub(crate) replacement_pclusters: Vec<u64>,
     pub(crate) head_lclusters: Vec<usize>,
-    pub(crate) head_cluster_offsets: Vec<usize>,
     pub(crate) encoded_bytes: Vec<usize>,
     pub(crate) logical_lclusters: usize,
     pub(crate) compact_2b_entries: usize,
@@ -59,8 +58,6 @@ pub(crate) struct CompiledCore {
 struct Head {
     lcn: usize,
     pcluster: u64,
-    kind: u16,
-    clusterofs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +68,7 @@ struct Topology {
     advise: u16,
     logical_lclusters: usize,
     compact_2b_entries: usize,
+    eof_plain_clusterofs: Option<usize>,
     heads: Vec<Head>,
 }
 
@@ -225,9 +223,14 @@ pub(crate) fn compile_lz4(
     let mut encoded_blocks = Vec::with_capacity(topology.heads.len());
     let mut encoded_bytes = Vec::with_capacity(topology.heads.len());
     for (index, head) in topology.heads.iter().enumerate() {
-        let start = head_logical_offset(head)?;
+        let start = head
+            .lcn
+            .checked_mul(BLOCK_BYTES)
+            .ok_or(CoreError::ArithmeticOverflow)?;
         let end = if let Some(next) = topology.heads.get(index + 1) {
-            head_logical_offset(next)?
+            next.lcn
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(CoreError::ArithmeticOverflow)?
         } else {
             replacement.len()
         };
@@ -239,15 +242,7 @@ pub(crate) fn compile_lz4(
         let extent = replacement
             .get(start..end)
             .ok_or(CoreError::UnexpectedEndOfStructure)?;
-        let (block, encoded_len) = match head.kind {
-            LCLUSTER_HEAD1 => encode_extent(head.lcn, extent)?,
-            LCLUSTER_PLAIN => encode_plain_extent(extent)?,
-            _ => {
-                return Err(CoreError::InvalidFilesystem(
-                    "recovered ordinary compact head has an unsupported type",
-                ))
-            }
-        };
+        let (block, encoded_len) = encode_extent(head.lcn, extent)?;
         encoded_blocks.push(block);
         encoded_bytes.push(encoded_len);
     }
@@ -385,17 +380,6 @@ pub(crate) fn compile_big_lz4(
     )
 }
 
-fn encode_plain_extent(extent: &[u8]) -> Result<(Vec<u8>, usize), CoreError> {
-    if extent.is_empty() || extent.len() > BLOCK_BYTES {
-        return Err(CoreError::UnsupportedInode(
-            "PLAIN extent must occupy one non-empty physical block",
-        ));
-    }
-    let mut block = vec![0_u8; BLOCK_BYTES];
-    block[..extent.len()].copy_from_slice(extent);
-    Ok((block, extent.len()))
-}
-
 fn encode_extent(head_lcn: usize, extent: &[u8]) -> Result<(Vec<u8>, usize), CoreError> {
     let compressed = lz4::encode(extent).map_err(|_| CoreError::CompressionValidationFailed)?;
     if compressed.len() > BLOCK_BYTES {
@@ -448,7 +432,6 @@ fn compile_blocks(
     let mut origin_pclusters = Vec::with_capacity(topology.heads.len());
     let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());
     let mut head_lclusters = Vec::with_capacity(topology.heads.len());
-    let mut head_cluster_offsets = Vec::with_capacity(topology.heads.len());
 
     for ((origin_head, replacement_head), encoded) in topology
         .heads
@@ -467,7 +450,6 @@ fn compile_blocks(
         origin_pclusters.push(origin_head.pcluster);
         replacement_pclusters.push(replacement_head.pcluster);
         head_lclusters.push(origin_head.lcn);
-        head_cluster_offsets.push(origin_head.clusterofs);
     }
 
     let compiled = view.finalize().map_err(CoreError::View)?;
@@ -485,7 +467,6 @@ fn compile_blocks(
         origin_pclusters,
         replacement_pclusters,
         head_lclusters,
-        head_cluster_offsets,
         encoded_bytes,
         logical_lclusters: topology.logical_lclusters,
         compact_2b_entries: topology.compact_2b_entries,
@@ -577,7 +558,6 @@ fn compile_big_spans(
         origin_nid: topology.nid,
         origin_pclusters,
         replacement_pclusters,
-        head_cluster_offsets: vec![0; head_lclusters.len()],
         head_lclusters,
         encoded_bytes,
         logical_lclusters: topology.logical_lclusters,
@@ -610,6 +590,11 @@ fn validate_compatible_topology(
             "logical compact-index lengths differ",
         ));
     }
+    if origin.eof_plain_clusterofs != replacement.eof_plain_clusterofs {
+        return Err(CoreError::IncompatibleReplacement(
+            "partial-EOF PLAIN sentinel offsets differ",
+        ));
+    }
     if origin.heads.len() != replacement.heads.len() {
         return Err(CoreError::IncompatibleReplacement(
             "physical pcluster counts differ",
@@ -618,14 +603,11 @@ fn validate_compatible_topology(
     if origin
         .heads
         .iter()
-        .map(|head| (head.lcn, head.kind, head.clusterofs))
-        .ne(replacement
-            .heads
-            .iter()
-            .map(|head| (head.lcn, head.kind, head.clusterofs)))
+        .map(|head| head.lcn)
+        .ne(replacement.heads.iter().map(|head| head.lcn))
     {
         return Err(CoreError::IncompatibleReplacement(
-            "compressed head-lcluster/type/offset topology differs",
+            "compressed HEAD-lcluster topology differs",
         ));
     }
     Ok(())
@@ -789,14 +771,16 @@ impl Image {
         }
 
         let entries = self.read_all_entries(map.ebase, logical_lclusters)?;
-        let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;
-        validate_head_logical_offsets(&heads, inode.size)?;
+        let eof_plain_clusterofs =
+            validate_eof_plain_sentinel(&entries, logical_lclusters, inode.size)?;
+        let heads =
+            self.recover_heads(map.ebase, logical_lclusters, &entries, eof_plain_clusterofs)?;
         if heads.len() != compressed_blocks {
             return Err(CoreError::InvalidFilesystem(
                 "compressed block count does not match recovered HEAD count",
             ));
         }
-        validate_nonheads(&entries, &heads, logical_lclusters)?;
+        validate_nonheads(&entries, &heads, logical_lclusters, eof_plain_clusterofs)?;
         validate_head_blocks(&heads, self.bytes)?;
 
         Ok(Topology {
@@ -806,6 +790,7 @@ impl Image {
             advise: map.advise,
             logical_lclusters,
             compact_2b_entries: map.regions.compact_2b,
+            eof_plain_clusterofs,
             heads,
         })
     }
@@ -897,6 +882,7 @@ impl Image {
         ebase: u64,
         total: usize,
         entries: &[CompactEntry],
+        eof_plain_clusterofs: Option<usize>,
     ) -> Result<Vec<Head>, CoreError> {
         let mut heads = Vec::new();
         for (lcn, entry) in entries.iter().enumerate() {
@@ -908,33 +894,22 @@ impl Image {
                         ));
                     }
                     let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;
-                    heads.push(Head {
-                        lcn,
-                        pcluster,
-                        kind: LCLUSTER_HEAD1,
-                        clusterofs: 0,
-                    });
+                    heads.push(Head { lcn, pcluster });
                 }
                 LCLUSTER_PLAIN => {
-                    if lcn + 1 != total {
-                        return Err(CoreError::UnsupportedInode(
-                            "compact core supports PLAIN only for the EOF lcluster",
+                    let expected = eof_plain_clusterofs.ok_or(CoreError::UnsupportedInode(
+                        "ordinary compact PLAIN is supported only as a partial-EOF sentinel",
+                    ))?;
+                    if lcn + 1 != total || usize::from(entry.low) != expected {
+                        return Err(CoreError::InvalidFilesystem(
+                            "ordinary compact PLAIN does not match the validated EOF sentinel",
                         ));
                     }
-                    let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;
-                    heads.push(Head {
-                        lcn,
-                        pcluster,
-                        kind: LCLUSTER_PLAIN,
-                        clusterofs: usize::from(entry.low),
-                    });
                 }
                 LCLUSTER_NONHEAD => {}
-                _ => {
-                    return Err(CoreError::UnsupportedInode(
-                        "compact core supports only EOF PLAIN, HEAD1 and NONHEAD entries",
-                    ))
-                }
+                _ => return Err(CoreError::UnsupportedInode(
+                    "compact core supports only HEAD1, NONHEAD, and a partial-EOF PLAIN sentinel",
+                )),
             }
         }
         if heads.first().map(|head| head.lcn) != Some(0) {
@@ -1092,50 +1067,47 @@ fn validate_target_inode(inode: &Inode) -> Result<usize, CoreError> {
     usize::try_from(logical_lclusters).map_err(|_| CoreError::ArithmeticOverflow)
 }
 
-fn head_logical_offset(head: &Head) -> Result<usize, CoreError> {
-    head.lcn
-        .checked_mul(BLOCK_BYTES)
-        .and_then(|start| start.checked_add(head.clusterofs))
-        .ok_or(CoreError::ArithmeticOverflow)
+fn validate_eof_plain_sentinel(
+    entries: &[CompactEntry],
+    total: usize,
+    logical_size: u64,
+) -> Result<Option<usize>, CoreError> {
+    if entries.len() != total || total == 0 {
+        return Err(CoreError::InvalidFilesystem(
+            "compact index vector length differs from logical lcluster count",
+        ));
+    }
+    let remainder = usize::try_from(logical_size % u64::from(BLOCK_SIZE))
+        .map_err(|_| CoreError::ArithmeticOverflow)?;
+    if remainder == 0 {
+        return Ok(None);
+    }
+    let eof = entries.last().ok_or(CoreError::UnexpectedEndOfStructure)?;
+    if eof.kind != LCLUSTER_PLAIN || usize::from(eof.low) != remainder {
+        return Err(CoreError::InvalidFilesystem(
+            "partial ordinary compact file lacks the expected PLAIN EOF sentinel",
+        ));
+    }
+    Ok(Some(remainder))
 }
 
-fn validate_head_logical_offsets(heads: &[Head], logical_size: u64) -> Result<(), CoreError> {
-    let logical_size = usize::try_from(logical_size).map_err(|_| CoreError::ArithmeticOverflow)?;
-    let mut previous = None;
-    for head in heads {
-        if head.clusterofs >= BLOCK_BYTES {
-            return Err(CoreError::InvalidFilesystem(
-                "compact head cluster offset exceeds one logical cluster",
-            ));
-        }
-        let start = head_logical_offset(head)?;
-        if start >= logical_size {
-            return Err(CoreError::InvalidFilesystem(
-                "compact head logical offset lies at or beyond EOF",
-            ));
-        }
-        if let Some(previous) = previous {
-            if start <= previous {
-                return Err(CoreError::InvalidFilesystem(
-                    "compact head logical offsets are not strictly increasing",
-                ));
-            }
-        } else if start != 0 {
-            return Err(CoreError::InvalidFilesystem(
-                "first compact head does not begin at logical byte zero",
-            ));
-        }
-        previous = Some(start);
-    }
-    Ok(())
-}
 fn validate_nonheads(
     entries: &[CompactEntry],
     heads: &[Head],
     total: usize,
+    eof_plain_clusterofs: Option<usize>,
 ) -> Result<(), CoreError> {
     for (head_index, head) in heads.iter().enumerate() {
-        let next_head = heads.get(head_index + 1).map_or(total, |next| next.lcn);
+        let next_head = heads.get(head_index + 1).map_or_else(
+            || {
+                if eof_plain_clusterofs.is_some() {
+                    total.saturating_sub(1)
+                } else {
+                    total
+                }
+            },
+            |next| next.lcn,
+        );
         if next_head <= head.lcn {
             return Err(CoreError::InvalidFilesystem(
                 "compressed HEAD lclusters are not strictly increasing",
@@ -1780,11 +1752,10 @@ mod tests {
             advise: ADVISE_COMPACTED_2B,
             logical_lclusters: 2,
             compact_2b_entries: 0,
+            eof_plain_clusterofs: None,
             heads: vec![Head {
                 lcn: 0,
                 pcluster: 10,
-                kind: LCLUSTER_HEAD1,
-                clusterofs: 0,
             }],
         };
         let mut relocated = single.clone();
@@ -1793,57 +1764,34 @@ mod tests {
     }
 
     #[test]
-    fn plain_tail_is_raw_and_zero_padded() {
-        let tail = vec![0x5a_u8; 3973];
-        let (block, encoded) = encode_plain_extent(&tail).unwrap();
-        assert_eq!(encoded, tail.len());
-        assert_eq!(&block[..tail.len()], tail.as_slice());
-        assert!(block[tail.len()..].iter().all(|byte| *byte == 0));
-    }
-
-    #[test]
-    fn topology_compatibility_rejects_head_type_changes() {
-        let origin = Topology {
-            nid: 1,
-            logical_size: 8192,
-            algorithm: 0,
-            advise: ADVISE_COMPACTED_2B,
-            logical_lclusters: 2,
-            compact_2b_entries: 0,
-            heads: vec![Head {
-                lcn: 0,
-                pcluster: 10,
+    fn partial_eof_plain_is_a_sentinel_not_a_data_head() {
+        let mut entries = vec![
+            CompactEntry {
                 kind: LCLUSTER_HEAD1,
-                clusterofs: 0,
-            }],
-        };
-        let mut replacement = origin.clone();
-        replacement.heads[0].kind = LCLUSTER_PLAIN;
-        assert!(matches!(
-            validate_compatible_topology(&origin, &replacement),
-            Err(CoreError::IncompatibleReplacement(
-                "compressed head-lcluster/type/offset topology differs"
-            ))
-        ));
-    }
-    #[test]
-    fn nonzero_plain_eof_offset_is_part_of_logical_topology() {
-        let heads = vec![
-            Head {
-                lcn: 0,
-                pcluster: 10,
-                kind: LCLUSTER_HEAD1,
-                clusterofs: 0,
+                low: 0,
+                slot: 0,
+                slots: 2,
+                base_pblk: 10,
             },
-            Head {
-                lcn: 1,
-                pcluster: 11,
+            CompactEntry {
                 kind: LCLUSTER_PLAIN,
-                clusterofs: 123,
+                low: 3973,
+                slot: 1,
+                slots: 2,
+                base_pblk: 10,
             },
         ];
-        assert_eq!(head_logical_offset(&heads[1]).unwrap(), 4096 + 123);
-        assert!(validate_head_logical_offsets(&heads, 8192).is_ok());
+        assert_eq!(
+            validate_eof_plain_sentinel(&entries, 2, 4096 + 3973).unwrap(),
+            Some(3973)
+        );
+        entries[1].low = 3972;
+        assert!(matches!(
+            validate_eof_plain_sentinel(&entries, 2, 4096 + 3973),
+            Err(CoreError::InvalidFilesystem(
+                "partial ordinary compact file lacks the expected PLAIN EOF sentinel"
+            ))
+        ));
     }
     #[test]
     fn later_extent_codec_failure_happens_before_view_construction() {
