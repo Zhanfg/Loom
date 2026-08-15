@@ -88,3 +88,6 @@ jobs:
 
       - name: Stage 9 EROFS flat-plain weaving
         run: bash tests/integration/stage9_erofs_flat_plain.sh
+
+      - name: Stage 10 compressed EROFS pcluster swap
+        run: bash tests/integration/stage10_erofs_compressed_pcluster.sh
