@@ -124,6 +124,12 @@ impl Ext4Image {
         if inode.file_type() != MODE_REGULAR {
             return Err(Ext4Error::NotRegularFile(inode_number));
         }
+        if inode.links_count != 1 {
+            return Err(Ext4Error::HardLinkedTarget {
+                inode: inode_number,
+                links: inode.links_count,
+            });
+        }
         if inode.flags & INODE_INLINE_DATA_FL != 0 {
             return Err(Ext4Error::UnsupportedInodeFeature("inline data"));
         }
@@ -571,6 +577,7 @@ struct Inode {
     mode: u16,
     size: u64,
     flags: u32,
+    links_count: u16,
     block: [u8; 60],
 }
 
@@ -591,6 +598,7 @@ impl Inode {
             mode: read_u16(bytes, 0x00)?,
             size: (size_high << 32) | size_low,
             flags: read_u32(bytes, 0x20)?,
+            links_count: read_u16(bytes, 0x1A)?,
             block,
         })
     }
@@ -671,6 +679,7 @@ pub enum Ext4Error {
     InvalidInode(u32),
     NotDirectory(u32),
     NotRegularFile(u32),
+    HardLinkedTarget { inode: u32, links: u16 },
     CorruptDirectory(u32),
     CorruptExtentTree,
     SparseFileUnsupported,
@@ -699,6 +708,10 @@ impl fmt::Display for Ext4Error {
             Self::InvalidInode(inode) => write!(f, "invalid inode number {inode}"),
             Self::NotDirectory(inode) => write!(f, "inode {inode} is not a directory"),
             Self::NotRegularFile(inode) => write!(f, "inode {inode} is not a regular file"),
+            Self::HardLinkedTarget { inode, links } => write!(
+                f,
+                "inode {inode} is hard-linked ({links} links); Stage 1 path replacement refuses alias-wide mutation"
+            ),
             Self::CorruptDirectory(inode) => write!(f, "directory inode {inode} is malformed"),
             Self::CorruptExtentTree => write!(f, "ext4 extent tree is malformed"),
             Self::SparseFileUnsupported => {
