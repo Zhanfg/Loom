@@ -3,7 +3,7 @@
 use loom_map::LoomMap;
 use loom_view::{EffectiveBlockStore, ViewError};
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -40,6 +40,17 @@ pub struct CompiledPclusterSwap {
     pub shadow_blocks: usize,
 }
 
+#[derive(Debug)]
+pub struct CompiledLz4Replacement {
+    pub map: LoomMap,
+    pub shadow: Vec<u8>,
+    pub block_size: u32,
+    pub nid: u64,
+    pub pcluster: u64,
+    pub encoded_bytes: usize,
+    pub shadow_blocks: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompressedExtent {
     nid: u64,
@@ -55,6 +66,7 @@ struct Superblock {
     block_size: u32,
     root_nid: u64,
     meta_block: u64,
+    feature_incompat: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,6 +170,83 @@ pub fn compile_full_pcluster_swap(
         origin_nid,
         origin_pcluster: origin_extent.pcluster,
         replacement_pcluster: replacement_extent.pcluster,
+        shadow_blocks: compiled.shadow_blocks,
+    })
+}
+
+/// Encodes a replacement payload into the existing legacy-layout LZ4 pcluster.
+///
+/// Unlike Stage 10, this path does not need a second EROFS image as an encoding oracle.
+/// It is intentionally limited to non-0padding EROFS, where raw LZ4 bytes begin at offset
+/// zero and unused bytes in the physical pcluster are zero-filled. The replacement must
+/// preserve the target logical size and its complete raw LZ4 block must fit inside the
+/// existing one-block physical footprint.
+///
+/// # Errors
+/// Returns [`CompressedError`] if the origin layout is outside the proven Stage 10 shape,
+/// the replacement size differs, raw LZ4 does not fit, round-trip validation fails, or the
+/// effective-view compiler fails.
+pub fn compile_lz4_replacement(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_path: &Path,
+) -> Result<CompiledLz4Replacement, CompressedError> {
+    let replacement = fs::read(replacement_path).map_err(CompressedError::Io)?;
+    let mut origin = Image::open(origin_path)?;
+    if origin.sb.feature_incompat & FEATURE_LZ4_0PADDING != 0 {
+        return Err(CompressedError::UnsupportedFilesystem(
+            "Stage 11 currently requires legacy non-0padding LZ4 placement",
+        ));
+    }
+
+    let nid = origin.resolve_path(target_path)?;
+    let extent = origin.read_two_lcluster_full_extent(nid)?;
+    let actual = u64::try_from(replacement.len()).map_err(|_| CompressedError::ArithmeticOverflow)?;
+    if actual != extent.logical_size {
+        return Err(CompressedError::ReplacementSizeMismatch {
+            expected: extent.logical_size,
+            actual,
+        });
+    }
+
+    let compressed = lz4_flex::block::compress(&replacement);
+    let capacity = usize::try_from(origin.sb.block_size)
+        .map_err(|_| CompressedError::ArithmeticOverflow)?;
+    if compressed.len() > capacity {
+        return Err(CompressedError::CompressionDoesNotFit {
+            encoded: compressed.len(),
+            capacity,
+        });
+    }
+
+    let mut decoded = vec![0_u8; replacement.len()];
+    let decoded_len = lz4_flex::block::decompress_into(&compressed, &mut decoded)
+        .map_err(|_| CompressedError::CompressionValidationFailed)?;
+    if decoded_len != replacement.len() || decoded != replacement {
+        return Err(CompressedError::CompressionValidationFailed);
+    }
+
+    let mut encoded_block = vec![0_u8; capacity];
+    encoded_block[..compressed.len()].copy_from_slice(&compressed);
+    let mut view = EffectiveBlockStore::open(origin_path, origin.sb.block_size)
+        .map_err(CompressedError::View)?;
+    view.block_mut(extent.pcluster)
+        .map_err(CompressedError::View)?
+        .copy_from_slice(&encoded_block);
+    let compiled = view.finalize().map_err(CompressedError::View)?;
+    if compiled.shadow_blocks != 1 {
+        return Err(CompressedError::IncompatibleReplacement(
+            "one-pcluster encoding did not finalize to exactly one shadow block",
+        ));
+    }
+
+    Ok(CompiledLz4Replacement {
+        map: compiled.map,
+        shadow: compiled.shadow,
+        block_size: compiled.block_size,
+        nid,
+        pcluster: extent.pcluster,
+        encoded_bytes: compressed.len(),
         shadow_blocks: compiled.shadow_blocks,
     })
 }
@@ -461,6 +550,7 @@ fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, Compressed
         block_size,
         root_nid: u64::from(read_u16(&raw, 0x0e)?),
         meta_block: u64::from(read_u32(&raw, 0x28)?),
+        feature_incompat,
     })
 }
 
@@ -619,6 +709,9 @@ pub enum CompressedError {
     UnsupportedFilesystem(&'static str),
     UnsupportedInode(&'static str),
     IncompatibleReplacement(&'static str),
+    ReplacementSizeMismatch { expected: u64, actual: u64 },
+    CompressionDoesNotFit { encoded: usize, capacity: usize },
+    CompressionValidationFailed,
     InvalidPath(&'static str),
     PathNotFound(String),
     NotDirectory(u64),
@@ -642,6 +735,17 @@ impl fmt::Display for CompressedError {
             Self::UnsupportedInode(reason) => write!(f, "unsupported compressed inode: {reason}"),
             Self::IncompatibleReplacement(reason) => {
                 write!(f, "incompatible encoded replacement: {reason}")
+            }
+            Self::ReplacementSizeMismatch { expected, actual } => write!(
+                f,
+                "replacement size mismatch: expected {expected} bytes, got {actual}"
+            ),
+            Self::CompressionDoesNotFit { encoded, capacity } => write!(
+                f,
+                "raw LZ4 block does not fit existing pcluster: encoded {encoded} bytes, capacity {capacity}"
+            ),
+            Self::CompressionValidationFailed => {
+                write!(f, "raw LZ4 round-trip validation failed")
             }
             Self::InvalidPath(reason) => write!(f, "invalid EROFS path: {reason}"),
             Self::PathNotFound(name) => write!(f, "EROFS path component not found: {name:?}"),
@@ -682,5 +786,16 @@ mod tests {
     fn align8_is_checked_and_monotonic() {
         assert_eq!(align8(33).unwrap(), 40);
         assert_eq!(align8(40).unwrap(), 40);
+    }
+
+    #[test]
+    fn raw_lz4_block_round_trips_without_size_prefix() {
+        let input = vec![b'L'; 8192];
+        let compressed = lz4_flex::block::compress(&input);
+        assert!(compressed.len() < 4096);
+        let mut decoded = vec![0_u8; input.len()];
+        let written = lz4_flex::block::decompress_into(&compressed, &mut decoded).unwrap();
+        assert_eq!(written, input.len());
+        assert_eq!(decoded, input);
     }
 }
