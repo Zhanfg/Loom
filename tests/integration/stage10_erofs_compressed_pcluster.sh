@@ -35,11 +35,12 @@ REPLACEMENT="$WORK/replacement.bin"
 SHADOW="$WORK/shadow.pack"
 TABLE="$WORK/loom.table"
 
-# Exactly one logical lcluster, deliberately highly compressible so mkfs.erofs
-# selects LZ4 compression. Both images have identical topology but different data.
-dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'A' > "$ORIGINAL"
+# Two logical 4 KiB lclusters are deliberately highly compressible so the pair
+# fits in one physical 4 KiB pcluster. With legacy-compress this yields the
+# minimal full-index topology Stage 10 models: HEAD1 + NONHEAD -> one pcluster.
+dd if=/dev/zero bs=4096 count=2 status=none | tr '\000' 'A' > "$ORIGINAL"
 printf 'LOOM-STAGE10-STOCK' | dd of="$ORIGINAL" bs=1 seek=64 conv=notrunc status=none
-dd if=/dev/zero bs=4096 count=1 status=none | tr '\000' 'B' > "$REPLACEMENT"
+dd if=/dev/zero bs=4096 count=2 status=none | tr '\000' 'B' > "$REPLACEMENT"
 printf 'LOOM-STAGE10-REPLACEMENT' | dd of="$REPLACEMENT" bs=1 seek=64 conv=notrunc status=none
 cp "$ORIGINAL" "$STOCK_SRC/000payload.bin"
 cp "$REPLACEMENT" "$REPL_SRC/000payload.bin"
@@ -55,7 +56,8 @@ build_image() {
   local output="$1"
   local source="$2"
   rm -f "$output"
-  mkfs.erofs -b 4096 -zlz4 -E legacy-compress -T 0 "$output" "$source" >/dev/null
+  mkfs.erofs -b 4096 -C 4096 -zlz4 -E legacy-compress,noinline_data -T 0 \
+    "$output" "$source" >/dev/null
 }
 
 build_image "$STOCK_IMG" "$STOCK_SRC"
@@ -64,7 +66,7 @@ fsck.erofs "$STOCK_IMG" >/dev/null
 fsck.erofs "$REPL_IMG" >/dev/null
 
 # Treat the replacement image as an encoding oracle only after native EROFS proves
-# that its compressed pcluster decodes to the intended replacement bytes.
+# that its compressed pcluster decodes to the intended 8 KiB replacement bytes.
 REPL_LOOP="$(sudo losetup --find --show --read-only "$REPL_IMG")"
 sudo mount -t erofs -o ro "$REPL_LOOP" "$MOUNT_DIR"
 sudo cmp "$MOUNT_DIR/000payload.bin" "$REPLACEMENT"
@@ -113,7 +115,9 @@ sudo umount "$MOUNT_DIR"
 
 printf '%s\n' \
   'Stage 10 compressed EROFS pcluster swap PASS' \
-  '  logical bytes: 4096' \
+  '  logical bytes: 8192' \
+  '  logical topology: HEAD1 + NONHEAD' \
+  '  encoded physical blocks: 1' \
   '  encoded replacement source: independently native-mounted and verified' \
   '  shadow blocks: 1' \
   "  shadow bytes: $(stat -c %s "$SHADOW")" \
