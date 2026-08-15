@@ -11,10 +11,13 @@ use std::path::Path;
 pub(crate) fn command(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let first = required(
         args,
-        "--encode, --multi, --multi-encode, or origin compact EROFS image",
+        "--encode, --multi, --multi-encode, --big-oracle, or origin compact EROFS image",
     )?;
     if first == "--multi" || first == "--multi-encode" {
         return command_multi(args, first == "--multi-encode");
+    }
+    if first == "--big-oracle" {
+        return command_big_oracle(args);
     }
 
     let (encode, origin_image) = if first == "--encode" {
@@ -50,15 +53,59 @@ pub(crate) fn command(args: &mut impl Iterator<Item = String>) -> Result<(), Box
             Path::new(&replacement),
         )?
     };
-    fs::write(&shadow_output, &compiled.shadow)?;
+    write_compiled(
+        compiled,
+        if encode { "encode" } else { "oracle" },
+        &shadow_output,
+        &origin_device,
+        &shadow_device,
+        &table_output,
+    )
+}
+
+fn command_big_oracle(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(), Box<dyn Error>> {
+    let origin_image = required(args, "origin big-pcluster compact EROFS image")?;
+    let target_path = required(args, "target path")?;
+    let replacement_image = required(args, "replacement big-pcluster compact EROFS image")?;
+    let shadow_output = required(args, "shadow pack output")?;
+    let origin_device = required(args, "origin block device")?;
+    let shadow_device = required(args, "shadow block device")?;
+    let table_output = required(args, "dm table output")?;
+    ensure_no_extra_args(args)?;
+
+    let compiled = CompiledCompactSwap::compile_big_pcluster_oracle(
+        Path::new(&origin_image),
+        &target_path,
+        Path::new(&replacement_image),
+    )?;
+    write_compiled(
+        compiled,
+        "big-oracle",
+        &shadow_output,
+        &origin_device,
+        &shadow_device,
+        &table_output,
+    )
+}
+
+fn write_compiled(
+    compiled: CompiledCompactSwap,
+    mode: &str,
+    shadow_output: &str,
+    origin_device: &str,
+    shadow_device: &str,
+    table_output: &str,
+) -> Result<(), Box<dyn Error>> {
+    fs::write(shadow_output, &compiled.shadow)?;
     let table = compiled
         .map
-        .to_dm_linear_table(&origin_device, &shadow_device)?;
-    fs::write(&table_output, table)?;
-
+        .to_dm_linear_table(origin_device, shadow_device)?;
+    fs::write(table_output, table)?;
     println!(
         "erofs compact pcluster compiled: mode={} origin_nid={} origin_pcluster={} replacement_pcluster={} block_size={} encoded_bytes={} logical_lclusters={} compact_2b_entries={} shadow_blocks={} shadow_bytes={}",
-        if encode { "encode" } else { "oracle" },
+        mode,
         compiled.origin_nid,
         compiled.origin_pcluster,
         compiled.replacement_pcluster,
