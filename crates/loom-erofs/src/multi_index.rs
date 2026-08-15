@@ -1,9 +1,12 @@
 #![forbid(unsafe_code)]
 
+#[path = "multi_lz4.rs"]
+mod lz4;
+
 use loom_map::LoomMap;
 use loom_view::{EffectiveBlockStore, ViewError};
 use std::fmt;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
@@ -41,6 +44,7 @@ pub struct CompiledMultiSwap {
     pub origin_pclusters: Vec<u64>,
     pub replacement_pclusters: Vec<u64>,
     pub head_lclusters: Vec<usize>,
+    pub encoded_bytes: Vec<usize>,
     pub physical_pclusters: usize,
     pub logical_lclusters: usize,
     pub compact_2b_entries: usize,
@@ -134,17 +138,148 @@ pub fn compile_multi_pcluster_swap(
 
     validate_compatible_topology(&origin_topology, &replacement_topology)?;
 
-    let mut view = EffectiveBlockStore::open(origin_path, BLOCK_SIZE).map_err(MultiIndexError::View)?;
-    let mut origin_pclusters = Vec::with_capacity(origin_topology.heads.len());
-    let mut replacement_pclusters = Vec::with_capacity(replacement_topology.heads.len());
-    let mut head_lclusters = Vec::with_capacity(origin_topology.heads.len());
+    let mut encoded_blocks = Vec::with_capacity(replacement_topology.heads.len());
+    for head in &replacement_topology.heads {
+        encoded_blocks.push(replacement.read_block(head.pcluster)?);
+    }
+    compile_blocks(
+        origin_path,
+        &origin_topology,
+        &replacement_topology.heads,
+        encoded_blocks,
+        vec![BLOCK_BYTES; replacement_topology.heads.len()],
+    )
+}
 
-    for (origin_head, replacement_head) in origin_topology
+impl CompiledMultiSwap {
+    /// Encodes every logical extent into its existing compact `LZ4_0PADDING` pcluster.
+    ///
+    /// Stage 17 uses the recovered HEAD topology to split a plain replacement payload into
+    /// logical extents. Each extent is encoded independently as a raw LZ4 block, right-aligned
+    /// inside exactly one existing 4 KiB pcluster, and round-trip validated both before and
+    /// after 0padding placement. All extents are encoded successfully before the effective
+    /// block store is mutated, so any footprint failure aborts the whole compilation.
+    ///
+    /// # Errors
+    /// Returns [`MultiIndexError`] for unsupported topology, replacement-size mismatch,
+    /// per-extent compression overflow, codec validation failure, I/O, or view errors.
+    pub fn compile_lz4_replacement(
+        origin_path: &Path,
+        target_path: &str,
+        replacement_path: &Path,
+    ) -> Result<Self, MultiIndexError> {
+        let replacement = fs::read(replacement_path).map_err(MultiIndexError::Io)?;
+        let mut origin = Image::open(origin_path)?;
+        let origin_nid = origin.resolve_path(target_path)?;
+        let topology = origin.read_topology(origin_nid)?;
+        let actual = u64::try_from(replacement.len()).map_err(|_| MultiIndexError::ArithmeticOverflow)?;
+        if actual != topology.logical_size {
+            return Err(MultiIndexError::ReplacementSizeMismatch {
+                expected: topology.logical_size,
+                actual,
+            });
+        }
+
+        let mut encoded_blocks = Vec::with_capacity(topology.heads.len());
+        let mut encoded_bytes = Vec::with_capacity(topology.heads.len());
+        for (index, head) in topology.heads.iter().enumerate() {
+            let next_lcn = topology
+                .heads
+                .get(index + 1)
+                .map_or(topology.logical_lclusters, |next| next.lcn);
+            let start = head
+                .lcn
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(MultiIndexError::ArithmeticOverflow)?;
+            let end = next_lcn
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(MultiIndexError::ArithmeticOverflow)?;
+            let extent = replacement
+                .get(start..end)
+                .ok_or(MultiIndexError::InvalidFilesystem(
+                    "recovered logical extent lies beyond replacement payload",
+                ))?;
+            let (block, encoded_len) = encode_extent(head.lcn, extent)?;
+            encoded_blocks.push(block);
+            encoded_bytes.push(encoded_len);
+        }
+
+        let generated_heads = topology.heads.clone();
+        compile_blocks(
+            origin_path,
+            &topology,
+            &generated_heads,
+            encoded_blocks,
+            encoded_bytes,
+        )
+    }
+}
+
+fn encode_extent(head_lcn: usize, extent: &[u8]) -> Result<(Vec<u8>, usize), MultiIndexError> {
+    let compressed = lz4::encode(extent).map_err(|_| MultiIndexError::CompressionValidationFailed)?;
+    if compressed.len() > BLOCK_BYTES {
+        return Err(MultiIndexError::CompressionDoesNotFit {
+            head_lcn,
+            encoded: compressed.len(),
+            capacity: BLOCK_BYTES,
+        });
+    }
+    if compressed.first().copied().unwrap_or(0) == 0 {
+        return Err(MultiIndexError::CompressionValidationFailed);
+    }
+    if lz4::decode(&compressed, extent.len())
+        .map_err(|_| MultiIndexError::CompressionValidationFailed)?
+        != extent
+    {
+        return Err(MultiIndexError::CompressionValidationFailed);
+    }
+
+    let mut pcluster = vec![0_u8; BLOCK_BYTES];
+    let start = BLOCK_BYTES
+        .checked_sub(compressed.len())
+        .ok_or(MultiIndexError::ArithmeticOverflow)?;
+    pcluster[start..].copy_from_slice(&compressed);
+    if lz4::decode_0padding(&pcluster, extent.len())
+        .map_err(|_| MultiIndexError::CompressionValidationFailed)?
+        != extent
+    {
+        return Err(MultiIndexError::CompressionValidationFailed);
+    }
+    Ok((pcluster, compressed.len()))
+}
+
+fn compile_blocks(
+    origin_path: &Path,
+    topology: &Topology,
+    replacement_heads: &[Head],
+    encoded_blocks: Vec<Vec<u8>>,
+    encoded_bytes: Vec<usize>,
+) -> Result<CompiledMultiSwap, MultiIndexError> {
+    if replacement_heads.len() != topology.heads.len()
+        || encoded_blocks.len() != topology.heads.len()
+        || encoded_bytes.len() != topology.heads.len()
+    {
+        return Err(MultiIndexError::InvalidFilesystem(
+            "multi-pcluster compiler received inconsistent extent vectors",
+        ));
+    }
+
+    let mut view = EffectiveBlockStore::open(origin_path, BLOCK_SIZE).map_err(MultiIndexError::View)?;
+    let mut origin_pclusters = Vec::with_capacity(topology.heads.len());
+    let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());
+    let mut head_lclusters = Vec::with_capacity(topology.heads.len());
+
+    for ((origin_head, replacement_head), encoded) in topology
         .heads
         .iter()
-        .zip(&replacement_topology.heads)
+        .zip(replacement_heads)
+        .zip(encoded_blocks)
     {
-        let encoded = replacement.read_block(replacement_head.pcluster)?;
+        if encoded.len() != BLOCK_BYTES {
+            return Err(MultiIndexError::InvalidFilesystem(
+                "encoded extent does not occupy exactly one physical block",
+            ));
+        }
         view.block_mut(origin_head.pcluster)
             .map_err(MultiIndexError::View)?
             .copy_from_slice(&encoded);
@@ -165,15 +300,16 @@ pub fn compile_multi_pcluster_swap(
         map: compiled.map,
         shadow: compiled.shadow,
         block_size: compiled.block_size,
-        origin_nid: origin_topology.nid,
+        origin_nid: topology.nid,
         origin_pcluster,
         replacement_pcluster,
         physical_pclusters: origin_pclusters.len(),
         origin_pclusters,
         replacement_pclusters,
         head_lclusters,
-        logical_lclusters: origin_topology.logical_lclusters,
-        compact_2b_entries: origin_topology.compact_2b_entries,
+        encoded_bytes,
+        logical_lclusters: topology.logical_lclusters,
+        compact_2b_entries: topology.compact_2b_entries,
         shadow_blocks: compiled.shadow_blocks,
     })
 }
@@ -338,7 +474,7 @@ impl Image {
             .map_err(|_| MultiIndexError::ArithmeticOverflow)?;
         if compressed_blocks < 2 {
             return Err(MultiIndexError::UnsupportedInode(
-                "Stage 16 multi mode requires at least two encoded physical blocks",
+                "multi mode requires at least two encoded physical blocks",
             ));
         }
 
@@ -355,18 +491,18 @@ impl Image {
         let advise = read_u16(&header, 4)?;
         if advise != ADVISE_COMPACTED_2B {
             return Err(MultiIndexError::UnsupportedInode(
-                "Stage 16 requires only COMPACTED_2B compact advice",
+                "multi mode requires only COMPACTED_2B compact advice",
             ));
         }
         let algorithm = header[6] & 0x0f;
         if algorithm != LZ4_ALGORITHM || header[6] >> 4 != 0 {
             return Err(MultiIndexError::UnsupportedInode(
-                "Stage 16 supports only HEAD1 LZ4",
+                "multi mode supports only HEAD1 LZ4",
             ));
         }
         if header[7] != 0 {
             return Err(MultiIndexError::UnsupportedInode(
-                "Stage 16 requires 4 KiB logical clusters without packed fragments",
+                "multi mode requires 4 KiB logical clusters without packed fragments",
             ));
         }
 
@@ -419,7 +555,7 @@ impl Image {
                 LCLUSTER_HEAD1 => {
                     if entry.low != 0 {
                         return Err(MultiIndexError::UnsupportedInode(
-                            "Stage 16 requires zero-offset HEAD1 lclusters",
+                            "multi mode requires zero-offset HEAD1 lclusters",
                         ));
                     }
                     let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;
@@ -428,7 +564,7 @@ impl Image {
                 LCLUSTER_NONHEAD => {}
                 _ => {
                     return Err(MultiIndexError::UnsupportedInode(
-                        "Stage 16 supports only HEAD1 and NONHEAD compact entries",
+                        "multi mode supports only HEAD1 and NONHEAD compact entries",
                     ))
                 }
             }
@@ -564,17 +700,17 @@ fn validate_target_inode(inode: &Inode) -> Result<usize, MultiIndexError> {
     }
     if inode.layout != DATA_COMPRESSED_COMPACT {
         return Err(MultiIndexError::UnsupportedInode(
-            "Stage 16 requires EROFS_INODE_COMPRESSED_COMPACT",
+            "multi mode requires EROFS_INODE_COMPRESSED_COMPACT",
         ));
     }
     if inode.xattr_size != 0 {
         return Err(MultiIndexError::UnsupportedInode(
-            "Stage 16 compact target must not carry xattrs",
+            "multi mode compact target must not carry xattrs",
         ));
     }
     if inode.size < u64::from(BLOCK_SIZE) * 2 || inode.size % u64::from(BLOCK_SIZE) != 0 {
         return Err(MultiIndexError::UnsupportedInode(
-            "Stage 16 requires a whole-block file of at least two lclusters",
+            "multi mode requires a whole-block file of at least two lclusters",
         ));
     }
     usize::try_from(inode.size / u64::from(BLOCK_SIZE))
@@ -587,7 +723,9 @@ fn validate_nonheads(
     total: usize,
 ) -> Result<(), MultiIndexError> {
     for (head_index, head) in heads.iter().enumerate() {
-        let next_head = heads.get(head_index + 1).map(|next| next.lcn).unwrap_or(total);
+        let next_head = heads
+            .get(head_index + 1)
+            .map_or(total, |next| next.lcn);
         if next_head <= head.lcn {
             return Err(MultiIndexError::InvalidFilesystem(
                 "compressed HEAD lclusters are not strictly increasing",
@@ -612,7 +750,7 @@ fn validate_nonheads(
             };
             if expected >= usize::from(D0_CBLKCNT) {
                 return Err(MultiIndexError::UnsupportedInode(
-                    "Stage 16 refuses CBLKCNT/long-distance compact NONHEAD encoding",
+                    "multi mode refuses CBLKCNT/long-distance compact NONHEAD encoding",
                 ));
             }
             let expected = u16::try_from(expected).map_err(|_| MultiIndexError::ArithmeticOverflow)?;
@@ -753,23 +891,23 @@ fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, MultiIndex
     }
     if raw[0x0c] != 12 {
         return Err(MultiIndexError::UnsupportedFilesystem(
-            "Stage 16 supports only 4 KiB EROFS blocks",
+            "multi mode supports only 4 KiB EROFS blocks",
         ));
     }
     let incompat = read_u32(&raw, 0x50)?;
     if incompat & !FEATURE_LZ4_0PADDING != 0 {
         return Err(MultiIndexError::UnsupportedFilesystem(
-            "Stage 16 image enables unsupported incompatible EROFS features",
+            "multi mode image enables unsupported incompatible EROFS features",
         ));
     }
     if incompat & FEATURE_LZ4_0PADDING == 0 {
         return Err(MultiIndexError::UnsupportedFilesystem(
-            "Stage 16 expects normal LZ4_0PADDING layout",
+            "multi mode expects normal LZ4_0PADDING layout",
         ));
     }
     if raw[0x5a] != 0 || read_u16(&raw, 0x56)? != 0 {
         return Err(MultiIndexError::UnsupportedFilesystem(
-            "Stage 16 requires primary-device core directories",
+            "multi mode requires primary-device core directories",
         ));
     }
     Ok(Superblock {
@@ -929,6 +1067,13 @@ pub enum MultiIndexError {
     UnsupportedFilesystem(&'static str),
     UnsupportedInode(&'static str),
     IncompatibleReplacement(&'static str),
+    ReplacementSizeMismatch { expected: u64, actual: u64 },
+    CompressionDoesNotFit {
+        head_lcn: usize,
+        encoded: usize,
+        capacity: usize,
+    },
+    CompressionValidationFailed,
     InvalidPath(&'static str),
     PathNotFound(String),
     NotDirectory(u64),
@@ -952,6 +1097,21 @@ impl fmt::Display for MultiIndexError {
             Self::UnsupportedInode(reason) => write!(f, "unsupported multi-extent inode: {reason}"),
             Self::IncompatibleReplacement(reason) => {
                 write!(f, "incompatible multi-pcluster replacement: {reason}")
+            }
+            Self::ReplacementSizeMismatch { expected, actual } => write!(
+                f,
+                "replacement size mismatch: expected {expected} bytes, got {actual}"
+            ),
+            Self::CompressionDoesNotFit {
+                head_lcn,
+                encoded,
+                capacity,
+            } => write!(
+                f,
+                "raw LZ4 extent at HEAD lcluster {head_lcn} does not fit existing pcluster: encoded {encoded} bytes, capacity {capacity}"
+            ),
+            Self::CompressionValidationFailed => {
+                write!(f, "multi-extent raw LZ4 round-trip validation failed")
             }
             Self::InvalidPath(reason) => write!(f, "invalid EROFS path: {reason}"),
             Self::PathNotFound(name) => write!(f, "EROFS path component not found: {name:?}"),
@@ -988,11 +1148,11 @@ mod tests {
         ];
         let mut entries = Vec::new();
         for lcn in 0..24 {
-            let head = lcn == 0 || lcn == 8 || lcn == 16;
+            let is_head = lcn == 0 || lcn == 8 || lcn == 16;
             let previous = if lcn < 8 { 0 } else if lcn < 16 { 8 } else { 16 };
             let next = if lcn < 8 { 8 } else if lcn < 16 { 16 } else { 24 };
             let slot = lcn % 16;
-            let low = if head {
+            let low = if is_head {
                 0
             } else if slot == 15 {
                 u16::try_from(next - lcn).unwrap()
@@ -1000,7 +1160,7 @@ mod tests {
                 u16::try_from(lcn - previous).unwrap()
             };
             entries.push(CompactEntry {
-                kind: if head { LCLUSTER_HEAD1 } else { LCLUSTER_NONHEAD },
+                kind: if is_head { LCLUSTER_HEAD1 } else { LCLUSTER_NONHEAD },
                 low,
                 slot,
                 slots: 16,
@@ -1027,5 +1187,26 @@ mod tests {
         assert!(validate_compatible_topology(&left, &right).is_ok());
         right.heads[1].lcn = 9;
         assert!(validate_compatible_topology(&left, &right).is_err());
+    }
+
+    #[test]
+    fn extent_encoding_is_transactional_before_view_mutation() {
+        let good = vec![b'Z'; 32768];
+        let (block, encoded) = encode_extent(0, &good).unwrap();
+        assert_eq!(block.len(), BLOCK_BYTES);
+        assert!(encoded < BLOCK_BYTES);
+
+        let mut state = 0x5354_3137_u32;
+        let mut bad = vec![0_u8; 32768];
+        for byte in &mut bad {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        assert!(matches!(
+            encode_extent(8, &bad),
+            Err(MultiIndexError::CompressionDoesNotFit { head_lcn: 8, .. })
+        ));
     }
 }
