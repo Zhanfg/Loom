@@ -66,3 +66,6 @@ jobs:
 
       - name: Stage 2 block-size matrix
         run: bash tests/integration/stage2_ext4_block_sizes.sh
+
+      - name: Stage 3 block allocation weaving
+        run: bash tests/integration/stage3_ext4_block_allocation.sh
