@@ -17,7 +17,7 @@ jobs:
         with:
           ref: feat/stage8-sparse-overlay-workspace
       - name: Apply source refactor
-        run: python3 scripts/stage8_reader_refactor.py
+        run: python3 scripts/stage8_reader_refactor_v2.py
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
