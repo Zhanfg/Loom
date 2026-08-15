@@ -75,6 +75,13 @@ impl Inode {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FullMapHeader {
+    index_offset: u64,
+    advise: u16,
+    algorithm: u8,
+}
+
 struct Image {
     file: File,
     bytes: u64,
@@ -270,8 +277,23 @@ impl Image {
         nid: u64,
     ) -> Result<CompressedExtent, CompressedError> {
         let inode = self.read_inode(nid)?;
+        self.validate_stage10_inode(&inode)?;
+        let header = self.read_stage10_map_header(&inode)?;
+        let (cluster_offset, pcluster) = self.read_stage10_full_indexes(header.index_offset)?;
+
+        Ok(CompressedExtent {
+            nid: inode.nid,
+            logical_size: inode.size,
+            pcluster,
+            algorithm: header.algorithm,
+            cluster_offset,
+            map_advise: header.advise,
+        })
+    }
+
+    fn validate_stage10_inode(&self, inode: &Inode) -> Result<(), CompressedError> {
         if inode.file_type() != MODE_REGULAR {
-            return Err(CompressedError::NotRegularFile(nid));
+            return Err(CompressedError::NotRegularFile(inode.nid));
         }
         if inode.layout != COMPRESSED_FULL {
             return Err(CompressedError::UnsupportedInode(
@@ -296,7 +318,10 @@ impl Image {
                 "Stage 10 requires exactly one encoded physical block",
             ));
         }
+        Ok(())
+    }
 
+    fn read_stage10_map_header(&mut self, inode: &Inode) -> Result<FullMapHeader, CompressedError> {
         let body_end = inode
             .offset
             .checked_add(inode.isize)
@@ -306,6 +331,7 @@ impl Image {
         ensure_range(self.bytes, header_offset, MAP_HEADER_SIZE)?;
         let mut header = [0_u8; 8];
         read_exact_at(&mut self.file, header_offset, &mut header)?;
+
         let advise = read_u16(&header, 4)?;
         if advise != 0 {
             return Err(CompressedError::UnsupportedInode(
@@ -323,11 +349,21 @@ impl Image {
                 "Stage 10 requires lcluster size equal to filesystem block size",
             ));
         }
-
         let index_offset = header_offset
             .checked_add(MAP_HEADER_SIZE)
             .and_then(|value| value.checked_add(FULL_INDEX_GAP))
             .ok_or(CompressedError::ArithmeticOverflow)?;
+        Ok(FullMapHeader {
+            index_offset,
+            advise,
+            algorithm,
+        })
+    }
+
+    fn read_stage10_full_indexes(
+        &mut self,
+        index_offset: u64,
+    ) -> Result<(u16, u64), CompressedError> {
         let index_bytes = FULL_INDEX_SIZE
             .checked_mul(FULL_INDEX_COUNT)
             .ok_or(CompressedError::ArithmeticOverflow)?;
@@ -369,21 +405,12 @@ impl Image {
                 "Stage 10 requires an ordinary NONHEAD second full index",
             ));
         }
-        let delta0 = read_u16(&indexes, nonhead + 4)?;
-        if delta0 != 1 {
+        if read_u16(&indexes, nonhead + 4)? != 1 {
             return Err(CompressedError::UnsupportedInode(
                 "Stage 10 NONHEAD must look back exactly one lcluster to HEAD1",
             ));
         }
-
-        Ok(CompressedExtent {
-            nid: inode.nid,
-            logical_size: inode.size,
-            pcluster,
-            algorithm,
-            cluster_offset,
-            map_advise: advise,
-        })
+        Ok((cluster_offset, pcluster))
     }
 
     fn read_block(&mut self, block: u64) -> Result<Vec<u8>, CompressedError> {
