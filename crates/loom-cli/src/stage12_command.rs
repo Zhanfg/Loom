@@ -175,7 +175,7 @@ fn command_multi(
     fs::write(&table_output, table)?;
 
     println!(
-        "erofs compact pcluster compiled: mode={} origin_nid={} origin_pcluster={} replacement_pcluster={} block_size={} physical_pclusters={} logical_lclusters={} compact_2b_entries={} head_lclusters={:?} origin_pclusters={:?} replacement_pclusters={:?} encoded_bytes={:?} shadow_blocks={} shadow_bytes={}",
+        "erofs compact pcluster compiled: mode={} origin_nid={} origin_pcluster={} replacement_pcluster={} block_size={} physical_pclusters={} logical_lclusters={} compact_2b_entries={} head_lclusters={:?} head_cluster_offsets={:?} origin_pclusters={:?} replacement_pclusters={:?} encoded_bytes={:?} shadow_blocks={} shadow_bytes={}",
         if encode { "multi-encode" } else { "multi" },
         compiled.origin_nid,
         compiled.origin_pcluster,
@@ -185,6 +185,7 @@ fn command_multi(
         compiled.logical_lclusters,
         compiled.compact_2b_entries,
         compiled.head_lclusters,
+        compiled.head_cluster_offsets,
         compiled.origin_pclusters,
         compiled.replacement_pclusters,
         compiled.encoded_bytes,
