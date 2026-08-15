@@ -1,0 +1,39 @@
+name: stage10-clippy-fix
+on:
+  push:
+    branches:
+      - feat/stage10-erofs-full-pcluster-swap
+permissions:
+  contents: write
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage10-erofs-full-pcluster-swap
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply exact fixes
+        run: |
+          sed -i '/    feature_incompat: u32,/d' crates/loom-erofs/src/compressed.rs
+          sed -i '/        feature_incompat,$/d' crates/loom-erofs/src/compressed.rs
+          sed -i 's/    inode_offset: u64,/    offset: u64,/' crates/loom-erofs/src/compressed.rs
+          sed -i 's/    inode_size: u64,/    isize: u64,/' crates/loom-erofs/src/compressed.rs
+          sed -i 's/            inode_offset,/            offset: inode_offset,/' crates/loom-erofs/src/compressed.rs
+          sed -i 's/            inode_size,/            isize: inode_size,/' crates/loom-erofs/src/compressed.rs
+          sed -i 's/inode\.inode_offset/inode.offset/g; s/inode\.inode_size/inode.isize/g' crates/loom-erofs/src/compressed.rs
+          sed -i 's/    image_bytes: u64,/    bytes: u64,/' crates/loom-erofs/src/compressed.rs
+          sed -i 's/            image_bytes,/            bytes: image_bytes,/' crates/loom-erofs/src/compressed.rs
+          sed -i 's/self\.image_bytes/self.bytes/g' crates/loom-erofs/src/compressed.rs
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+      - name: Commit
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/loom-erofs/src/compressed.rs
+          git commit -m 'refactor(erofs): satisfy Stage 10 strict lint gate'
+          git push origin HEAD:feat/stage10-erofs-full-pcluster-swap
