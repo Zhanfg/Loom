@@ -47,13 +47,15 @@ pub(crate) fn command(args: &mut impl Iterator<Item = String>) -> Result<(), Box
     fs::write(&table_output, table)?;
 
     println!(
-        "erofs compact pcluster compiled: mode={} origin_nid={} origin_pcluster={} replacement_pcluster={} block_size={} encoded_bytes={} shadow_blocks={} shadow_bytes={}",
+        "erofs compact pcluster compiled: mode={} origin_nid={} origin_pcluster={} replacement_pcluster={} block_size={} encoded_bytes={} logical_lclusters={} compact_2b_entries={} shadow_blocks={} shadow_bytes={}",
         if encode { "encode" } else { "oracle" },
         compiled.origin_nid,
         compiled.origin_pcluster,
         compiled.replacement_pcluster,
         compiled.block_size,
         compiled.encoded_bytes,
+        compiled.logical_lclusters,
+        compiled.compact_2b_entries,
         compiled.shadow_blocks,
         compiled.shadow.len()
     );
