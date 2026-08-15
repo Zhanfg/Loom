@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use crate::compact_core::{self, CompiledCore, CoreError};
+use crate::compact_index::shared_core::{self, CompiledCore, CoreError};
 use loom_map::LoomMap;
 use std::path::Path;
 
@@ -36,11 +36,11 @@ pub fn compile_multi_pcluster_swap(
     target_path: &str,
     replacement_image_path: &Path,
 ) -> Result<CompiledMultiSwap, MultiIndexError> {
-    Ok(from_core(compact_core::compile_oracle(
+    from_core(shared_core::compile_oracle(
         origin_path,
         target_path,
         replacement_image_path,
-    )?)?)
+    )?)
 }
 
 impl CompiledMultiSwap {
@@ -54,7 +54,7 @@ impl CompiledMultiSwap {
         target_path: &str,
         replacement_path: &Path,
     ) -> Result<Self, MultiIndexError> {
-        from_core(compact_core::compile_lz4(
+        from_core(shared_core::compile_lz4(
             origin_path,
             target_path,
             replacement_path,
