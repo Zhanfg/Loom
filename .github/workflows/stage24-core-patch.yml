@@ -1,0 +1,162 @@
+name: stage24-core-patch
+
+on:
+  push:
+    branches:
+      - feat/stage24-erofs-multi-big-self-encode
+    paths:
+      - .github/workflows/stage24-core-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage24-erofs-multi-big-self-encode
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply Stage 24 compact-core patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/loom-erofs/src/compact_core.rs')
+          text = path.read_text()
+
+          text = text.replace('const MIN_BIG_PHYSICAL_BLOCKS: usize = 2;\n', '')
+
+          dispatch = r'''pub(crate) fn compile_multi_lz4(
+              origin_path: &Path,
+              target_path: &str,
+              replacement_path: &Path,
+          ) -> Result<CompiledCore, CoreError> {
+              let origin = Image::open(origin_path)?;
+              match origin.sb.incompat {
+                  FEATURE_LZ4_0PADDING => compile_lz4(origin_path, target_path, replacement_path),
+                  BIG_REQUIRED_INCOMPAT => compile_big_lz4(origin_path, target_path, replacement_path),
+                  _ => Err(CoreError::UnsupportedFilesystem(
+                      "multi compact self-encode supports only ordinary LZ4_0PADDING or big-pcluster compact images",
+                  )),
+              }
+          }
+
+          '''
+          marker = 'pub(crate) fn compile_lz4(\n'
+          if 'pub(crate) fn compile_multi_lz4(' not in text:
+              assert marker in text
+              text = text.replace(marker, dispatch + marker, 1)
+
+          start_marker = 'pub(crate) fn compile_big_lz4(\n'
+          end_marker = 'fn encode_extent(head_lcn: usize, extent: &[u8]) -> Result<(Vec<u8>, usize), CoreError> {'
+          start = text.index(start_marker)
+          end = text.index(end_marker, start)
+          replacement = r'''pub(crate) fn compile_big_lz4(
+              origin_path: &Path,
+              target_path: &str,
+              replacement_path: &Path,
+          ) -> Result<CompiledCore, CoreError> {
+              let replacement = fs::read(replacement_path).map_err(CoreError::Io)?;
+              let mut origin = Image::open(origin_path)?;
+              let origin_nid = origin.resolve_path(target_path)?;
+              let topology = origin.read_big_topology(origin_nid)?;
+              let actual = u64::try_from(replacement.len()).map_err(|_| CoreError::ArithmeticOverflow)?;
+              if actual != topology.logical_size {
+                  return Err(CoreError::ReplacementSizeMismatch {
+                      expected: topology.logical_size,
+                      actual,
+                  });
+              }
+
+              // Transaction boundary: encode and validate every logical extent before opening
+              // EffectiveBlockStore. A later footprint failure therefore cannot materialize a
+              // partial shadow view.
+              let mut encoded_spans = Vec::with_capacity(topology.extents.len());
+              let mut encoded_bytes = Vec::with_capacity(topology.extents.len());
+              for (index, extent) in topology.extents.iter().enumerate() {
+                  let next_lcn = topology
+                      .extents
+                      .get(index + 1)
+                      .map_or(topology.logical_lclusters, |next| next.lcn);
+                  let start = extent
+                      .lcn
+                      .checked_mul(BLOCK_BYTES)
+                      .ok_or(CoreError::ArithmeticOverflow)?;
+                  let end = next_lcn
+                      .checked_mul(BLOCK_BYTES)
+                      .ok_or(CoreError::ArithmeticOverflow)?;
+                  let logical_extent = replacement
+                      .get(start..end)
+                      .ok_or(CoreError::InvalidFilesystem(
+                          "recovered big logical extent lies beyond replacement payload",
+                      ))?;
+                  let capacity = extent
+                      .physical_blocks
+                      .checked_mul(BLOCK_BYTES)
+                      .ok_or(CoreError::ArithmeticOverflow)?;
+                  let compressed =
+                      lz4::encode(logical_extent).map_err(|_| CoreError::CompressionValidationFailed)?;
+                  if compressed.len() > capacity {
+                      return Err(CoreError::CompressionDoesNotFit {
+                          head_lcn: extent.lcn,
+                          encoded: compressed.len(),
+                          capacity,
+                      });
+                  }
+                  if compressed.first().copied().unwrap_or(0) == 0 {
+                      return Err(CoreError::CompressionValidationFailed);
+                  }
+                  if lz4::decode(&compressed, logical_extent.len())
+                      .map_err(|_| CoreError::CompressionValidationFailed)?
+                      != logical_extent
+                  {
+                      return Err(CoreError::CompressionValidationFailed);
+                  }
+
+                  let mut span = vec![0_u8; capacity];
+                  let padded_start = capacity
+                      .checked_sub(compressed.len())
+                      .ok_or(CoreError::ArithmeticOverflow)?;
+                  span[padded_start..].copy_from_slice(&compressed);
+                  if lz4::decode_0padding(&span, logical_extent.len())
+                      .map_err(|_| CoreError::CompressionValidationFailed)?
+                      != logical_extent
+                  {
+                      return Err(CoreError::CompressionValidationFailed);
+                  }
+                  encoded_bytes.push(compressed.len());
+                  encoded_spans.push(span);
+              }
+
+              let replacement_extents = topology.extents.clone();
+              compile_big_spans(
+                  origin_path,
+                  &topology,
+                  &replacement_extents,
+                  encoded_spans,
+                  encoded_bytes,
+              )
+          }
+
+          '''
+          text = text[:start] + replacement + text[end:]
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          grep -q 'pub(crate) fn compile_multi_lz4' crates/loom-erofs/src/compact_core.rs
+          grep -q 'for (index, extent) in topology.extents.iter().enumerate()' crates/loom-erofs/src/compact_core.rs
+      - name: Commit patch and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name 'Loom Stage 24 maintainer'
+          git config user.email 'actions@users.noreply.github.com'
+          git rm .github/workflows/stage24-core-patch.yml
+          git add crates/loom-erofs/src/compact_core.rs
+          git commit -m 'stage24: self-encode multiple big-pcluster extents'
+          git push origin HEAD:feat/stage24-erofs-multi-big-self-encode
