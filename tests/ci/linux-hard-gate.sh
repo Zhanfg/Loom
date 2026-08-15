@@ -32,5 +32,6 @@ bash tests/integration/stage14_erofs_compact_2b_pack.sh
 bash tests/integration/stage15_erofs_compact_2b_self_encode.sh
 bash tests/integration/stage16_erofs_multi_pcluster_oracle.sh
 bash tests/integration/stage17_erofs_multi_pcluster_self_encode.sh
+bash tests/integration/stage18_erofs_compact_core_unification.sh
 
 printf '%s\n' 'Loom Linux filesystem hard gate PASS'
