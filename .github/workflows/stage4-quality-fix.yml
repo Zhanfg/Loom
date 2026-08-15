@@ -1,0 +1,75 @@
+name: stage4-quality-fix
+
+on:
+  push:
+    branches:
+      - feat/stage4-ext4-create-file
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage4-ext4-create-file
+      - name: Apply exact quality fixes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/loom-ext4/src/create.rs')
+          s = p.read_text()
+
+          exact = [
+              ('const EXTENT_ENTRY_SIZE: usize = 12;\n', ''),
+              ('    inode_table_block: u64,\n', ''),
+              ('            inode_table_block,\n', ''),
+              ('        || read_u16(block, tail + DIRENT_TAIL_REC_LEN)? != DIRENT_TAIL_SIZE as u16\n',
+               '        || read_u16(block, tail + DIRENT_TAIL_REC_LEN)?\n            != u16::try_from(DIRENT_TAIL_SIZE).map_err(|_| Ext4Error::ArithmeticOverflow)?\n'),
+          ]
+          for old, new in exact:
+              if old not in s:
+                  raise SystemExit(f'expected text not found: {old!r}')
+              s = s.replace(old, new, 1)
+
+          old_name = '''    let name = components
+        .last()
+        .ok_or(Ext4Error::InvalidPath("missing filename"))?
+        .to_string();'''
+          new_name = '''    let name = components
+        .last()
+        .copied()
+        .ok_or(Ext4Error::InvalidPath("missing filename"))?
+        .to_string();'''
+          if old_name not in s:
+              raise SystemExit('split_parent name block not found')
+          s = s.replace(old_name, new_name, 1)
+
+          old_exists = '''        if self.resolve_path(target_path).is_ok() {
+            return Err(Ext4Error::InvalidPath("target path already exists"));
+        }'''
+          new_exists = '''        match self.resolve_path(target_path) {
+            Ok(_) => return Err(Ext4Error::InvalidPath("target path already exists")),
+            Err(Ext4Error::PathNotFound(_)) => {}
+            Err(error) => return Err(error),
+        }'''
+          if old_exists not in s:
+              raise SystemExit('target existence block not found')
+          s = s.replace(old_exists, new_exists, 1)
+          p.write_text(s)
+          PY
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Format and commit
+        run: |
+          cargo fmt --all
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/loom-ext4/src/create.rs
+          git commit -m 'refactor(ext4): tighten Stage 4 create transaction'
+          git push origin HEAD:feat/stage4-ext4-create-file
