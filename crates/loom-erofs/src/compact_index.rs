@@ -101,7 +101,6 @@ fn into_single(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
     if compiled.origin_pclusters.len() != 1
         || compiled.replacement_pclusters.len() != 1
         || compiled.head_lclusters.len() != 1
-        || compiled.head_cluster_offsets.len() != 1
         || compiled.encoded_bytes.len() != 1
         || compiled.shadow_blocks != 1
     {
@@ -116,7 +115,6 @@ fn into_big(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
     if compiled.origin_pclusters.len() != 1
         || compiled.replacement_pclusters.len() != 1
         || compiled.head_lclusters.as_slice() != [0]
-        || compiled.head_cluster_offsets.as_slice() != [0]
         || compiled.encoded_bytes.len() != 1
         || compiled.shadow_blocks < 2
     {
