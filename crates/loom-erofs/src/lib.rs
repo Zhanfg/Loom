@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub use compressed::{compile_full_pcluster_swap, CompiledPclusterSwap, CompressedError};
+mod compressed;
 use loom_map::LoomMap;
 use loom_view::{EffectiveBlockStore, ViewError};
 use std::fmt;

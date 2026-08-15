@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod stage10_command;
 mod stage7_command;
 mod stage9_command;
 
@@ -40,6 +41,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "ext4-selinux" => command_ext4_selinux(&mut args)?,
         "ext4-create-selinux" => stage7_command::command(&mut args)?,
         "erofs-replace" => stage9_command::command(&mut args)?,
+        "erofs-pcluster-swap" => stage10_command::command(&mut args)?,
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command {other:?}").into()),
     }

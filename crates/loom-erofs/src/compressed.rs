@@ -172,7 +172,10 @@ impl Image {
             .checked_mul(u64::from(self.sb.block_size))
             .ok_or(CompressedError::ArithmeticOverflow)?;
         let inode_offset = metadata_base
-            .checked_add(nid.checked_mul(32).ok_or(CompressedError::ArithmeticOverflow)?)
+            .checked_add(
+                nid.checked_mul(32)
+                    .ok_or(CompressedError::ArithmeticOverflow)?,
+            )
             .ok_or(CompressedError::ArithmeticOverflow)?;
         ensure_range(self.image_bytes, inode_offset, 32)?;
         let mut compact = [0_u8; 32];
@@ -184,8 +187,8 @@ impl Image {
             ));
         }
         let extended = format & 1 != 0;
-        let layout = u8::try_from((format >> 1) & 7)
-            .map_err(|_| CompressedError::ArithmeticOverflow)?;
+        let layout =
+            u8::try_from((format >> 1) & 7).map_err(|_| CompressedError::ArithmeticOverflow)?;
         if layout > 4 {
             return Err(CompressedError::UnsupportedInode(
                 "reserved EROFS inode data layout",
@@ -323,7 +326,9 @@ impl Image {
         let mut index = [0_u8; FULL_INDEX_SIZE];
         read_exact_at(&mut self.file, index_offset, &mut index)?;
         let index_advise = read_u16(&index, 0)?;
-        if index_advise & LCLUSTER_TYPE_MASK != LCLUSTER_HEAD1 || index_advise & !LCLUSTER_TYPE_MASK != 0 {
+        if index_advise & LCLUSTER_TYPE_MASK != LCLUSTER_HEAD1
+            || index_advise & !LCLUSTER_TYPE_MASK != 0
+        {
             return Err(CompressedError::UnsupportedInode(
                 "Stage 10 requires an ordinary HEAD1 full index",
             ));
@@ -359,7 +364,8 @@ impl Image {
         ensure_range(self.image_bytes, offset, block_size)?;
         let mut bytes = vec![
             0_u8;
-            usize::try_from(block_size).map_err(|_| CompressedError::ArithmeticOverflow)?
+            usize::try_from(block_size)
+                .map_err(|_| CompressedError::ArithmeticOverflow)?
         ];
         read_exact_at(&mut self.file, offset, &mut bytes)?;
         Ok(bytes)
@@ -420,7 +426,10 @@ fn find_in_directory_block(block: &[u8], target: &[u8]) -> Result<Option<u64>, C
         return Err(CompressedError::CorruptDirectory);
     }
     let first_name_offset = usize::from(read_u16(block, 8)?);
-    if first_name_offset == 0 || first_name_offset % DIRENT_SIZE != 0 || first_name_offset > block.len() {
+    if first_name_offset == 0
+        || first_name_offset % DIRENT_SIZE != 0
+        || first_name_offset > block.len()
+    {
         return Err(CompressedError::CorruptDirectory);
     }
     let count = first_name_offset / DIRENT_SIZE;
@@ -435,9 +444,15 @@ fn find_in_directory_block(block: &[u8], target: &[u8]) -> Result<Option<u64>, C
         let name_end = if index + 1 < count {
             usize::from(read_u16(block, entry + DIRENT_SIZE + 8)?)
         } else {
-            let tail = block.get(name_offset..).ok_or(CompressedError::CorruptDirectory)?;
+            let tail = block
+                .get(name_offset..)
+                .ok_or(CompressedError::CorruptDirectory)?;
             name_offset
-                .checked_add(tail.iter().position(|byte| *byte == 0).unwrap_or(tail.len()))
+                .checked_add(
+                    tail.iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(tail.len()),
+                )
                 .ok_or(CompressedError::ArithmeticOverflow)?
         };
         if name_end < name_offset || name_end > block.len() {
@@ -498,12 +513,15 @@ fn ensure_range(image_bytes: u64, offset: u64, length: u64) -> Result<(), Compre
 }
 
 fn read_exact_at(file: &mut File, offset: u64, buffer: &mut [u8]) -> Result<(), CompressedError> {
-    file.seek(SeekFrom::Start(offset)).map_err(CompressedError::Io)?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(CompressedError::Io)?;
     file.read_exact(buffer).map_err(CompressedError::Io)
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, CompressedError> {
-    let end = offset.checked_add(2).ok_or(CompressedError::ArithmeticOverflow)?;
+    let end = offset
+        .checked_add(2)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
     let raw: [u8; 2] = bytes
         .get(offset..end)
         .ok_or(CompressedError::UnexpectedEndOfStructure)?
@@ -513,7 +531,9 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, CompressedError> {
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CompressedError> {
-    let end = offset.checked_add(4).ok_or(CompressedError::ArithmeticOverflow)?;
+    let end = offset
+        .checked_add(4)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
     let raw: [u8; 4] = bytes
         .get(offset..end)
         .ok_or(CompressedError::UnexpectedEndOfStructure)?
@@ -523,7 +543,9 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, CompressedError> {
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, CompressedError> {
-    let end = offset.checked_add(8).ok_or(CompressedError::ArithmeticOverflow)?;
+    let end = offset
+        .checked_add(8)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
     let raw: [u8; 8] = bytes
         .get(offset..end)
         .ok_or(CompressedError::UnexpectedEndOfStructure)?
@@ -558,9 +580,13 @@ impl fmt::Display for CompressedError {
             Self::View(error) => write!(f, "Loom effective-view error: {error}"),
             Self::BadMagic(magic) => write!(f, "invalid EROFS magic {magic:#010x}"),
             Self::InvalidFilesystem(reason) => write!(f, "invalid compressed EROFS: {reason}"),
-            Self::UnsupportedFilesystem(reason) => write!(f, "unsupported compressed EROFS: {reason}"),
+            Self::UnsupportedFilesystem(reason) => {
+                write!(f, "unsupported compressed EROFS: {reason}")
+            }
             Self::UnsupportedInode(reason) => write!(f, "unsupported compressed inode: {reason}"),
-            Self::IncompatibleReplacement(reason) => write!(f, "incompatible encoded replacement: {reason}"),
+            Self::IncompatibleReplacement(reason) => {
+                write!(f, "incompatible encoded replacement: {reason}")
+            }
             Self::InvalidPath(reason) => write!(f, "invalid EROFS path: {reason}"),
             Self::PathNotFound(name) => write!(f, "EROFS path component not found: {name:?}"),
             Self::NotDirectory(nid) => write!(f, "EROFS nid {nid} is not a directory"),
@@ -568,7 +594,9 @@ impl fmt::Display for CompressedError {
             Self::CorruptDirectory => write!(f, "malformed EROFS directory block"),
             Self::UnexpectedEndOfImage => write!(f, "EROFS reference lies beyond image bytes"),
             Self::UnexpectedEndOfStructure => write!(f, "unexpected end of EROFS structure"),
-            Self::ArithmeticOverflow => write!(f, "integer overflow while parsing compressed EROFS"),
+            Self::ArithmeticOverflow => {
+                write!(f, "integer overflow while parsing compressed EROFS")
+            }
         }
     }
 }
