@@ -58,68 +58,78 @@ pub fn compile_selinux_xattr(
     value_path: &Path,
 ) -> Result<CompiledSelinuxXattr, Ext4Error> {
     let value = fs::read(value_path).map_err(Ext4Error::Io)?;
-    if value.is_empty() {
-        return Err(Ext4Error::UnsupportedInodeFeature(
-            "Stage 6 requires a non-empty security.selinux value",
-        ));
-    }
     let mut image = Ext4Image::open(origin_path)?;
-    let inode_number = image.resolve_path(target_path)?;
-    let inode = image.read_inode(inode_number)?;
-    if inode.file_type() != MODE_REGULAR {
-        return Err(Ext4Error::NotRegularFile(inode_number));
-    }
-    if inode.flags & INODE_INLINE_DATA_FL != 0 {
-        return Err(Ext4Error::UnsupportedInodeFeature("inline data"));
-    }
-    if inode.flags & INODE_VERITY_FL != 0 {
-        return Err(Ext4Error::UnsupportedInodeFeature("fs-verity"));
-    }
-
-    let checksum_seed = image.read_stage6_checksum_seed()?;
-    let (table_block, inode_offset) = image.inode_record_location_stage6(inode_number)?;
-    let mut table_shadow = image.read_block(table_block)?;
-    let inode_size = usize::from(image.superblock.inode_size);
-    let inode_end = inode_offset
-        .checked_add(inode_size)
-        .ok_or(Ext4Error::ArithmeticOverflow)?;
-    let raw_inode =
-        table_shadow
-            .get_mut(inode_offset..inode_end)
-            .ok_or(Ext4Error::InvalidFilesystem(
-                "inode record crosses inode-table filesystem block",
-            ))?;
-
-    verify_inode_checksum(raw_inode, checksum_seed, inode_number).map_err(Ext4Error::Checksum)?;
-    reject_external_xattr(raw_inode, image.superblock.has_64bit)?;
-    write_empty_ibody_selinux_xattr(raw_inode, &value)?;
-    rewrite_inode_checksum(raw_inode, checksum_seed, inode_number).map_err(Ext4Error::Checksum)?;
-
-    let sectors_per_block = u64::from(image.superblock.block_size) / SECTOR_SIZE;
-    let shadow = table_shadow;
-    let logical_start = table_block
-        .checked_mul(sectors_per_block)
-        .ok_or(Ext4Error::ArithmeticOverflow)?;
-    let replacement = ReplacementExtent {
-        logical_start: Sector(logical_start),
-        sector_count: SectorCount(sectors_per_block),
-        shadow_start: Sector(0),
-    };
-    let map =
-        LoomMap::from_replacements(SectorCount(image.image_bytes / SECTOR_SIZE), &[replacement])
-            .map_err(Ext4Error::Map)?;
-
-    Ok(CompiledSelinuxXattr {
-        map,
-        shadow,
-        block_size: image.superblock.block_size,
-        inode: inode_number,
-        value_bytes: value.len(),
-        shadow_blocks: 1,
-    })
+    image.compile_selinux_xattr_bytes(target_path, &value)
 }
 
 impl Ext4Image {
+    pub(crate) fn compile_selinux_xattr_bytes(
+        &mut self,
+        target_path: &str,
+        value: &[u8],
+    ) -> Result<CompiledSelinuxXattr, Ext4Error> {
+        if value.is_empty() {
+            return Err(Ext4Error::UnsupportedInodeFeature(
+                "Stage 6 requires a non-empty security.selinux value",
+            ));
+        }
+        let inode_number = self.resolve_path(target_path)?;
+        let inode = self.read_inode(inode_number)?;
+        if inode.file_type() != MODE_REGULAR {
+            return Err(Ext4Error::NotRegularFile(inode_number));
+        }
+        if inode.flags & INODE_INLINE_DATA_FL != 0 {
+            return Err(Ext4Error::UnsupportedInodeFeature("inline data"));
+        }
+        if inode.flags & INODE_VERITY_FL != 0 {
+            return Err(Ext4Error::UnsupportedInodeFeature("fs-verity"));
+        }
+
+        let checksum_seed = self.read_stage6_checksum_seed()?;
+        let (table_block, inode_offset) = self.inode_record_location_stage6(inode_number)?;
+        let mut table_shadow = self.read_block(table_block)?;
+        let inode_size = usize::from(self.superblock.inode_size);
+        let inode_end = inode_offset
+            .checked_add(inode_size)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let raw_inode =
+            table_shadow
+                .get_mut(inode_offset..inode_end)
+                .ok_or(Ext4Error::InvalidFilesystem(
+                    "inode record crosses inode-table filesystem block",
+                ))?;
+
+        verify_inode_checksum(raw_inode, checksum_seed, inode_number).map_err(Ext4Error::Checksum)?;
+        reject_external_xattr(raw_inode, self.superblock.has_64bit)?;
+        write_empty_ibody_selinux_xattr(raw_inode, value)?;
+        rewrite_inode_checksum(raw_inode, checksum_seed, inode_number).map_err(Ext4Error::Checksum)?;
+
+        let sectors_per_block = u64::from(self.superblock.block_size) / SECTOR_SIZE;
+        let shadow = table_shadow;
+        let logical_start = table_block
+            .checked_mul(sectors_per_block)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let replacement = ReplacementExtent {
+            logical_start: Sector(logical_start),
+            sector_count: SectorCount(sectors_per_block),
+            shadow_start: Sector(0),
+        };
+        let map = LoomMap::from_replacements(
+            SectorCount(self.image_bytes / SECTOR_SIZE),
+            &[replacement],
+        )
+        .map_err(Ext4Error::Map)?;
+
+        Ok(CompiledSelinuxXattr {
+            map,
+            shadow,
+            block_size: self.superblock.block_size,
+            inode: inode_number,
+            value_bytes: value.len(),
+            shadow_blocks: 1,
+        })
+    }
+
     fn read_stage6_checksum_seed(&mut self) -> Result<u32, Ext4Error> {
         let mut raw = [0_u8; SUPERBLOCK_SIZE];
         read_exact_at(&mut self.file, SUPERBLOCK_OFFSET, &mut raw)?;
