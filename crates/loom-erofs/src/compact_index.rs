@@ -11,6 +11,7 @@ const SUPERBLOCK_OFFSET: u64 = 1024;
 const SUPERBLOCK_SIZE: usize = 128;
 const EROFS_MAGIC: u32 = 0xe0f5_e1e2;
 const BLOCK_SIZE: u32 = 4096;
+const BLOCK_BYTES: usize = 4096;
 const BLOCK_BITS: u16 = 12;
 const OFFSET_MASK: u16 = (1 << BLOCK_BITS) - 1;
 const DIRENT_SIZE: usize = 12;
@@ -130,12 +131,12 @@ pub fn compile_pcluster_swap(
         origin_extent,
         &encoded,
         replacement_extent.pcluster,
-        BLOCK_SIZE as usize,
+        BLOCK_BYTES,
     )
 }
 
 impl CompiledSwap {
-    /// Encodes a plain replacement payload into the existing compact 0padding LZ4 pcluster.
+    /// Encodes a plain replacement payload into the existing compact `0PADDING` LZ4 pcluster.
     ///
     /// The encoded LZ4 block is right-aligned in the 4 KiB physical pcluster and the
     /// leading bytes are zero-filled, matching the EROFS `LZ4_0PADDING` on-disk layout.
@@ -164,28 +165,25 @@ impl CompiledSwap {
         }
 
         let compressed = encode_lz4_block(&replacement)?;
-        let capacity = BLOCK_SIZE as usize;
-        if compressed.len() > capacity {
+        if compressed.len() > BLOCK_BYTES {
             return Err(IndexError::CompressionDoesNotFit {
                 encoded: compressed.len(),
-                capacity,
+                capacity: BLOCK_BYTES,
             });
         }
         if compressed.first().copied().unwrap_or(0) == 0 {
             return Err(IndexError::CompressionValidationFailed);
         }
-        let decoded = decode_lz4_block(&compressed, replacement.len())?;
-        if decoded != replacement {
+        if decode_lz4_block(&compressed, replacement.len())? != replacement {
             return Err(IndexError::CompressionValidationFailed);
         }
 
-        let mut pcluster = vec![0_u8; capacity];
-        let start = capacity
+        let mut pcluster = vec![0_u8; BLOCK_BYTES];
+        let start = BLOCK_BYTES
             .checked_sub(compressed.len())
             .ok_or(IndexError::ArithmeticOverflow)?;
         pcluster[start..].copy_from_slice(&compressed);
-        let decoded_pcluster = decode_0padding_pcluster(&pcluster, replacement.len())?;
-        if decoded_pcluster != replacement {
+        if decode_0padding_pcluster(&pcluster, replacement.len())? != replacement {
             return Err(IndexError::CompressionValidationFailed);
         }
 
@@ -206,7 +204,7 @@ fn compile_shadow(
     replacement_pcluster: u64,
     encoded_bytes: usize,
 ) -> Result<CompiledSwap, IndexError> {
-    if encoded_block.len() != BLOCK_SIZE as usize {
+    if encoded_block.len() != BLOCK_BYTES {
         return Err(IndexError::IncompatibleReplacement(
             "encoded replacement must occupy exactly one filesystem block",
         ));
@@ -452,7 +450,7 @@ impl Image {
             .checked_mul(block_size)
             .ok_or(IndexError::ArithmeticOverflow)?;
         ensure_range(self.bytes, offset, block_size)?;
-        let mut bytes = vec![0_u8; BLOCK_SIZE as usize];
+        let mut bytes = vec![0_u8; BLOCK_BYTES];
         read_exact_at(&mut self.file, offset, &mut bytes)?;
         Ok(bytes)
     }
@@ -947,12 +945,12 @@ mod tests {
     #[test]
     fn raw_lz4_right_aligned_0padding_round_trips() {
         let mut input = vec![b'Q'; 8192];
-        input[64..88].copy_from_slice(b"LOOM-STAGE13-0PADDING!!");
+        input[64..87].copy_from_slice(b"LOOM-STAGE13-0PADDING!!");
         let encoded = encode_lz4_block(&input).unwrap();
         assert!(!encoded.is_empty());
         assert_ne!(encoded[0], 0);
-        assert!(encoded.len() < BLOCK_SIZE as usize);
-        let mut pcluster = vec![0_u8; BLOCK_SIZE as usize];
+        assert!(encoded.len() < BLOCK_BYTES);
+        let mut pcluster = vec![0_u8; BLOCK_BYTES];
         let start = pcluster.len() - encoded.len();
         pcluster[start..].copy_from_slice(&encoded);
         assert!(pcluster[..start].iter().all(|byte| *byte == 0));
@@ -970,7 +968,7 @@ mod tests {
             *byte = state as u8;
         }
         let encoded = encode_lz4_block(&input).unwrap();
-        assert!(encoded.len() > BLOCK_SIZE as usize);
+        assert!(encoded.len() > BLOCK_BYTES);
         assert_eq!(decode_lz4_block(&encoded, input.len()).unwrap(), input);
     }
 }
