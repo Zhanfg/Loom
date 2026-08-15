@@ -48,6 +48,7 @@ pub(crate) struct CompiledCore {
     pub(crate) origin_pclusters: Vec<u64>,
     pub(crate) replacement_pclusters: Vec<u64>,
     pub(crate) head_lclusters: Vec<usize>,
+    pub(crate) head_cluster_offsets: Vec<usize>,
     pub(crate) encoded_bytes: Vec<usize>,
     pub(crate) logical_lclusters: usize,
     pub(crate) compact_2b_entries: usize,
@@ -59,6 +60,7 @@ struct Head {
     lcn: usize,
     pcluster: u64,
     kind: u16,
+    clusterofs: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,14 +225,9 @@ pub(crate) fn compile_lz4(
     let mut encoded_blocks = Vec::with_capacity(topology.heads.len());
     let mut encoded_bytes = Vec::with_capacity(topology.heads.len());
     for (index, head) in topology.heads.iter().enumerate() {
-        let start = head
-            .lcn
-            .checked_mul(BLOCK_BYTES)
-            .ok_or(CoreError::ArithmeticOverflow)?;
+        let start = head_logical_offset(head)?;
         let end = if let Some(next) = topology.heads.get(index + 1) {
-            next.lcn
-                .checked_mul(BLOCK_BYTES)
-                .ok_or(CoreError::ArithmeticOverflow)?
+            head_logical_offset(next)?
         } else {
             replacement.len()
         };
@@ -391,7 +388,7 @@ pub(crate) fn compile_big_lz4(
 fn encode_plain_extent(extent: &[u8]) -> Result<(Vec<u8>, usize), CoreError> {
     if extent.is_empty() || extent.len() > BLOCK_BYTES {
         return Err(CoreError::UnsupportedInode(
-            "zero-offset PLAIN extent must occupy one non-empty logical block",
+            "PLAIN extent must occupy one non-empty physical block",
         ));
     }
     let mut block = vec![0_u8; BLOCK_BYTES];
@@ -451,6 +448,7 @@ fn compile_blocks(
     let mut origin_pclusters = Vec::with_capacity(topology.heads.len());
     let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());
     let mut head_lclusters = Vec::with_capacity(topology.heads.len());
+    let mut head_cluster_offsets = Vec::with_capacity(topology.heads.len());
 
     for ((origin_head, replacement_head), encoded) in topology
         .heads
@@ -469,6 +467,7 @@ fn compile_blocks(
         origin_pclusters.push(origin_head.pcluster);
         replacement_pclusters.push(replacement_head.pcluster);
         head_lclusters.push(origin_head.lcn);
+        head_cluster_offsets.push(origin_head.clusterofs);
     }
 
     let compiled = view.finalize().map_err(CoreError::View)?;
@@ -486,6 +485,7 @@ fn compile_blocks(
         origin_pclusters,
         replacement_pclusters,
         head_lclusters,
+        head_cluster_offsets,
         encoded_bytes,
         logical_lclusters: topology.logical_lclusters,
         compact_2b_entries: topology.compact_2b_entries,
@@ -577,6 +577,7 @@ fn compile_big_spans(
         origin_nid: topology.nid,
         origin_pclusters,
         replacement_pclusters,
+        head_cluster_offsets: vec![0; head_lclusters.len()],
         head_lclusters,
         encoded_bytes,
         logical_lclusters: topology.logical_lclusters,
@@ -617,11 +618,14 @@ fn validate_compatible_topology(
     if origin
         .heads
         .iter()
-        .map(|head| (head.lcn, head.kind))
-        .ne(replacement.heads.iter().map(|head| (head.lcn, head.kind)))
+        .map(|head| (head.lcn, head.kind, head.clusterofs))
+        .ne(replacement
+            .heads
+            .iter()
+            .map(|head| (head.lcn, head.kind, head.clusterofs)))
     {
         return Err(CoreError::IncompatibleReplacement(
-            "compressed head-lcluster/type topology differs",
+            "compressed head-lcluster/type/offset topology differs",
         ));
     }
     Ok(())
@@ -786,6 +790,7 @@ impl Image {
 
         let entries = self.read_all_entries(map.ebase, logical_lclusters)?;
         let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;
+        validate_head_logical_offsets(&heads, inode.size)?;
         if heads.len() != compressed_blocks {
             return Err(CoreError::InvalidFilesystem(
                 "compressed block count does not match recovered HEAD count",
@@ -907,12 +912,13 @@ impl Image {
                         lcn,
                         pcluster,
                         kind: LCLUSTER_HEAD1,
+                        clusterofs: 0,
                     });
                 }
                 LCLUSTER_PLAIN => {
-                    if lcn + 1 != total || entry.low != 0 {
+                    if lcn + 1 != total {
                         return Err(CoreError::UnsupportedInode(
-                            "compact core supports only a zero-offset PLAIN EOF lcluster",
+                            "compact core supports PLAIN only for the EOF lcluster",
                         ));
                     }
                     let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;
@@ -920,6 +926,7 @@ impl Image {
                         lcn,
                         pcluster,
                         kind: LCLUSTER_PLAIN,
+                        clusterofs: usize::from(entry.low),
                     });
                 }
                 LCLUSTER_NONHEAD => {}
@@ -1085,6 +1092,43 @@ fn validate_target_inode(inode: &Inode) -> Result<usize, CoreError> {
     usize::try_from(logical_lclusters).map_err(|_| CoreError::ArithmeticOverflow)
 }
 
+fn head_logical_offset(head: &Head) -> Result<usize, CoreError> {
+    head.lcn
+        .checked_mul(BLOCK_BYTES)
+        .and_then(|start| start.checked_add(head.clusterofs))
+        .ok_or(CoreError::ArithmeticOverflow)
+}
+
+fn validate_head_logical_offsets(heads: &[Head], logical_size: u64) -> Result<(), CoreError> {
+    let logical_size = usize::try_from(logical_size).map_err(|_| CoreError::ArithmeticOverflow)?;
+    let mut previous = None;
+    for head in heads {
+        if head.clusterofs >= BLOCK_BYTES {
+            return Err(CoreError::InvalidFilesystem(
+                "compact head cluster offset exceeds one logical cluster",
+            ));
+        }
+        let start = head_logical_offset(head)?;
+        if start >= logical_size {
+            return Err(CoreError::InvalidFilesystem(
+                "compact head logical offset lies at or beyond EOF",
+            ));
+        }
+        if let Some(previous) = previous {
+            if start <= previous {
+                return Err(CoreError::InvalidFilesystem(
+                    "compact head logical offsets are not strictly increasing",
+                ));
+            }
+        } else if start != 0 {
+            return Err(CoreError::InvalidFilesystem(
+                "first compact head does not begin at logical byte zero",
+            ));
+        }
+        previous = Some(start);
+    }
+    Ok(())
+}
 fn validate_nonheads(
     entries: &[CompactEntry],
     heads: &[Head],
@@ -1740,6 +1784,7 @@ mod tests {
                 lcn: 0,
                 pcluster: 10,
                 kind: LCLUSTER_HEAD1,
+                clusterofs: 0,
             }],
         };
         let mut relocated = single.clone();
@@ -1769,6 +1814,7 @@ mod tests {
                 lcn: 0,
                 pcluster: 10,
                 kind: LCLUSTER_HEAD1,
+                clusterofs: 0,
             }],
         };
         let mut replacement = origin.clone();
@@ -1776,9 +1822,28 @@ mod tests {
         assert!(matches!(
             validate_compatible_topology(&origin, &replacement),
             Err(CoreError::IncompatibleReplacement(
-                "compressed head-lcluster/type topology differs"
+                "compressed head-lcluster/type/offset topology differs"
             ))
         ));
+    }
+    #[test]
+    fn nonzero_plain_eof_offset_is_part_of_logical_topology() {
+        let heads = vec![
+            Head {
+                lcn: 0,
+                pcluster: 10,
+                kind: LCLUSTER_HEAD1,
+                clusterofs: 0,
+            },
+            Head {
+                lcn: 1,
+                pcluster: 11,
+                kind: LCLUSTER_PLAIN,
+                clusterofs: 123,
+            },
+        ];
+        assert_eq!(head_logical_offset(&heads[1]).unwrap(), 4096 + 123);
+        assert!(validate_head_logical_offsets(&heads, 8192).is_ok());
     }
     #[test]
     fn later_extent_codec_failure_happens_before_view_construction() {
