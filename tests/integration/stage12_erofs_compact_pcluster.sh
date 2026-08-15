@@ -120,6 +120,8 @@ sudo umount "$MOUNT_DIR"
 
 # A legacy/full-index image must be rejected without output side effects. This
 # protects the compact reader from accidentally interpreting full-index bytes.
+# The unified compact core now rejects legacy images at the superblock feature
+# gate before it reaches the inode-layout gate, so either rejection layer is valid.
 rm -f "$WORK/legacy.shadow" "$WORK/legacy.table" "$WORK/legacy.err"
 if "$LOOM" erofs-compact-pcluster-swap \
   "$LEGACY_IMG" /000payload.bin "$REPL_IMG" \
@@ -128,7 +130,7 @@ if "$LOOM" erofs-compact-pcluster-swap \
   echo 'Stage 12 expected full-index rejection' >&2
   exit 1
 fi
-grep -Eq 'expects normal compact LZ4|requires EROFS_INODE_COMPRESSED_COMPACT' "$WORK/legacy.err"
+grep -Eq 'LZ4_0PADDING|expects normal compact LZ4|requires EROFS_INODE_COMPRESSED_COMPACT' "$WORK/legacy.err"
 [[ ! -e "$WORK/legacy.shadow" ]]
 [[ ! -e "$WORK/legacy.table" ]]
 
