@@ -24,109 +24,121 @@ fn run() -> Result<(), Box<dyn Error>> {
     };
 
     match command.as_str() {
-        "pack-block" => {
-            let input = required(&mut args, "input file")?;
-            let output = required(&mut args, "output pack")?;
-            let block_size = parse_usize(&required(&mut args, "block size")?, "block size")?;
-            ensure_no_extra_args(&mut args)?;
-            loom_pack::pack_file(Path::new(&input), Path::new(&output), block_size)?;
-        }
-        "map-single" => {
-            let total = parse_u64(&required(&mut args, "total sectors")?, "total sectors")?;
-            let start = parse_u64(
-                &required(&mut args, "replacement start sector")?,
-                "replacement start sector",
-            )?;
-            let length = parse_u64(
-                &required(&mut args, "replacement sector count")?,
-                "replacement sector count",
-            )?;
-            let shadow_start = parse_u64(
-                &required(&mut args, "shadow start sector")?,
-                "shadow start sector",
-            )?;
-            let origin_device = required(&mut args, "origin device")?;
-            let shadow_device = required(&mut args, "shadow device")?;
-            let output = required(&mut args, "output table")?;
-            ensure_no_extra_args(&mut args)?;
-
-            let map = LoomMap::single_replacement(
-                SectorCount(total),
-                Sector(start),
-                SectorCount(length),
-                Sector(shadow_start),
-            )?;
-            let table = map.to_dm_linear_table(&origin_device, &shadow_device)?;
-            fs::write(output, table)?;
-        }
-        "ext4-replace" => {
-            let origin_image = required(&mut args, "origin ext4 image")?;
-            let target_path = required(&mut args, "target path")?;
-            let replacement = required(&mut args, "replacement file")?;
-            let shadow_output = required(&mut args, "shadow pack output")?;
-            let origin_device = required(&mut args, "origin block device")?;
-            let shadow_device = required(&mut args, "shadow block device")?;
-            let table_output = required(&mut args, "dm table output")?;
-            ensure_no_extra_args(&mut args)?;
-
-            let compiled = compile_same_size_replacement(
-                Path::new(&origin_image),
-                &target_path,
-                Path::new(&replacement),
-            )?;
-            fs::write(&shadow_output, &compiled.shadow)?;
-            let table = compiled
-                .map
-                .to_dm_linear_table(&origin_device, &shadow_device)?;
-            fs::write(&table_output, table)?;
-
-            println!(
-                "ext4 replacement compiled: inode={} block_size={} data_blocks={} shadow_blocks={} shadow_bytes={}",
-                compiled.inode,
-                compiled.block_size,
-                compiled.data_blocks,
-                compiled.shadow_blocks,
-                compiled.shadow.len()
-            );
-        }
-        "ext4-resize" => {
-            let origin_image = required(&mut args, "origin ext4 image")?;
-            let target_path = required(&mut args, "target path")?;
-            let replacement = required(&mut args, "replacement file")?;
-            let shadow_output = required(&mut args, "shadow pack output")?;
-            let origin_device = required(&mut args, "origin block device")?;
-            let shadow_device = required(&mut args, "shadow block device")?;
-            let table_output = required(&mut args, "dm table output")?;
-            ensure_no_extra_args(&mut args)?;
-
-            let compiled = compile_resize_within_allocation(
-                Path::new(&origin_image),
-                &target_path,
-                Path::new(&replacement),
-            )?;
-            fs::write(&shadow_output, &compiled.shadow)?;
-            let table = compiled
-                .map
-                .to_dm_linear_table(&origin_device, &shadow_device)?;
-            fs::write(&table_output, table)?;
-
-            println!(
-                "ext4 resize compiled: inode={} original_size={} effective_size={} block_size={} data_blocks={} data_shadow_blocks={} metadata_blocks={} shadow_blocks={} shadow_bytes={}",
-                compiled.inode,
-                compiled.original_size,
-                compiled.effective_size,
-                compiled.block_size,
-                compiled.data_blocks,
-                compiled.data_shadow_blocks,
-                compiled.metadata_blocks,
-                compiled.shadow_blocks,
-                compiled.shadow.len()
-            );
-        }
+        "pack-block" => command_pack_block(&mut args)?,
+        "map-single" => command_map_single(&mut args)?,
+        "ext4-replace" => command_ext4_replace(&mut args)?,
+        "ext4-resize" => command_ext4_resize(&mut args)?,
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command {other:?}").into()),
     }
 
+    Ok(())
+}
+
+fn command_pack_block(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let input = required(args, "input file")?;
+    let output = required(args, "output pack")?;
+    let block_size = parse_usize(&required(args, "block size")?, "block size")?;
+    ensure_no_extra_args(args)?;
+    loom_pack::pack_file(Path::new(&input), Path::new(&output), block_size)?;
+    Ok(())
+}
+
+fn command_map_single(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let total = parse_u64(&required(args, "total sectors")?, "total sectors")?;
+    let start = parse_u64(
+        &required(args, "replacement start sector")?,
+        "replacement start sector",
+    )?;
+    let length = parse_u64(
+        &required(args, "replacement sector count")?,
+        "replacement sector count",
+    )?;
+    let shadow_start = parse_u64(
+        &required(args, "shadow start sector")?,
+        "shadow start sector",
+    )?;
+    let origin_device = required(args, "origin device")?;
+    let shadow_device = required(args, "shadow device")?;
+    let output = required(args, "output table")?;
+    ensure_no_extra_args(args)?;
+
+    let map = LoomMap::single_replacement(
+        SectorCount(total),
+        Sector(start),
+        SectorCount(length),
+        Sector(shadow_start),
+    )?;
+    let table = map.to_dm_linear_table(&origin_device, &shadow_device)?;
+    fs::write(output, table)?;
+    Ok(())
+}
+
+fn command_ext4_replace(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let origin_image = required(args, "origin ext4 image")?;
+    let target_path = required(args, "target path")?;
+    let replacement = required(args, "replacement file")?;
+    let shadow_output = required(args, "shadow pack output")?;
+    let origin_device = required(args, "origin block device")?;
+    let shadow_device = required(args, "shadow block device")?;
+    let table_output = required(args, "dm table output")?;
+    ensure_no_extra_args(args)?;
+
+    let compiled = compile_same_size_replacement(
+        Path::new(&origin_image),
+        &target_path,
+        Path::new(&replacement),
+    )?;
+    fs::write(&shadow_output, &compiled.shadow)?;
+    let table = compiled
+        .map
+        .to_dm_linear_table(&origin_device, &shadow_device)?;
+    fs::write(&table_output, table)?;
+
+    println!(
+        "ext4 replacement compiled: inode={} block_size={} data_blocks={} shadow_blocks={} shadow_bytes={}",
+        compiled.inode,
+        compiled.block_size,
+        compiled.data_blocks,
+        compiled.shadow_blocks,
+        compiled.shadow.len()
+    );
+    Ok(())
+}
+
+fn command_ext4_resize(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let origin_image = required(args, "origin ext4 image")?;
+    let target_path = required(args, "target path")?;
+    let replacement = required(args, "replacement file")?;
+    let shadow_output = required(args, "shadow pack output")?;
+    let origin_device = required(args, "origin block device")?;
+    let shadow_device = required(args, "shadow block device")?;
+    let table_output = required(args, "dm table output")?;
+    ensure_no_extra_args(args)?;
+
+    let compiled = compile_resize_within_allocation(
+        Path::new(&origin_image),
+        &target_path,
+        Path::new(&replacement),
+    )?;
+    fs::write(&shadow_output, &compiled.shadow)?;
+    let table = compiled
+        .map
+        .to_dm_linear_table(&origin_device, &shadow_device)?;
+    fs::write(&table_output, table)?;
+
+    println!(
+        "ext4 resize compiled: inode={} original_size={} effective_size={} block_size={} data_blocks={} data_shadow_blocks={} metadata_blocks={} shadow_blocks={} shadow_bytes={}",
+        compiled.inode,
+        compiled.original_size,
+        compiled.effective_size,
+        compiled.block_size,
+        compiled.data_blocks,
+        compiled.data_shadow_blocks,
+        compiled.metadata_blocks,
+        compiled.shadow_blocks,
+        compiled.shadow.len()
+    );
     Ok(())
 }
 
