@@ -78,6 +78,13 @@ sudo fsck.erofs "/dev/mapper/$MAPPER" >/dev/null
 STOCK_HASH_AFTER="$(sha256sum "$STOCK" | awk '{print $1}')"
 [[ "$STOCK_HASH_BEFORE" == "$STOCK_HASH_AFTER" ]]
 
+# Drop the composed view before mounting the authoritative origin itself. Keeping
+# dm-linear alive while attempting a second mount of the same EROFS lower device
+# can be rejected as busy by the runner kernel even though the effective mount is gone.
+sudo dmsetup remove "$MAPPER"
+sudo losetup -d "$SHADOW_LOOP"
+SHADOW_LOOP=""
+
 sudo mount -t erofs -o ro "$ORIGIN_LOOP" "$MOUNT_DIR"
 sudo cmp "$MOUNT_DIR/000payload.bin" "$ORIGINAL"
 sudo umount "$MOUNT_DIR"
