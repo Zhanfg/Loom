@@ -1,0 +1,151 @@
+name: stage27-core-patch
+
+on:
+  push:
+    branches:
+      - feat/stage27-erofs-partial-tail
+    paths:
+      - .github/workflows/stage27-core-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage27-erofs-partial-tail
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply Stage 27 compact-core patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/loom-erofs/src/compact_core.rs')
+          text = path.read_text()
+
+          old_validate = "\n".join([
+              "    if inode.size < u64::from(BLOCK_SIZE) * 2 || inode.size % u64::from(BLOCK_SIZE) != 0 {",
+              "        return Err(CoreError::UnsupportedInode(",
+              "            \"compact core requires a whole-block file of at least two lclusters\",",
+              "        ));",
+              "    }",
+              "    usize::try_from(inode.size / u64::from(BLOCK_SIZE)).map_err(|_| CoreError::ArithmeticOverflow)",
+          ])
+          new_validate = "\n".join([
+              "    let logical_lclusters = div_ceil(inode.size, u64::from(BLOCK_SIZE))?;",
+              "    if logical_lclusters < 2 {",
+              "        return Err(CoreError::UnsupportedInode(",
+              "            \"compact core requires at least two logical clusters\",",
+              "        ));",
+              "    }",
+              "    usize::try_from(logical_lclusters).map_err(|_| CoreError::ArithmeticOverflow)",
+          ])
+          assert text.count(old_validate) == 1
+          text = text.replace(old_validate, new_validate, 1)
+
+          old_normal = "\n".join([
+              "        let next_lcn = topology",
+              "            .heads",
+              "            .get(index + 1)",
+              "            .map_or(topology.logical_lclusters, |next| next.lcn);",
+              "        let start = head",
+              "            .lcn",
+              "            .checked_mul(BLOCK_BYTES)",
+              "            .ok_or(CoreError::ArithmeticOverflow)?;",
+              "        let end = next_lcn",
+              "            .checked_mul(BLOCK_BYTES)",
+              "            .ok_or(CoreError::ArithmeticOverflow)?;",
+              "        let extent = replacement",
+              "            .get(start..end)",
+              "            .ok_or(CoreError::InvalidFilesystem(",
+              "                \"recovered logical extent lies beyond replacement payload\",",
+              "            ))?;",
+          ])
+          new_normal = "\n".join([
+              "        let start = head",
+              "            .lcn",
+              "            .checked_mul(BLOCK_BYTES)",
+              "            .ok_or(CoreError::ArithmeticOverflow)?;",
+              "        let end = if let Some(next) = topology.heads.get(index + 1) {",
+              "            next.lcn",
+              "                .checked_mul(BLOCK_BYTES)",
+              "                .ok_or(CoreError::ArithmeticOverflow)?",
+              "        } else {",
+              "            replacement.len()",
+              "        };",
+              "        if start >= end || end > replacement.len() {",
+              "            return Err(CoreError::InvalidFilesystem(",
+              "                \"recovered logical extent lies beyond replacement payload\",",
+              "            ));",
+              "        }",
+              "        let extent = replacement",
+              "            .get(start..end)",
+              "            .ok_or(CoreError::UnexpectedEndOfStructure)?;",
+          ])
+          assert text.count(old_normal) == 1
+          text = text.replace(old_normal, new_normal, 1)
+
+          old_big = "\n".join([
+              "        let next_lcn = topology",
+              "            .extents",
+              "            .get(index + 1)",
+              "            .map_or(topology.logical_lclusters, |next| next.lcn);",
+              "        let start = extent",
+              "            .lcn",
+              "            .checked_mul(BLOCK_BYTES)",
+              "            .ok_or(CoreError::ArithmeticOverflow)?;",
+              "        let end = next_lcn",
+              "            .checked_mul(BLOCK_BYTES)",
+              "            .ok_or(CoreError::ArithmeticOverflow)?;",
+              "        let logical_extent = replacement",
+              "            .get(start..end)",
+              "            .ok_or(CoreError::InvalidFilesystem(",
+              "                \"recovered big logical extent lies beyond replacement payload\",",
+              "            ))?;",
+          ])
+          new_big = "\n".join([
+              "        let start = extent",
+              "            .lcn",
+              "            .checked_mul(BLOCK_BYTES)",
+              "            .ok_or(CoreError::ArithmeticOverflow)?;",
+              "        let end = if let Some(next) = topology.extents.get(index + 1) {",
+              "            next.lcn",
+              "                .checked_mul(BLOCK_BYTES)",
+              "                .ok_or(CoreError::ArithmeticOverflow)?",
+              "        } else {",
+              "            replacement.len()",
+              "        };",
+              "        if start >= end || end > replacement.len() {",
+              "            return Err(CoreError::InvalidFilesystem(",
+              "                \"recovered big logical extent lies beyond replacement payload\",",
+              "            ));",
+              "        }",
+              "        let logical_extent = replacement",
+              "            .get(start..end)",
+              "            .ok_or(CoreError::UnexpectedEndOfStructure)?;",
+          ])
+          assert text.count(old_big) == 1
+          text = text.replace(old_big, new_big, 1)
+
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          grep -q 'let logical_lclusters = div_ceil(inode.size' crates/loom-erofs/src/compact_core.rs
+          grep -q 'replacement.len()' crates/loom-erofs/src/compact_core.rs
+          ! grep -q 'whole-block file' crates/loom-erofs/src/compact_core.rs
+      - name: Commit patch and remove one-shot workflow
+        shell: bash
+        run: |
+          git config user.name 'Loom Stage 27 maintainer'
+          git config user.email 'actions@users.noreply.github.com'
+          git rm .github/workflows/stage27-core-patch.yml
+          git add crates/loom-erofs/src/compact_core.rs
+          git commit -m 'stage27: support partial final EROFS lclusters'
+          git push origin HEAD:feat/stage27-erofs-partial-tail
