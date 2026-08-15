@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 
-#[path = "big_pcluster.rs"]
-mod big_pcluster;
 #[path = "compact_core.rs"]
 pub(crate) mod shared_core;
 
@@ -74,13 +72,11 @@ impl CompiledSwap {
         target_path: &str,
         replacement_image_path: &Path,
     ) -> Result<Self, IndexError> {
-        let compiled = big_pcluster::compile_big_pcluster_swap(
+        into_big(shared_core::compile_big_oracle(
             origin_path,
             target_path,
             replacement_image_path,
-        )
-        .map_err(map_big_error)?;
-        Ok(from_big(compiled))
+        )?)
     }
 
     /// Self-encodes a plain payload into the existing Stage 20 two-block big-pcluster span.
@@ -93,10 +89,11 @@ impl CompiledSwap {
         target_path: &str,
         replacement_path: &Path,
     ) -> Result<Self, IndexError> {
-        let compiled =
-            big_pcluster::compile_big_pcluster_lz4(origin_path, target_path, replacement_path)
-                .map_err(map_big_error)?;
-        Ok(from_big(compiled))
+        into_big(shared_core::compile_big_lz4(
+            origin_path,
+            target_path,
+            replacement_path,
+        )?)
     }
 }
 
@@ -111,10 +108,38 @@ fn into_single(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
             "single compact mode requires exactly one encoded physical block; use multi mode",
         ));
     }
+    into_scalar(compiled)
+}
 
-    let origin_pcluster = compiled.origin_pclusters[0];
-    let replacement_pcluster = compiled.replacement_pclusters[0];
-    let encoded_bytes = compiled.encoded_bytes[0];
+fn into_big(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
+    if compiled.origin_pclusters.len() != 1
+        || compiled.replacement_pclusters.len() != 1
+        || compiled.head_lclusters.as_slice() != [0]
+        || compiled.encoded_bytes.len() != 1
+        || compiled.shadow_blocks != 2
+    {
+        return Err(CoreError::InvalidFilesystem(
+            "big-pcluster compact core returned an unexpected proof topology",
+        ));
+    }
+    into_scalar(compiled)
+}
+
+fn into_scalar(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
+    let origin_pcluster = *compiled
+        .origin_pclusters
+        .first()
+        .ok_or(CoreError::InvalidFilesystem("compact core returned no origin pcluster"))?;
+    let replacement_pcluster = *compiled
+        .replacement_pclusters
+        .first()
+        .ok_or(CoreError::InvalidFilesystem(
+            "compact core returned no replacement pcluster",
+        ))?;
+    let encoded_bytes = *compiled
+        .encoded_bytes
+        .first()
+        .ok_or(CoreError::InvalidFilesystem("compact core returned no encoded length"))?;
     Ok(CompiledSwap {
         map: compiled.map,
         shadow: compiled.shadow,
@@ -127,49 +152,4 @@ fn into_single(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
         compact_2b_entries: compiled.compact_2b_entries,
         shadow_blocks: compiled.shadow_blocks,
     })
-}
-
-fn from_big(compiled: big_pcluster::CompiledBigPclusterSwap) -> CompiledSwap {
-    CompiledSwap {
-        map: compiled.map,
-        shadow: compiled.shadow,
-        block_size: compiled.block_size,
-        origin_nid: compiled.origin_nid,
-        origin_pcluster: compiled.origin_pcluster,
-        replacement_pcluster: compiled.replacement_pcluster,
-        encoded_bytes: compiled.encoded_bytes,
-        logical_lclusters: compiled.logical_lclusters,
-        compact_2b_entries: compiled.compact_2b_entries,
-        shadow_blocks: compiled.shadow_blocks,
-    }
-}
-
-fn map_big_error(error: big_pcluster::BigPclusterError) -> CoreError {
-    use big_pcluster::BigPclusterError as Big;
-    match error {
-        Big::Io(error) => CoreError::Io(error),
-        Big::View(error) => CoreError::View(error),
-        Big::BadMagic(magic) => CoreError::BadMagic(magic),
-        Big::InvalidFilesystem(reason) => CoreError::InvalidFilesystem(reason),
-        Big::UnsupportedFilesystem(reason) => CoreError::UnsupportedFilesystem(reason),
-        Big::UnsupportedInode(reason) => CoreError::UnsupportedInode(reason),
-        Big::IncompatibleReplacement(reason) => CoreError::IncompatibleReplacement(reason),
-        Big::ReplacementSizeMismatch { expected, actual } => {
-            CoreError::ReplacementSizeMismatch { expected, actual }
-        }
-        Big::CompressionDoesNotFit { encoded, capacity } => CoreError::CompressionDoesNotFit {
-            head_lcn: 0,
-            encoded,
-            capacity,
-        },
-        Big::CompressionValidationFailed => CoreError::CompressionValidationFailed,
-        Big::InvalidPath(reason) => CoreError::InvalidPath(reason),
-        Big::PathNotFound(name) => CoreError::PathNotFound(name),
-        Big::NotDirectory(nid) => CoreError::NotDirectory(nid),
-        Big::NotRegularFile(nid) => CoreError::NotRegularFile(nid),
-        Big::CorruptDirectory => CoreError::CorruptDirectory,
-        Big::UnexpectedEndOfImage => CoreError::UnexpectedEndOfImage,
-        Big::UnexpectedEndOfStructure => CoreError::UnexpectedEndOfStructure,
-        Big::ArithmeticOverflow => CoreError::ArithmeticOverflow,
-    }
 }
