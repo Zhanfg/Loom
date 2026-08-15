@@ -1,63 +1,86 @@
-name: stage-linux
+from pathlib import Path
 
-on:
-  pull_request:
-  workflow_dispatch:
 
-permissions:
-  contents: write
+def replace_span(source: str, start: str, end: str, replacement: str) -> str:
+    start_index = source.index(start)
+    end_index = source.index(end, start_index)
+    return source[:start_index] + replacement + source[end_index:]
 
-jobs:
-  rust-and-ext4-fabric:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
 
-    steps:
-      - name: Checkout Stage 4 branch
-        uses: actions/checkout@v5
-        with:
-          ref: feat/stage4-ext4-contiguous-growth
+path = Path("crates/loom-ext4/src/allocator.rs")
+text = path.read_text()
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
+marker = """struct GroupDescriptorLocation {
+    group: u32,
+    descriptor_block: u64,
+    descriptor_offset: usize,
+    block_bitmap: u64,
+    free_blocks: u32,
+    flags: u16,
+}
+"""
+addition = """
+#[derive(Debug, Clone, Copy)]
+enum GrowthPolicy {
+    ExactlyOne,
+    UpTo64,
+}
 
-      - name: Install Linux test dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y e2fsprogs dmsetup util-linux
-          sudo modprobe dm_mod
-          sudo modprobe dm_linear || true
+impl GrowthPolicy {
+    fn validate(self, new_blocks: usize) -> Result<(), Ext4Error> {
+        match self {
+            Self::ExactlyOne if new_blocks != 1 => Err(Ext4Error::UnsupportedFilesystemFeature(
+                "Stage 3 allocator requires exactly one new data block",
+            )),
+            Self::UpTo64 if new_blocks == 0 || new_blocks > 64 => {
+                Err(Ext4Error::UnsupportedFilesystemFeature(
+                    "Stage 4 allocator supports at most 64 new data blocks and requires at least one",
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+}
 
-      - name: Generalize allocator growth policy
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
+#[derive(Debug, Clone, Copy)]
+struct AllocatorDelta {
+    geometry: AllocationGeometry,
+    allocated_blocks: u32,
+}
+"""
+if "enum GrowthPolicy" not in text:
+    if marker not in text:
+        raise SystemExit("group descriptor insertion marker missing")
+    text = text.replace(marker, marker + addition, 1)
 
-          path = Path('crates/loom-ext4/src/allocator.rs')
-          text = path.read_text()
+old_plan = """struct InodeGrowthPlan<'a> {
+    inode_number: u32,
+    inode: &'a Inode,
+    old_block: u64,
+    new_block: u64,
+    checksum_seed: u32,
+    sectors_per_block: u64,
+    effective_size: u64,
+}
+"""
+new_plan = """struct InodeGrowthPlan<'a> {
+    inode_number: u32,
+    inode: &'a Inode,
+    old_block: u64,
+    new_run_start: u64,
+    new_block_count: usize,
+    checksum_seed: u32,
+    sectors_per_block: u64,
+    added_sectors: u64,
+    effective_size: u64,
+}
+"""
+if new_plan not in text:
+    if old_plan not in text:
+        raise SystemExit("InodeGrowthPlan shape missing")
+    text = text.replace(old_plan, new_plan, 1)
 
-          def replace_span(source: str, start: str, end: str, replacement: str) -> str:
-              start_index = source.index(start)
-              end_index = source.index(end, start_index)
-              return source[:start_index] + replacement + source[end_index:]
-
-          marker = '''struct GroupDescriptorLocation {\n    group: u32,\n    descriptor_block: u64,\n    descriptor_offset: usize,\n    block_bitmap: u64,\n    free_blocks: u32,\n    flags: u16,\n}\n'''
-          addition = '''\n#[derive(Debug, Clone, Copy)]\nenum GrowthPolicy {\n    ExactlyOne,\n    UpTo64,\n}\n\nimpl GrowthPolicy {\n    fn validate(self, new_blocks: usize) -> Result<(), Ext4Error> {\n        match self {\n            Self::ExactlyOne if new_blocks != 1 => Err(Ext4Error::UnsupportedFilesystemFeature(\n                "Stage 3 allocator requires exactly one new data block",\n            )),\n            Self::UpTo64 if new_blocks == 0 || new_blocks > 64 => {\n                Err(Ext4Error::UnsupportedFilesystemFeature(\n                    "Stage 4 allocator supports at most 64 new data blocks and requires at least one",\n                ))\n            }\n            _ => Ok(()),\n        }\n    }\n}\n\n#[derive(Debug, Clone, Copy)]\nstruct AllocatorDelta {\n    geometry: AllocationGeometry,\n    allocated_blocks: u32,\n}\n'''
-          if 'enum GrowthPolicy' not in text:
-              if marker not in text:
-                  raise SystemExit('group descriptor insertion marker missing')
-              text = text.replace(marker, marker + addition, 1)
-
-          old_plan = '''struct InodeGrowthPlan<'a> {\n    inode_number: u32,\n    inode: &'a Inode,\n    old_block: u64,\n    new_block: u64,\n    checksum_seed: u32,\n    sectors_per_block: u64,\n    effective_size: u64,\n}\n'''
-          new_plan = '''struct InodeGrowthPlan<'a> {\n    inode_number: u32,\n    inode: &'a Inode,\n    old_block: u64,\n    new_run_start: u64,\n    new_block_count: usize,\n    checksum_seed: u32,\n    sectors_per_block: u64,\n    added_sectors: u64,\n    effective_size: u64,\n}\n'''
-          if new_plan not in text:
-              if old_plan not in text:
-                  raise SystemExit('InodeGrowthPlan shape missing')
-              text = text.replace(old_plan, new_plan, 1)
-
-          public_and_compile = r'''/// Grows a one-block ext4 regular file by exactly one newly allocated data block.
+public_and_compile = r'''/// Grows a one-block ext4 regular file by exactly one newly allocated data block.
 ///
 /// # Errors
 /// Returns [`Ext4Error`] when the target or filesystem falls outside the proven
@@ -244,25 +267,40 @@ impl Ext4Image {
     }
 
 '''
-          text = replace_span(
-              text,
-              '/// Grows a one-block ext4 regular file by exactly one newly allocated data block.',
-              '    fn allocation_geometry(',
-              public_and_compile + '    fn allocation_geometry(',
-          )
+text = replace_span(
+    text,
+    "/// Grows a one-block ext4 regular file by exactly one newly allocated data block.",
+    "    fn allocation_geometry(",
+    public_and_compile + "    fn allocation_geometry(",
+)
 
-          text = text.replace(
-              '''        update_extent_root_for_one_block(\n            raw_inode,\n            &plan.inode.block,\n            plan.old_block,\n            plan.new_block,\n        )?;\n''',
-              '''        update_extent_root_for_run(\n            raw_inode,\n            &plan.inode.block,\n            plan.old_block,\n            plan.new_run_start,\n            plan.new_block_count,\n        )?;\n''',
-              1,
-          )
-          text = text.replace(
-              '        increment_inode_blocks(raw_inode, plan.sectors_per_block)?;\n',
-              '        increment_inode_blocks(raw_inode, plan.added_sectors)?;\n',
-              1,
-          )
+old_extent_call = """        update_extent_root_for_one_block(
+            raw_inode,
+            &plan.inode.block,
+            plan.old_block,
+            plan.new_block,
+        )?;
+"""
+new_extent_call = """        update_extent_root_for_run(
+            raw_inode,
+            &plan.inode.block,
+            plan.old_block,
+            plan.new_run_start,
+            plan.new_block_count,
+        )?;
+"""
+if old_extent_call not in text:
+    raise SystemExit("extent update call missing")
+text = text.replace(old_extent_call, new_extent_call, 1)
+if "increment_inode_blocks(raw_inode, plan.sectors_per_block)?;" not in text:
+    raise SystemExit("i_blocks update call missing")
+text = text.replace(
+    "increment_inode_blocks(raw_inode, plan.sectors_per_block)?;",
+    "increment_inode_blocks(raw_inode, plan.added_sectors)?;",
+    1,
+)
 
-          descriptor_method = r'''    fn update_block_bitmap_checksum_and_descriptor(
+descriptor_method = r'''    fn update_block_bitmap_checksum_and_descriptor(
         &mut self,
         location: GroupDescriptorLocation,
         delta: AllocatorDelta,
@@ -316,14 +354,14 @@ impl Ext4Image {
     }
 
 '''
-          text = replace_span(
-              text,
-              '    fn update_block_bitmap_checksum_and_descriptor(',
-              '    fn append_superblock_allocator_shadow(',
-              descriptor_method + '    fn append_superblock_allocator_shadow(',
-          )
+text = replace_span(
+    text,
+    "    fn update_block_bitmap_checksum_and_descriptor(",
+    "    fn append_superblock_allocator_shadow(",
+    descriptor_method + "    fn append_superblock_allocator_shadow(",
+)
 
-          super_method = r'''    fn append_superblock_allocator_shadow(
+super_method = r'''    fn append_superblock_allocator_shadow(
         &mut self,
         delta: AllocatorDelta,
         sectors_per_block: u64,
@@ -356,14 +394,14 @@ impl Ext4Image {
 }
 
 '''
-          text = replace_span(
-              text,
-              '    fn append_superblock_allocator_shadow(',
-              'fn build_compiled_growth(',
-              super_method + 'fn build_compiled_growth(',
-          )
+text = replace_span(
+    text,
+    "    fn append_superblock_allocator_shadow(",
+    "fn build_compiled_growth(",
+    super_method + "fn build_compiled_growth(",
+)
 
-          build_result = r'''fn build_compiled_growth(
+build_result = r'''fn build_compiled_growth(
     map: LoomMap,
     shadow: Vec<u8>,
     block_size: u32,
@@ -388,14 +426,14 @@ impl Ext4Image {
 }
 
 '''
-          text = replace_span(
-              text,
-              'fn build_compiled_growth(',
-              'fn validate_allocator_inode(',
-              build_result + 'fn validate_allocator_inode(',
-          )
+text = replace_span(
+    text,
+    "fn build_compiled_growth(",
+    "fn validate_allocator_inode(",
+    build_result + "fn validate_allocator_inode(",
+)
 
-          free_run = r'''fn find_and_set_free_run(
+free_run = r'''fn find_and_set_free_run(
     bitmap: &mut [u8],
     group: u32,
     first_data_block: u64,
@@ -505,14 +543,14 @@ fn append_new_data_run(
 }
 
 '''
-          text = replace_span(
-              text,
-              'fn find_and_set_free_block(',
-              'fn update_extent_root_for_one_block(',
-              free_run + 'fn update_extent_root_for_one_block(',
-          )
+text = replace_span(
+    text,
+    "fn find_and_set_free_block(",
+    "fn update_extent_root_for_one_block(",
+    free_run + "fn update_extent_root_for_one_block(",
+)
 
-          extent_run = r'''fn update_extent_root_for_run(
+extent_run = r'''fn update_extent_root_for_run(
     raw_inode: &mut [u8],
     parsed_root: &[u8; INODE_BLOCK_ROOT_LEN],
     old_block: u64,
@@ -591,14 +629,14 @@ fn append_new_data_run(
 }
 
 '''
-          text = replace_span(
-              text,
-              'fn update_extent_root_for_one_block(',
-              'fn increment_inode_blocks(',
-              extent_run + 'fn increment_inode_blocks(',
-          )
+text = replace_span(
+    text,
+    "fn update_extent_root_for_one_block(",
+    "fn increment_inode_blocks(",
+    extent_run + "fn increment_inode_blocks(",
+)
 
-          group_counter = r'''fn decrement_group_free_blocks(
+group_counter = r'''fn decrement_group_free_blocks(
     descriptor: &mut [u8],
     has_64bit: bool,
     count: u32,
@@ -630,14 +668,14 @@ fn append_new_data_run(
 }
 
 '''
-          text = replace_span(
-              text,
-              'fn decrement_group_free_blocks(',
-              'fn decrement_super_free_blocks(',
-              group_counter + 'fn decrement_super_free_blocks(',
-          )
+text = replace_span(
+    text,
+    "fn decrement_group_free_blocks(",
+    "fn decrement_super_free_blocks(",
+    group_counter + "fn decrement_super_free_blocks(",
+)
 
-          super_counter = r'''fn decrement_super_free_blocks(
+super_counter = r'''fn decrement_super_free_blocks(
     raw_super: &mut [u8],
     has_64bit: bool,
     count: u64,
@@ -669,38 +707,38 @@ fn append_new_data_run(
 }
 
 '''
-          text = replace_span(
-              text,
-              'fn decrement_super_free_blocks(',
-              'fn rewrite_group_descriptor_checksum(',
-              super_counter + 'fn rewrite_group_descriptor_checksum(',
-          )
+text = replace_span(
+    text,
+    "fn decrement_super_free_blocks(",
+    "fn rewrite_group_descriptor_checksum(",
+    super_counter + "fn rewrite_group_descriptor_checksum(",
+)
 
-          path.write_text(text)
+path.write_text(text)
 
-          lib = Path('crates/loom-ext4/src/lib.rs')
-          lib_text = lib.read_text()
-          lib_text = lib_text.replace(
-              'pub use allocator::{compile_one_block_growth, CompiledGrowth};',
-              'pub use allocator::{compile_contiguous_growth, compile_one_block_growth, CompiledGrowth};',
-              1,
-          )
-          lib.write_text(lib_text)
+lib = Path("crates/loom-ext4/src/lib.rs")
+lib_text = lib.read_text()
+lib_text = lib_text.replace(
+    "pub use allocator::{compile_one_block_growth, CompiledGrowth};",
+    "pub use allocator::{compile_contiguous_growth, compile_one_block_growth, CompiledGrowth};",
+    1,
+)
+lib.write_text(lib_text)
 
-          cli = Path('crates/loom-cli/src/main.rs')
-          cli_text = cli.read_text()
-          cli_text = cli_text.replace(
-              '    compile_one_block_growth, compile_resize_within_allocation, compile_same_size_replacement,\n',
-              '    compile_contiguous_growth, compile_one_block_growth, compile_resize_within_allocation,\n    compile_same_size_replacement,\n',
-              1,
-          )
-          cli_text = cli_text.replace(
-              '        "ext4-grow-one" => command_ext4_grow_one(&mut args)?,\n',
-              '        "ext4-grow-one" => command_ext4_grow_one(&mut args)?,\n        "ext4-grow-run" => command_ext4_grow_run(&mut args)?,\n',
-              1,
-          )
-          handler_marker = 'fn required(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, Box<dyn Error>> {'
-          handler = r'''fn command_ext4_grow_run(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+cli = Path("crates/loom-cli/src/main.rs")
+cli_text = cli.read_text()
+cli_text = cli_text.replace(
+    "    compile_one_block_growth, compile_resize_within_allocation, compile_same_size_replacement,\n",
+    "    compile_contiguous_growth, compile_one_block_growth, compile_resize_within_allocation,\n    compile_same_size_replacement,\n",
+    1,
+)
+cli_text = cli_text.replace(
+    '        "ext4-grow-one" => command_ext4_grow_one(&mut args)?,\n',
+    '        "ext4-grow-one" => command_ext4_grow_one(&mut args)?,\n        "ext4-grow-run" => command_ext4_grow_run(&mut args)?,\n',
+    1,
+)
+handler_marker = "fn required(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, Box<dyn Error>> {"
+handler = r'''fn command_ext4_grow_run(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let origin_image = required(args, "origin ext4 image")?;
     let target_path = required(args, "target path")?;
     let replacement = required(args, "replacement file")?;
@@ -739,73 +777,11 @@ fn append_new_data_run(
 }
 
 '''
-          if 'fn command_ext4_grow_run(' not in cli_text:
-              cli_text = cli_text.replace(handler_marker, handler + handler_marker, 1)
-          cli_text = cli_text.replace(
-              '           loom ext4-grow-one <origin-image> <target-path> <replacement> <shadow-pack> \\\\\n<origin-device> <shadow-device> <output-table>\\n"',
-              '           loom ext4-grow-one <origin-image> <target-path> <replacement> <shadow-pack> \\\\\n<origin-device> <shadow-device> <output-table>\\n\\\n           loom ext4-grow-run <origin-image> <target-path> <replacement> <shadow-pack> \\\\\n<origin-device> <shadow-device> <output-table>\\n"',
-              1,
-          )
-          cli_text = cli_text.replace('"Loom Stage 3\\n\\n\\\n', '"Loom Stage 4\\n\\n\\\n', 1)
-          cli.write_text(cli_text)
-          PY
-          cargo fmt --all
-
-      - name: Commit generalized allocator
-        run: |
-          if ! git diff --quiet -- crates; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add crates
-            git commit -m "feat(ext4): generalize allocator to bounded contiguous growth"
-            git push origin HEAD:feat/stage4-ext4-contiguous-growth
-          fi
-
-      - name: Format
-        run: cargo fmt --all -- --check
-
-      - name: Clippy diagnostics
-        continue-on-error: true
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Unit tests
-        run: cargo test --workspace
-
-      - name: Stage 0 ext4 sparse substitution
-        run: bash tests/integration/stage0_ext4_dm_linear.sh
-
-      - name: Stage 1 ext4 path compiler
-        run: bash tests/integration/stage1_ext4_compiler.sh
-
-      - name: Stage 1 partial final block
-        run: bash tests/integration/stage1_ext4_partial_block.sh
-
-      - name: Stage 1.1 ext4 block-size matrix
-        run: bash tests/integration/stage1_ext4_block_sizes.sh
-
-      - name: Stage 1.1 sparse block delta
-        run: bash tests/integration/stage1_ext4_block_delta.sh
-
-      - name: Stage 1.1 sparse-file rejection
-        run: bash tests/integration/stage1_ext4_sparse_reject.sh
-
-      - name: Stage 2 inode resize
-        run: bash tests/integration/stage2_ext4_inode_resize.sh
-
-      - name: Stage 2 allocation-boundary rejection
-        run: bash tests/integration/stage2_ext4_resize_reject.sh
-
-      - name: Stage 2 block-size matrix
-        run: bash tests/integration/stage2_ext4_block_sizes.sh
-
-      - name: Stage 3 one-block allocator
-        run: bash tests/integration/stage3_ext4_one_block_growth.sh
-
-      - name: Stage 3.1 allocator block-size matrix
-        run: bash tests/integration/stage3_1_ext4_allocator_block_sizes.sh
-
-      - name: Stage 4 contiguous growth
-        run: bash tests/integration/stage4_ext4_contiguous_growth.sh
-
-      - name: Clippy hard gate
-        run: cargo clippy --workspace --all-targets -- -D warnings
+if "fn command_ext4_grow_run(" not in cli_text:
+    cli_text = cli_text.replace(handler_marker, handler + handler_marker, 1)
+cli_text = cli_text.replace('"Loom Stage 3\\n\\n\\\n', '"Loom Stage 4\\n\\n\\\n', 1)
+usage_old = "           loom ext4-grow-one <origin-image> <target-path> <replacement> <shadow-pack> \\\\\n<origin-device> <shadow-device> <output-table>\\n\""
+usage_new = "           loom ext4-grow-one <origin-image> <target-path> <replacement> <shadow-pack> \\\\\n<origin-device> <shadow-device> <output-table>\\n\\\n           loom ext4-grow-run <origin-image> <target-path> <replacement> <shadow-pack> \\\\\n<origin-device> <shadow-device> <output-table>\\n\""
+if usage_old in cli_text:
+    cli_text = cli_text.replace(usage_old, usage_new, 1)
+cli.write_text(cli_text)
