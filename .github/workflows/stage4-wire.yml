@@ -1,0 +1,40 @@
+name: stage4-wire
+
+on:
+  push:
+    branches:
+      - feat/stage4-ext4-create-file
+
+permissions:
+  contents: write
+
+jobs:
+  wire:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage4-ext4-create-file
+      - name: Wire create module
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/loom-ext4/src/lib.rs')
+          s = p.read_text()
+          old = "mod allocate;\nmod checksum;\nmod resize;\n\npub use allocate::{compile_grow_with_block_allocation, CompiledAllocationGrow};"
+          new = "mod allocate;\nmod checksum;\nmod create;\nmod resize;\n\npub use allocate::{compile_grow_with_block_allocation, CompiledAllocationGrow};\npub use create::{compile_create_file, CompiledCreateFile};"
+          if new not in s:
+              if old not in s:
+                  raise SystemExit('expected module prelude not found')
+              p.write_text(s.replace(old, new, 1))
+          PY
+          cargo fmt --all
+      - name: Commit wiring and formatting
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/loom-ext4/src/lib.rs crates/loom-ext4/src/create.rs
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'feat(ext4): wire Stage 4 create-file compiler'
+          git push origin HEAD:feat/stage4-ext4-create-file
