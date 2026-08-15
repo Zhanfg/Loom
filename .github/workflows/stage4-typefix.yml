@@ -19,14 +19,16 @@ jobs:
       - name: Apply exact type fix
         run: |
           python3 - <<'PY'
+          import re
           from pathlib import Path
           p = Path('crates/loom-ext4/src/create.rs')
           s = p.read_text()
-          old = 'let descriptor_start_block = if self.superblock.block_size == 1024 { 2 } else { 1 };'
-          new = 'let descriptor_start_block: u64 = if self.superblock.block_size == 1024 { 2 } else { 1 };'
-          if old not in s:
-              raise SystemExit('expected descriptor_start_block line not found')
-          p.write_text(s.replace(old, new, 1))
+          pattern = r'let descriptor_start_block\s*=\s*if self\.superblock\.block_size == 1024'
+          replacement = 'let descriptor_start_block: u64 = if self.superblock.block_size == 1024'
+          s2, count = re.subn(pattern, replacement, s, count=1)
+          if count != 1:
+              raise SystemExit(f'expected one descriptor_start_block binding, found {count}')
+          p.write_text(s2)
           PY
           cargo fmt --all
       - name: Commit exact fix
