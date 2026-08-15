@@ -19,7 +19,6 @@ pub struct CompiledMultiSwap {
     pub origin_pclusters: Vec<u64>,
     pub replacement_pclusters: Vec<u64>,
     pub head_lclusters: Vec<usize>,
-    pub head_cluster_offsets: Vec<usize>,
     pub encoded_bytes: Vec<usize>,
     pub physical_pclusters: usize,
     pub logical_lclusters: usize,
@@ -84,7 +83,6 @@ fn from_core(compiled: CompiledCore) -> Result<CompiledMultiSwap, MultiIndexErro
     let physical_pclusters = compiled.origin_pclusters.len();
     if physical_pclusters != compiled.replacement_pclusters.len()
         || physical_pclusters != compiled.head_lclusters.len()
-        || physical_pclusters != compiled.head_cluster_offsets.len()
         || physical_pclusters != compiled.encoded_bytes.len()
     {
         return Err(CoreError::InvalidFilesystem(
@@ -116,7 +114,6 @@ fn from_core(compiled: CompiledCore) -> Result<CompiledMultiSwap, MultiIndexErro
         origin_pclusters: compiled.origin_pclusters,
         replacement_pclusters: compiled.replacement_pclusters,
         head_lclusters: compiled.head_lclusters,
-        head_cluster_offsets: compiled.head_cluster_offsets,
         encoded_bytes: compiled.encoded_bytes,
         physical_pclusters,
         logical_lclusters: compiled.logical_lclusters,
