@@ -1,0 +1,38 @@
+name: stage4-typefix
+
+on:
+  push:
+    branches:
+      - feat/stage4-ext4-create-file
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage4-ext4-create-file
+      - name: Apply exact type fix
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/loom-ext4/src/create.rs')
+          s = p.read_text()
+          old = 'let descriptor_start_block = if self.superblock.block_size == 1024 { 2 } else { 1 };'
+          new = 'let descriptor_start_block: u64 = if self.superblock.block_size == 1024 { 2 } else { 1 };'
+          if old not in s:
+              raise SystemExit('expected descriptor_start_block line not found')
+          p.write_text(s.replace(old, new, 1))
+          PY
+          cargo fmt --all
+      - name: Commit exact fix
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/loom-ext4/src/create.rs
+          git commit -m 'fix(ext4): type Stage 4 descriptor block arithmetic'
+          git push origin HEAD:feat/stage4-ext4-create-file
