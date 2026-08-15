@@ -62,7 +62,7 @@ impl CompiledSwap {
         )?)
     }
 
-    /// Compiles the Stage 19 two-block compact big-pcluster oracle path.
+    /// Compiles a single-extent compact big-pcluster oracle path.
     ///
     /// # Errors
     /// Returns [`IndexError`] for malformed/unsupported big-pcluster metadata, CBLKCNT
@@ -79,7 +79,7 @@ impl CompiledSwap {
         )?)
     }
 
-    /// Self-encodes a plain payload into the existing Stage 20 two-block big-pcluster span.
+    /// Self-encodes a plain payload into an existing single-extent big-pcluster span.
     ///
     /// # Errors
     /// Returns [`IndexError`] for malformed/unsupported CBLKCNT topology, replacement-size
@@ -116,10 +116,10 @@ fn into_big(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
         || compiled.replacement_pclusters.len() != 1
         || compiled.head_lclusters.as_slice() != [0]
         || compiled.encoded_bytes.len() != 1
-        || compiled.shadow_blocks != 2
+        || compiled.shadow_blocks < 2
     {
         return Err(CoreError::InvalidFilesystem(
-            "big-pcluster compact core returned an unexpected proof topology",
+            "big-pcluster compact core returned an unexpected single-extent topology",
         ));
     }
     into_scalar(compiled)

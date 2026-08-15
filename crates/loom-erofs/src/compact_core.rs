@@ -37,7 +37,7 @@ const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
 const FEATURE_BIG_PCLUSTER: u32 = 0x0000_0002;
 const SUPPORTED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER;
 const BIG_REQUIRED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER;
-const BIG_PROOF_PHYSICAL_BLOCKS: usize = 2;
+const MIN_BIG_PHYSICAL_BLOCKS: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct CompiledCore {
@@ -685,9 +685,9 @@ impl Image {
         let logical_lclusters = validate_target_inode(&inode)?;
         let physical_blocks =
             usize::try_from(inode.data_word).map_err(|_| CoreError::ArithmeticOverflow)?;
-        if physical_blocks != BIG_PROOF_PHYSICAL_BLOCKS {
+        if physical_blocks < MIN_BIG_PHYSICAL_BLOCKS {
             return Err(CoreError::UnsupportedInode(
-                "big-pcluster proof requires exactly two encoded physical blocks",
+                "single-extent big-pcluster mode requires at least two encoded physical blocks",
             ));
         }
 
@@ -704,7 +704,7 @@ impl Image {
         }
 
         let entries = self.read_all_entries(map.ebase, logical_lclusters)?;
-        validate_big_single_extent(&entries, logical_lclusters)?;
+        validate_big_single_extent(&entries, logical_lclusters, physical_blocks)?;
         let head = entries.first().ok_or(CoreError::InvalidFilesystem(
             "compact index stream is empty",
         ))?;
@@ -990,7 +990,11 @@ fn validate_nonheads(
     Ok(())
 }
 
-fn validate_big_single_extent(entries: &[CompactEntry], total: usize) -> Result<(), CoreError> {
+fn validate_big_single_extent(
+    entries: &[CompactEntry],
+    total: usize,
+    physical_blocks: usize,
+) -> Result<(), CoreError> {
     let head = entries.first().ok_or(CoreError::InvalidFilesystem(
         "compact index stream is empty",
     ))?;
@@ -1007,12 +1011,15 @@ fn validate_big_single_extent(entries: &[CompactEntry], total: usize) -> Result<
     let cblk = entries
         .get(1)
         .ok_or(CoreError::InvalidFilesystem("missing CBLKCNT index"))?;
-    if cblk.kind != LCLUSTER_NONHEAD
-        || cblk.low & D0_CBLKCNT == 0
-        || usize::from(cblk.low & !D0_CBLKCNT) != BIG_PROOF_PHYSICAL_BLOCKS
-    {
+    if cblk.kind != LCLUSTER_NONHEAD || cblk.low & D0_CBLKCNT == 0 {
         return Err(CoreError::InvalidFilesystem(
-            "first NONHEAD does not encode a two-block CBLKCNT",
+            "first NONHEAD does not carry a CBLKCNT marker",
+        ));
+    }
+    let cblkcnt = usize::from(cblk.low & !D0_CBLKCNT);
+    if cblkcnt != physical_blocks {
+        return Err(CoreError::InvalidFilesystem(
+            "CBLKCNT does not match inode encoded physical-block count",
         ));
     }
     for (lcn, entry) in entries.iter().enumerate().skip(2) {
@@ -1500,7 +1507,70 @@ mod tests {
                 base_pblk: 102,
             },
         ];
-        assert!(validate_big_single_extent(&entries, 3).is_ok());
+        assert!(validate_big_single_extent(&entries, 3, 2).is_ok());
+    }
+
+    #[test]
+    fn variable_cblkcnt_accepts_three_and_four_physical_blocks() {
+        for physical_blocks in [3_u16, 4_u16] {
+            let entries = vec![
+                CompactEntry {
+                    kind: LCLUSTER_HEAD1,
+                    low: 0,
+                    slot: 0,
+                    slots: 2,
+                    base_pblk: 100,
+                },
+                CompactEntry {
+                    kind: LCLUSTER_NONHEAD,
+                    low: D0_CBLKCNT | physical_blocks,
+                    slot: 1,
+                    slots: 2,
+                    base_pblk: 100,
+                },
+                CompactEntry {
+                    kind: LCLUSTER_NONHEAD,
+                    low: 2,
+                    slot: 0,
+                    slots: 2,
+                    base_pblk: 102,
+                },
+            ];
+            assert!(validate_big_single_extent(&entries, 3, usize::from(physical_blocks)).is_ok());
+        }
+    }
+
+    #[test]
+    fn cblkcnt_must_match_inode_physical_block_count() {
+        let entries = vec![
+            CompactEntry {
+                kind: LCLUSTER_HEAD1,
+                low: 0,
+                slot: 0,
+                slots: 2,
+                base_pblk: 100,
+            },
+            CompactEntry {
+                kind: LCLUSTER_NONHEAD,
+                low: D0_CBLKCNT | 3,
+                slot: 1,
+                slots: 2,
+                base_pblk: 100,
+            },
+            CompactEntry {
+                kind: LCLUSTER_NONHEAD,
+                low: 2,
+                slot: 0,
+                slots: 2,
+                base_pblk: 102,
+            },
+        ];
+        assert!(matches!(
+            validate_big_single_extent(&entries, 3, 4),
+            Err(CoreError::InvalidFilesystem(
+                "CBLKCNT does not match inode encoded physical-block count"
+            ))
+        ));
     }
 
     #[test]
