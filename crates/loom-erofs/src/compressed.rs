@@ -18,10 +18,12 @@ const FLAT_PLAIN: u8 = 0;
 const FLAT_INLINE: u8 = 2;
 const COMPRESSED_FULL: u8 = 1;
 const LCLUSTER_HEAD1: u16 = 1;
+const LCLUSTER_NONHEAD: u16 = 2;
 const LCLUSTER_TYPE_MASK: u16 = 3;
 const MAP_HEADER_SIZE: u64 = 8;
 const FULL_INDEX_GAP: u64 = 8;
 const FULL_INDEX_SIZE: usize = 8;
+const FULL_INDEX_COUNT: usize = 2;
 const LZ4_ALGORITHM: u8 = 0;
 const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
 const FEATURE_COMPR_CFGS_OR_BIG_PCLUSTER: u32 = 0x0000_0002;
@@ -79,12 +81,13 @@ struct Image {
     sb: Superblock,
 }
 
-/// Replaces one complete one-block LZ4 pcluster while keeping the stock compressed indexes.
+/// Replaces one complete one-block LZ4 pcluster while keeping stock compressed indexes.
 ///
-/// The replacement pcluster is taken from a second EROFS image built with compatible
-/// geometry. Stage 10 intentionally proves the block-weaving invariant before introducing
-/// an in-process compressor: both target inodes must use `COMPRESSED_FULL`, one logical
-/// cluster, one physical cluster, LZ4 HEAD1, zero cluster offset, and identical map advice.
+/// Stage 10 uses the smallest layout that is actually compression-beneficial: two logical
+/// filesystem blocks are represented by one physical pcluster. Both images must expose a
+/// `COMPRESSED_FULL` target with a HEAD1 + NONHEAD full-index chain, LZ4, zero cluster
+/// offset, one encoded block, and no big/inline/fragment/extent metadata features.
+/// The encoded replacement pcluster is taken from a separately verified EROFS image.
 ///
 /// # Errors
 /// Returns [`CompressedError`] for incompatible compressed layouts, path failures,
@@ -104,8 +107,8 @@ pub fn compile_full_pcluster_swap(
 
     let origin_nid = origin.resolve_path(target_path)?;
     let replacement_nid = replacement.resolve_path(target_path)?;
-    let origin_extent = origin.read_single_full_extent(origin_nid)?;
-    let replacement_extent = replacement.read_single_full_extent(replacement_nid)?;
+    let origin_extent = origin.read_two_lcluster_full_extent(origin_nid)?;
+    let replacement_extent = replacement.read_two_lcluster_full_extent(replacement_nid)?;
 
     if origin_extent.logical_size != replacement_extent.logical_size {
         return Err(CompressedError::IncompatibleReplacement(
@@ -155,13 +158,9 @@ pub fn compile_full_pcluster_swap(
 impl Image {
     fn open(path: &Path) -> Result<Self, CompressedError> {
         let mut file = File::open(path).map_err(CompressedError::Io)?;
-        let image_bytes = file.metadata().map_err(CompressedError::Io)?.len();
-        let sb = read_superblock(&mut file, image_bytes)?;
-        Ok(Self {
-            file,
-            bytes: image_bytes,
-            sb,
-        })
+        let bytes = file.metadata().map_err(CompressedError::Io)?.len();
+        let sb = read_superblock(&mut file, bytes)?;
+        Ok(Self { file, bytes, sb })
     }
 
     fn read_inode(&mut self, nid: u64) -> Result<Inode, CompressedError> {
@@ -170,15 +169,16 @@ impl Image {
             .meta_block
             .checked_mul(u64::from(self.sb.block_size))
             .ok_or(CompressedError::ArithmeticOverflow)?;
-        let inode_offset = metadata_base
+        let offset = metadata_base
             .checked_add(
                 nid.checked_mul(32)
                     .ok_or(CompressedError::ArithmeticOverflow)?,
             )
             .ok_or(CompressedError::ArithmeticOverflow)?;
-        ensure_range(self.bytes, inode_offset, 32)?;
+        ensure_range(self.bytes, offset, 32)?;
+
         let mut compact = [0_u8; 32];
-        read_exact_at(&mut self.file, inode_offset, &mut compact)?;
+        read_exact_at(&mut self.file, offset, &mut compact)?;
         let format = read_u16(&compact, 0)?;
         if format & !0x1f != 0 {
             return Err(CompressedError::UnsupportedInode(
@@ -193,22 +193,22 @@ impl Image {
                 "reserved EROFS inode data layout",
             ));
         }
-        let inode_size = if extended { 64 } else { 32 };
-        let xattr_icount = read_u16(&compact, 2)?;
-        let xattr_size = xattr_ibody_size(xattr_icount)?;
+        let isize = if extended { 64 } else { 32 };
+        let xattr_size = xattr_ibody_size(read_u16(&compact, 2)?)?;
         let mode = read_u16(&compact, 4)?;
         let size = if extended {
-            ensure_range(self.bytes, inode_offset, 64)?;
+            ensure_range(self.bytes, offset, 64)?;
             let mut raw = [0_u8; 64];
-            read_exact_at(&mut self.file, inode_offset, &mut raw)?;
+            read_exact_at(&mut self.file, offset, &mut raw)?;
             read_u64(&raw, 8)?
         } else {
             u64::from(read_u32(&compact, 8)?)
         };
+
         Ok(Inode {
             nid,
-            offset: inode_offset,
-            isize: inode_size,
+            offset,
+            isize,
             xattr_size,
             mode,
             size,
@@ -265,7 +265,10 @@ impl Image {
         ))
     }
 
-    fn read_single_full_extent(&mut self, nid: u64) -> Result<CompressedExtent, CompressedError> {
+    fn read_two_lcluster_full_extent(
+        &mut self,
+        nid: u64,
+    ) -> Result<CompressedExtent, CompressedError> {
         let inode = self.read_inode(nid)?;
         if inode.file_type() != MODE_REGULAR {
             return Err(CompressedError::NotRegularFile(nid));
@@ -280,9 +283,17 @@ impl Image {
                 "Stage 10 compressed target must not carry xattrs",
             ));
         }
-        if inode.size != u64::from(self.sb.block_size) {
+        let logical_size = u64::from(self.sb.block_size)
+            .checked_mul(2)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        if inode.size != logical_size {
             return Err(CompressedError::UnsupportedInode(
-                "Stage 10 requires exactly one logical filesystem block",
+                "Stage 10 requires exactly two logical filesystem blocks",
+            ));
+        }
+        if inode.data_word != 1 {
+            return Err(CompressedError::UnsupportedInode(
+                "Stage 10 requires exactly one encoded physical block",
             ));
         }
 
@@ -298,7 +309,7 @@ impl Image {
         let advise = read_u16(&header, 4)?;
         if advise != 0 {
             return Err(CompressedError::UnsupportedInode(
-                "Stage 10 requires single-block full indexes without big/inline/fragment advice",
+                "Stage 10 refuses big/inline/fragment/extent compressed advice",
             ));
         }
         let algorithm = header[6] & 0x0f;
@@ -317,31 +328,51 @@ impl Image {
             .checked_add(MAP_HEADER_SIZE)
             .and_then(|value| value.checked_add(FULL_INDEX_GAP))
             .ok_or(CompressedError::ArithmeticOverflow)?;
+        let index_bytes = FULL_INDEX_SIZE
+            .checked_mul(FULL_INDEX_COUNT)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
         ensure_range(
             self.bytes,
             index_offset,
-            u64::try_from(FULL_INDEX_SIZE).map_err(|_| CompressedError::ArithmeticOverflow)?,
+            u64::try_from(index_bytes).map_err(|_| CompressedError::ArithmeticOverflow)?,
         )?;
-        let mut index = [0_u8; FULL_INDEX_SIZE];
-        read_exact_at(&mut self.file, index_offset, &mut index)?;
-        let index_advise = read_u16(&index, 0)?;
-        if index_advise & LCLUSTER_TYPE_MASK != LCLUSTER_HEAD1
-            || index_advise & !LCLUSTER_TYPE_MASK != 0
+        let mut indexes = [0_u8; FULL_INDEX_SIZE * FULL_INDEX_COUNT];
+        read_exact_at(&mut self.file, index_offset, &mut indexes)?;
+
+        let head_advise = read_u16(&indexes, 0)?;
+        if head_advise & LCLUSTER_TYPE_MASK != LCLUSTER_HEAD1
+            || head_advise & !LCLUSTER_TYPE_MASK != 0
         {
             return Err(CompressedError::UnsupportedInode(
-                "Stage 10 requires an ordinary HEAD1 full index",
+                "Stage 10 requires an ordinary HEAD1 first full index",
             ));
         }
-        let cluster_offset = read_u16(&index, 2)?;
+        let cluster_offset = read_u16(&indexes, 2)?;
         if cluster_offset != 0 {
             return Err(CompressedError::UnsupportedInode(
-                "Stage 10 requires zero cluster offset",
+                "Stage 10 requires zero HEAD cluster offset",
             ));
         }
-        let pcluster = u64::from(read_u32(&index, 4)?);
+        let pcluster = u64::from(read_u32(&indexes, 4)?);
         if pcluster >= self.bytes / u64::from(self.sb.block_size) {
             return Err(CompressedError::InvalidFilesystem(
                 "compressed pcluster lies beyond image",
+            ));
+        }
+
+        let nonhead = FULL_INDEX_SIZE;
+        let nonhead_advise = read_u16(&indexes, nonhead)?;
+        if nonhead_advise & LCLUSTER_TYPE_MASK != LCLUSTER_NONHEAD
+            || nonhead_advise & !LCLUSTER_TYPE_MASK != 0
+        {
+            return Err(CompressedError::UnsupportedInode(
+                "Stage 10 requires an ordinary NONHEAD second full index",
+            ));
+        }
+        let delta0 = read_u16(&indexes, nonhead + 4)?;
+        if delta0 != 1 {
+            return Err(CompressedError::UnsupportedInode(
+                "Stage 10 NONHEAD must look back exactly one lcluster to HEAD1",
             ));
         }
 
@@ -371,8 +402,8 @@ impl Image {
     }
 }
 
-fn read_superblock(file: &mut File, image_bytes: u64) -> Result<Superblock, CompressedError> {
-    ensure_range(image_bytes, SB_OFFSET, SB_SIZE as u64)?;
+fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, CompressedError> {
+    ensure_range(bytes, SB_OFFSET, SB_SIZE as u64)?;
     let mut raw = [0_u8; SB_SIZE];
     read_exact_at(file, SB_OFFSET, &mut raw)?;
     let magic = read_u32(&raw, 0)?;
@@ -500,11 +531,11 @@ fn div_ceil(value: u64, divisor: u64) -> Result<u64, CompressedError> {
         .ok_or(CompressedError::ArithmeticOverflow)
 }
 
-fn ensure_range(image_bytes: u64, offset: u64, length: u64) -> Result<(), CompressedError> {
+fn ensure_range(bytes: u64, offset: u64, length: u64) -> Result<(), CompressedError> {
     let end = offset
         .checked_add(length)
         .ok_or(CompressedError::ArithmeticOverflow)?;
-    if end > image_bytes {
+    if end > bytes {
         return Err(CompressedError::UnexpectedEndOfImage);
     }
     Ok(())
