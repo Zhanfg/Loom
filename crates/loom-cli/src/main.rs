@@ -81,10 +81,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             fs::write(&table_output, table)?;
 
             println!(
-                "ext4 replacement compiled: inode={} block_size={} data_blocks={} shadow_bytes={}",
+                "ext4 replacement compiled: inode={} block_size={} data_blocks={} shadow_blocks={} shadow_bytes={}",
                 compiled.inode,
                 compiled.block_size,
                 compiled.data_blocks,
+                compiled.shadow_blocks,
                 compiled.shadow.len()
             );
         }

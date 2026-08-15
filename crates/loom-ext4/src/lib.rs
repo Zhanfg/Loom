@@ -43,6 +43,7 @@ pub struct CompiledReplacement {
     pub block_size: u32,
     pub inode: u32,
     pub data_blocks: usize,
+    pub shadow_blocks: usize,
 }
 
 /// Compiles one same-size ext4 path replacement into shadow blocks and a Loom map.
@@ -150,17 +151,14 @@ impl Ext4Image {
         let block_size = usize::try_from(self.superblock.block_size)
             .map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let sectors_per_block = u64::from(self.superblock.block_size) / SECTOR_SIZE;
-        let mut shadow = Vec::with_capacity(
-            blocks
-                .len()
-                .checked_mul(block_size)
-                .ok_or(Ext4Error::ArithmeticOverflow)?,
-        );
+        let mut shadow = Vec::new();
         let mut replacements = Vec::with_capacity(blocks.len());
+        let mut changed_blocks = 0_usize;
 
-        for (shadow_index, physical_block) in blocks.iter().copied().enumerate() {
-            let mut block = self.read_block(physical_block)?;
-            let replacement_offset = shadow_index
+        for (file_block_index, physical_block) in blocks.iter().copied().enumerate() {
+            let origin_block = self.read_block(physical_block)?;
+            let mut effective_block = origin_block.clone();
+            let replacement_offset = file_block_index
                 .checked_mul(block_size)
                 .ok_or(Ext4Error::ArithmeticOverflow)?;
             let remaining = replacement.len().saturating_sub(replacement_offset);
@@ -169,12 +167,16 @@ impl Ext4Image {
                 let replacement_end = replacement_offset
                     .checked_add(copy_len)
                     .ok_or(Ext4Error::ArithmeticOverflow)?;
-                block[..copy_len]
+                effective_block[..copy_len]
                     .copy_from_slice(&replacement[replacement_offset..replacement_end]);
             }
 
+            if effective_block == origin_block {
+                continue;
+            }
+
             let shadow_index_u64 =
-                u64::try_from(shadow_index).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+                u64::try_from(changed_blocks).map_err(|_| Ext4Error::ArithmeticOverflow)?;
             let logical_start = physical_block
                 .checked_mul(sectors_per_block)
                 .ok_or(Ext4Error::ArithmeticOverflow)?;
@@ -187,7 +189,10 @@ impl Ext4Image {
                 sector_count: SectorCount(sectors_per_block),
                 shadow_start: Sector(shadow_start),
             });
-            shadow.extend_from_slice(&block);
+            shadow.extend_from_slice(&effective_block);
+            changed_blocks = changed_blocks
+                .checked_add(1)
+                .ok_or(Ext4Error::ArithmeticOverflow)?;
         }
 
         let total_sectors = self.image_bytes / SECTOR_SIZE;
@@ -200,6 +205,7 @@ impl Ext4Image {
             block_size: self.superblock.block_size,
             inode: inode_number,
             data_blocks: blocks.len(),
+            shadow_blocks: changed_blocks,
         })
     }
 
