@@ -57,6 +57,15 @@ cp "$ORIGINAL" "$ORIGIN_ROOT/000payload.bin"
 cp "$REPLACEMENT" "$REPLACEMENT_ROOT/000payload.bin"
 cp "$REPLACEMENT" "$NORMAL_ROOT/000payload.bin"
 
+# Keep path traversal out of the big-pcluster proof itself. A single-entry EROFS root
+# may be emitted with an inline directory tail, which this deliberately narrow parser
+# refuses; dummy entries force all three roots onto ordinary directory data blocks.
+for i in $(seq -w 0 499); do
+  : > "$ORIGIN_ROOT/z_dummy_${i}_for_directory_growth"
+  : > "$REPLACEMENT_ROOT/z_dummy_${i}_for_directory_growth"
+  : > "$NORMAL_ROOT/z_dummy_${i}_for_directory_growth"
+done
+
 mkfs.erofs -b 4096 -C 8192 -zlz4 -E noinline_data -T 0 \
   --max-extent-bytes 32768 "$ORIGIN_IMG" "$ORIGIN_ROOT" >/dev/null
 mkfs.erofs -b 4096 -C 8192 -zlz4 -E noinline_data -T 0 \
