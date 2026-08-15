@@ -10,6 +10,7 @@ name = "loom"
 path = "src/main.rs"
 
 [dependencies]
+loom-erofs = { path = "../loom-erofs" }
 loom-ext4 = { path = "../loom-ext4" }
 loom-map = { path = "../loom-map" }
 loom-pack = { path = "../loom-pack" }
