@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
-use crate::compact_core::{self, CompiledCore, CoreError};
+#[path = "compact_core.rs"]
+pub(crate) mod shared_core;
+
 use loom_map::LoomMap;
+use shared_core::{CompiledCore, CoreError};
 use std::path::Path;
 
 pub type IndexError = CoreError;
@@ -34,7 +37,7 @@ pub fn compile_pcluster_swap(
     target_path: &str,
     replacement_image_path: &Path,
 ) -> Result<CompiledSwap, IndexError> {
-    into_single(compact_core::compile_oracle(
+    into_single(shared_core::compile_oracle(
         origin_path,
         target_path,
         replacement_image_path,
@@ -52,7 +55,7 @@ impl CompiledSwap {
         target_path: &str,
         replacement_path: &Path,
     ) -> Result<Self, IndexError> {
-        into_single(compact_core::compile_lz4(
+        into_single(shared_core::compile_lz4(
             origin_path,
             target_path,
             replacement_path,
