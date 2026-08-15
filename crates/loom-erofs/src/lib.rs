@@ -10,6 +10,8 @@ pub use compressed::{
     CompiledPclusterSwap, CompressedError,
 };
 mod compressed;
+pub use multi_index::{compile_multi_pcluster_swap, CompiledMultiSwap, MultiIndexError};
+mod multi_index;
 use loom_map::LoomMap;
 use loom_view::{EffectiveBlockStore, ViewError};
 use std::fmt;
