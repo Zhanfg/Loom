@@ -32,8 +32,8 @@ PARTIAL_FAIL="$WORK/partial-fail.bin"
 SHADOW="$WORK/shadow.pack"
 TABLE="$WORK/loom.table"
 
-# The stock file is split into multiple one-pcluster extents by the 32 KiB
-# decompressed-extent ceiling. Replacement bytes are plain; no oracle image exists.
+# The 32 KiB decompressed-extent ceiling forces at least three extents across
+# this 96 KiB file, but the test deliberately does not assume exact HEAD positions.
 dd if=/dev/zero bs=4096 count=24 status=none | tr '\000' 'M' > "$ORIGINAL"
 printf 'LOOM-STAGE17-STOCK-MULTI-ENCODE' | dd of="$ORIGINAL" bs=1 seek=64 conv=notrunc status=none
 cp "$ORIGINAL" "$SOURCE/000payload.bin"
@@ -64,21 +64,29 @@ COMPILE_OUTPUT="$(
 )"
 
 echo "$COMPILE_OUTPUT" | grep -q 'mode=multi-encode'
-echo "$COMPILE_OUTPUT" | grep -q 'physical_pclusters=3'
 echo "$COMPILE_OUTPUT" | grep -q 'logical_lclusters=24'
 echo "$COMPILE_OUTPUT" | grep -q 'compact_2b_entries=16'
 echo "$COMPILE_OUTPUT" | grep -q 'head_lclusters=\[0,'
-echo "$COMPILE_OUTPUT" | grep -q 'shadow_blocks=3'
-[[ "$(stat -c %s "$SHADOW")" -eq 12288 ]]
 
+PCLUSTER_COUNT="$(printf '%s\n' "$COMPILE_OUTPUT" | sed -n 's/.*physical_pclusters=\([0-9][0-9]*\).*/\1/p')"
+SHADOW_BLOCKS="$(printf '%s\n' "$COMPILE_OUTPUT" | sed -n 's/.*shadow_blocks=\([0-9][0-9]*\).*/\1/p')"
+HEAD_VECTOR="$(printf '%s\n' "$COMPILE_OUTPUT" | sed -n 's/.*head_lclusters=\(\[[^]]*\]\).*/\1/p')"
 ENCODED_VECTOR="$(printf '%s\n' "$COMPILE_OUTPUT" | sed -n 's/.*encoded_bytes=\(\[[^]]*\]\).*/\1/p')"
-[[ -n "$ENCODED_VECTOR" ]]
-python3 - "$SHADOW" "$ENCODED_VECTOR" <<'PY'
+[[ -n "$PCLUSTER_COUNT" && -n "$SHADOW_BLOCKS" && -n "$HEAD_VECTOR" && -n "$ENCODED_VECTOR" ]]
+[[ "$PCLUSTER_COUNT" -ge 3 ]]
+[[ "$SHADOW_BLOCKS" -eq "$PCLUSTER_COUNT" ]]
+[[ "$(stat -c %s "$SHADOW")" -eq $((PCLUSTER_COUNT * 4096)) ]]
+
+python3 - "$SHADOW" "$HEAD_VECTOR" "$ENCODED_VECTOR" <<'PY'
 import ast
 import sys
 shadow = open(sys.argv[1], 'rb').read()
-sizes = ast.literal_eval(sys.argv[2])
-assert len(sizes) == 3
+heads = ast.literal_eval(sys.argv[2])
+sizes = ast.literal_eval(sys.argv[3])
+assert len(heads) >= 3
+assert heads[0] == 0
+assert heads == sorted(heads)
+assert len(sizes) == len(heads)
 assert len(shadow) == 4096 * len(sizes)
 for index, encoded in enumerate(sizes):
     assert 0 < encoded < 4096
@@ -108,17 +116,23 @@ sudo mount -t erofs -o ro "$ORIGIN_LOOP" "$MOUNT_DIR"
 sudo cmp "$MOUNT_DIR/000payload.bin" "$ORIGINAL"
 sudo umount "$MOUNT_DIR"
 
-# Build a payload where earlier extents remain compressible but the middle 32 KiB
-# is deterministic random data. The compiler must encode all extents first and
-# fail before any shadow/table artifact is written.
+# Corrupt the second *recovered* logical extent with deterministic random bytes.
+# Earlier extents remain compressible. Stage 17 must finish all pre-encoding before
+# opening the effective block store, so this later footprint failure leaves no artifacts.
 cp "$REPLACEMENT" "$PARTIAL_FAIL"
-python3 - "$PARTIAL_FAIL" <<'PY'
+python3 - "$PARTIAL_FAIL" "$HEAD_VECTOR" <<'PY'
+import ast
 import random
 import sys
 path = sys.argv[1]
+heads = ast.literal_eval(sys.argv[2])
+assert len(heads) >= 3
+start = heads[1] * 4096
+end = heads[2] * 4096
+assert end > start
 rng = random.Random(0x53544147453137)
 data = bytearray(open(path, 'rb').read())
-data[32768:65536] = bytes(rng.randrange(256) for _ in range(32768))
+data[start:end] = bytes(rng.randrange(256) for _ in range(end - start))
 open(path, 'wb').write(data)
 PY
 
@@ -138,9 +152,10 @@ printf '%s\n' \
   'Stage 17 compact multi-pcluster self-encode PASS' \
   '  logical bytes: 98304' \
   '  logical lclusters: 24' \
-  '  physical pclusters: 3' \
+  "  physical pclusters: $PCLUSTER_COUNT" \
+  "  HEAD lclusters: $HEAD_VECTOR" \
   "  per-extent encoded bytes: $ENCODED_VECTOR" \
-  '  physical shadow blocks: 3' \
+  "  physical shadow blocks: $SHADOW_BLOCKS" \
   '  replacement-image oracle: removed' \
   '  later-extent footprint failure is transactional: PASS' \
   "  origin sha256: $STOCK_HASH_AFTER"
