@@ -67,9 +67,18 @@ pub(crate) fn rewrite_inode_checksum(
     }
 
     let checksum = crc32c(inode_seed(fs_seed, inode_number, generation), raw_inode);
-    write_u16(raw_inode, INODE_CHECKSUM_LO_OFFSET, checksum as u16)?;
+    let checksum_bytes = checksum.to_le_bytes();
+    write_u16(
+        raw_inode,
+        INODE_CHECKSUM_LO_OFFSET,
+        u16::from_le_bytes([checksum_bytes[0], checksum_bytes[1]]),
+    )?;
     if high_checksum_fits {
-        write_u16(raw_inode, INODE_CHECKSUM_HI_OFFSET, (checksum >> 16) as u16)?;
+        write_u16(
+            raw_inode,
+            INODE_CHECKSUM_HI_OFFSET,
+            u16::from_le_bytes([checksum_bytes[2], checksum_bytes[3]]),
+        )?;
     }
     Ok(checksum)
 }
