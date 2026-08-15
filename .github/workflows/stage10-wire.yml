@@ -1,0 +1,33 @@
+name: stage10-wire
+on:
+  push:
+    branches:
+      - feat/stage10-erofs-full-pcluster-swap
+permissions:
+  contents: write
+jobs:
+  wire:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage10-erofs-full-pcluster-swap
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Wire module and CLI
+        run: |
+          sed -i '2a\mod compressed;' crates/loom-erofs/src/lib.rs
+          sed -i '3i\pub use compressed::{compile_full_pcluster_swap, CompiledPclusterSwap, CompressedError};\' crates/loom-erofs/src/lib.rs
+          sed -i '/mod stage9_command;/a\mod stage10_command;' crates/loom-cli/src/main.rs
+          sed -i '/"erofs-replace" => stage9_command::command(&mut args)?,/a\        "erofs-pcluster-swap" => stage10_command::command(\&mut args)?,' crates/loom-cli/src/main.rs
+          cargo fmt --all
+          cargo check --workspace
+      - name: Commit
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add crates/loom-erofs/src/lib.rs crates/loom-erofs/src/compressed.rs crates/loom-cli/src/main.rs crates/loom-cli/src/stage10_command.rs
+          git commit -m 'feat(erofs): wire Stage 10 full pcluster swap'
+          git push origin HEAD:feat/stage10-erofs-full-pcluster-swap
