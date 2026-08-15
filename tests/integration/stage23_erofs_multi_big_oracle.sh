@@ -24,6 +24,7 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
+trap 'rc=$?; printf "Stage 23 FAIL line=%s status=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit "$rc"' ERR
 
 mkdir -p "$ORIGIN_ROOT" "$REPLACEMENT_ROOT" "$MOUNT_DIR"
 ORIGINAL="$WORK/original.bin"
@@ -101,6 +102,7 @@ echo "$OUTPUT" | grep -q 'head_lclusters=\[0, 8, 16\]'
 echo "$OUTPUT" | grep -q 'encoded_bytes=\[12288, 12288, 12288\]'
 echo "$OUTPUT" | grep -q 'shadow_blocks=9'
 [[ "$(stat -c %s "$SHADOW")" -eq 36864 ]]
+printf '%s\n' 'Stage 23 topology assertions PASS'
 
 SHADOW_LOOP="$(sudo losetup --find --show --read-only "$SHADOW")"
 sed -i "s|LOOM_SHADOW_PLACEHOLDER|$SHADOW_LOOP|g" "$TABLE"
@@ -112,9 +114,11 @@ sudo fsck.erofs "/dev/mapper/$MAPPER" >/dev/null
 sudo dmsetup remove "$MAPPER"
 sudo losetup -d "$SHADOW_LOOP"
 SHADOW_LOOP=""
+printf '%s\n' 'Stage 23 effective oracle mount/fsck PASS'
 
 STOCK_HASH_MID="$(sha256sum "$ORIGIN_IMG" | awk '{print $1}')"
 [[ "$STOCK_HASH_BEFORE" == "$STOCK_HASH_MID" ]]
+printf '%s\n' 'Stage 23 oracle origin-immutability PASS'
 
 # The scalar big adapter remains intentionally single-extent and must fail before artifacts.
 rm -f "$WORK/scalar.shadow" "$WORK/scalar.table" "$WORK/scalar.out" "$WORK/scalar.err"
@@ -128,6 +132,7 @@ fi
 grep -q 'unexpected single-extent topology' "$WORK/scalar.err"
 [[ ! -e "$WORK/scalar.shadow" ]]
 [[ ! -e "$WORK/scalar.table" ]]
+printf '%s\n' 'Stage 23 scalar-adapter rejection PASS'
 
 # The multi oracle must compare every HEAD footprint, not only logical size/HEAD locations.
 rm -f "$WORK/mismatch.shadow" "$WORK/mismatch.table" "$WORK/mismatch.out" "$WORK/mismatch.err"
@@ -141,6 +146,7 @@ fi
 grep -Eq 'incompatible compact replacement: .*big-pcluster|big-pcluster .* differs' "$WORK/mismatch.err"
 [[ ! -e "$WORK/mismatch.shadow" ]]
 [[ ! -e "$WORK/mismatch.table" ]]
+printf '%s\n' 'Stage 23 per-extent mismatch rejection PASS'
 
 STOCK_HASH_AFTER="$(sha256sum "$ORIGIN_IMG" | awk '{print $1}')"
 [[ "$STOCK_HASH_BEFORE" == "$STOCK_HASH_AFTER" ]]
