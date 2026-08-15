@@ -105,9 +105,67 @@ DUMPED_ORIGIN="$WORK/origin-after.bin"
 debugfs -R "dump /system/etc/payload.bin $DUMPED_ORIGIN" "$STOCK" >/dev/null 2>&1
 cmp -n 12288 "$DUMPED_ORIGIN" "$ORIGINAL"
 
+# A path-level replacement must not silently alter every alias of a hard-linked inode.
+HARDLINK_IMAGE="$WORK/hardlink.ext4"
+cp --reflink=auto "$STOCK" "$HARDLINK_IMAGE"
+debugfs -w -R 'ln /system/etc/payload.bin /system/etc/payload-alias.bin' "$HARDLINK_IMAGE" >/dev/null 2>&1
+set +e
+e2fsck -fy "$HARDLINK_IMAGE" >/dev/null
+HARDLINK_FSCK_RC=$?
+set -e
+if (( HARDLINK_FSCK_RC > 1 )); then
+  echo "hard-link fixture validation failed with e2fsck rc=$HARDLINK_FSCK_RC" >&2
+  exit "$HARDLINK_FSCK_RC"
+fi
+HARDLINK_HASH_BEFORE="$(sha256sum "$HARDLINK_IMAGE" | awk '{print $1}')"
+set +e
+HARDLINK_ERROR="$(
+  "$LOOM" ext4-replace \
+    "$HARDLINK_IMAGE" \
+    /system/etc/payload.bin \
+    "$REPLACEMENT" \
+    "$WORK/hardlink-shadow.pack" \
+    ORIGIN_PLACEHOLDER \
+    SHADOW_PLACEHOLDER \
+    "$WORK/hardlink.table" 2>&1
+)"
+HARDLINK_RC=$?
+set -e
+if (( HARDLINK_RC == 0 )); then
+  echo "hard-linked target was accepted unexpectedly" >&2
+  exit 1
+fi
+echo "$HARDLINK_ERROR" | grep -q 'hard-linked'
+HARDLINK_HASH_AFTER="$(sha256sum "$HARDLINK_IMAGE" | awk '{print $1}')"
+[[ "$HARDLINK_HASH_BEFORE" == "$HARDLINK_HASH_AFTER" ]]
+
+# Same-size replacement is a Stage 1 invariant; mismatched payloads must fail before output.
+SHORT_REPLACEMENT="$WORK/short.bin"
+printf 'short' > "$SHORT_REPLACEMENT"
+set +e
+SIZE_ERROR="$(
+  "$LOOM" ext4-replace \
+    "$STOCK" \
+    /system/etc/payload.bin \
+    "$SHORT_REPLACEMENT" \
+    "$WORK/short-shadow.pack" \
+    ORIGIN_PLACEHOLDER \
+    SHADOW_PLACEHOLDER \
+    "$WORK/short.table" 2>&1
+)"
+SIZE_RC=$?
+set -e
+if (( SIZE_RC == 0 )); then
+  echo "mismatched replacement size was accepted unexpectedly" >&2
+  exit 1
+fi
+echo "$SIZE_ERROR" | grep -q 'does not match original size'
+
 printf '%s\n' \
   "Stage 1 PASS" \
   "  target: /system/etc/payload.bin" \
   "  replacement bytes: 12288" \
   "  shadow bytes: $(stat -c %s "$SHADOW")" \
+  "  hard-link rejection: PASS" \
+  "  size-mismatch rejection: PASS" \
   "  origin sha256: $STOCK_HASH_AFTER"
