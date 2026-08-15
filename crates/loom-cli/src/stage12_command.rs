@@ -11,13 +11,13 @@ use std::path::Path;
 pub(crate) fn command(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
     let first = required(
         args,
-        "--encode, --multi, --multi-encode, --big-oracle, or origin compact EROFS image",
+        "--encode, --multi, --multi-encode, --big-oracle, --big-encode, or origin compact EROFS image",
     )?;
     if first == "--multi" || first == "--multi-encode" {
         return command_multi(args, first == "--multi-encode");
     }
-    if first == "--big-oracle" {
-        return command_big_oracle(args);
+    if first == "--big-oracle" || first == "--big-encode" {
+        return command_big(args, first == "--big-encode");
     }
 
     let (encode, origin_image) = if first == "--encode" {
@@ -54,7 +54,7 @@ pub(crate) fn command(args: &mut impl Iterator<Item = String>) -> Result<(), Box
         )?
     };
     write_compiled(
-        compiled,
+        &compiled,
         if encode { "encode" } else { "oracle" },
         &shadow_output,
         &origin_device,
@@ -63,26 +63,42 @@ pub(crate) fn command(args: &mut impl Iterator<Item = String>) -> Result<(), Box
     )
 }
 
-fn command_big_oracle(
+fn command_big(
     args: &mut impl Iterator<Item = String>,
+    encode: bool,
 ) -> Result<(), Box<dyn Error>> {
     let origin_image = required(args, "origin big-pcluster compact EROFS image")?;
     let target_path = required(args, "target path")?;
-    let replacement_image = required(args, "replacement big-pcluster compact EROFS image")?;
+    let replacement = required(
+        args,
+        if encode {
+            "plain replacement payload"
+        } else {
+            "replacement big-pcluster compact EROFS image"
+        },
+    )?;
     let shadow_output = required(args, "shadow pack output")?;
     let origin_device = required(args, "origin block device")?;
     let shadow_device = required(args, "shadow block device")?;
     let table_output = required(args, "dm table output")?;
     ensure_no_extra_args(args)?;
 
-    let compiled = CompiledCompactSwap::compile_big_pcluster_oracle(
-        Path::new(&origin_image),
-        &target_path,
-        Path::new(&replacement_image),
-    )?;
+    let compiled = if encode {
+        CompiledCompactSwap::compile_big_pcluster_lz4(
+            Path::new(&origin_image),
+            &target_path,
+            Path::new(&replacement),
+        )?
+    } else {
+        CompiledCompactSwap::compile_big_pcluster_oracle(
+            Path::new(&origin_image),
+            &target_path,
+            Path::new(&replacement),
+        )?
+    };
     write_compiled(
-        compiled,
-        "big-oracle",
+        &compiled,
+        if encode { "big-encode" } else { "big-oracle" },
         &shadow_output,
         &origin_device,
         &shadow_device,
@@ -91,7 +107,7 @@ fn command_big_oracle(
 }
 
 fn write_compiled(
-    compiled: CompiledCompactSwap,
+    compiled: &CompiledCompactSwap,
     mode: &str,
     shadow_output: &str,
     origin_device: &str,

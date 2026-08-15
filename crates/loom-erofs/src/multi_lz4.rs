@@ -26,7 +26,7 @@ pub(crate) fn encode(input: &[u8]) -> Result<Vec<u8>, CodecError> {
         table[hash] = cursor;
         let valid = candidate != usize::MAX
             && cursor > candidate
-            && cursor - candidate <= usize::from(u16::MAX)
+            && u16::try_from(cursor - candidate).is_ok()
             && input[candidate..candidate + MIN_MATCH] == input[cursor..cursor + MIN_MATCH];
         if !valid {
             cursor += 1;
@@ -39,14 +39,7 @@ pub(crate) fn encode(input: &[u8]) -> Result<Vec<u8>, CodecError> {
         {
             match_len += 1;
         }
-        emit_sequence(
-            &mut output,
-            input,
-            anchor,
-            cursor,
-            candidate,
-            match_len,
-        )?;
+        emit_sequence(&mut output, input, anchor, cursor, candidate, match_len)?;
 
         let next = cursor.checked_add(match_len).ok_or(CodecError::Overflow)?;
         let mut update = cursor + 1;
@@ -112,7 +105,10 @@ pub(crate) fn decode(encoded: &[u8], expected: usize) -> Result<Vec<u8>, CodecEr
             return Err(CodecError::InvalidBlock);
         }
         for _ in 0..match_len {
-            let source = output.len().checked_sub(offset).ok_or(CodecError::InvalidBlock)?;
+            let source = output
+                .len()
+                .checked_sub(offset)
+                .ok_or(CodecError::InvalidBlock)?;
             let byte = *output.get(source).ok_or(CodecError::InvalidBlock)?;
             output.push(byte);
         }
@@ -150,8 +146,12 @@ fn emit_sequence(
     match_ref: usize,
     match_len: usize,
 ) -> Result<(), CodecError> {
-    let literal_len = match_start.checked_sub(anchor).ok_or(CodecError::Overflow)?;
-    let match_code = match_len.checked_sub(MIN_MATCH).ok_or(CodecError::Overflow)?;
+    let literal_len = match_start
+        .checked_sub(anchor)
+        .ok_or(CodecError::Overflow)?;
+    let match_code = match_len
+        .checked_sub(MIN_MATCH)
+        .ok_or(CodecError::Overflow)?;
     let token = u8::try_from((literal_len.min(15) << 4) | match_code.min(15))
         .map_err(|_| CodecError::Overflow)?;
     output.push(token);
@@ -164,7 +164,9 @@ fn emit_sequence(
             .ok_or(CodecError::InvalidBlock)?,
     );
 
-    let offset = match_start.checked_sub(match_ref).ok_or(CodecError::Overflow)?;
+    let offset = match_start
+        .checked_sub(match_ref)
+        .ok_or(CodecError::Overflow)?;
     let offset = u16::try_from(offset).map_err(|_| CodecError::InvalidBlock)?;
     if offset == 0 {
         return Err(CodecError::InvalidBlock);
@@ -236,7 +238,7 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            *byte = state as u8;
+            *byte = state.to_le_bytes()[0];
         }
         let encoded = encode(&input).unwrap();
         assert!(encoded.len() > 4096);

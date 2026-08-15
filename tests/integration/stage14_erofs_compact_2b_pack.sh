@@ -120,6 +120,8 @@ sudo umount "$MOUNT_DIR"
 
 # Current Stage 14 contract is deliberately one physical pcluster. A file split
 # into multiple compressed extents must fail before any shadow/table output.
+# The unified compact core can reject this either at topology compatibility
+# (different pcluster count) or at the scalar single-mode adapter.
 rm -f "$WORK/multi.shadow" "$WORK/multi.table" "$WORK/multi.err"
 if "$LOOM" erofs-compact-pcluster-swap \
   "$MULTI_IMG" /000payload.bin "$REPL_IMG" \
@@ -128,7 +130,7 @@ if "$LOOM" erofs-compact-pcluster-swap \
   echo 'Stage 14 expected multi-pcluster rejection' >&2
   exit 1
 fi
-grep -q 'requires exactly one encoded physical block' "$WORK/multi.err"
+grep -Eq 'physical pcluster counts differ|single compact mode requires exactly one encoded physical block' "$WORK/multi.err"
 [[ ! -e "$WORK/multi.shadow" ]]
 [[ ! -e "$WORK/multi.table" ]]
 

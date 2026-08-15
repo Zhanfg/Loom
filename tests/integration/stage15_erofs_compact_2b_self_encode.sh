@@ -122,7 +122,7 @@ if "$LOOM" erofs-compact-pcluster-swap --encode \
   echo 'Stage 15 expected 96KiB footprint rejection' >&2
   exit 1
 fi
-grep -q 'does not fit existing compact pcluster' "$WORK/random.err"
+grep -Eq 'does not fit existing (compact )?pcluster' "$WORK/random.err"
 [[ ! -e "$WORK/random.shadow" ]]
 [[ ! -e "$WORK/random.table" ]]
 

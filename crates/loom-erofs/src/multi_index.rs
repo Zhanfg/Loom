@@ -63,14 +63,20 @@ impl CompiledMultiSwap {
 }
 
 fn from_core(compiled: CompiledCore) -> Result<CompiledMultiSwap, MultiIndexError> {
-    let origin_pcluster = *compiled
-        .origin_pclusters
-        .first()
-        .ok_or(CoreError::InvalidFilesystem("compressed topology has no HEAD"))?;
-    let replacement_pcluster = *compiled
-        .replacement_pclusters
-        .first()
-        .ok_or(CoreError::InvalidFilesystem("replacement topology has no HEAD"))?;
+    let origin_pcluster =
+        *compiled
+            .origin_pclusters
+            .first()
+            .ok_or(CoreError::InvalidFilesystem(
+                "compressed topology has no HEAD",
+            ))?;
+    let replacement_pcluster =
+        *compiled
+            .replacement_pclusters
+            .first()
+            .ok_or(CoreError::InvalidFilesystem(
+                "replacement topology has no HEAD",
+            ))?;
     let physical_pclusters = compiled.origin_pclusters.len();
     if physical_pclusters != compiled.replacement_pclusters.len()
         || physical_pclusters != compiled.head_lclusters.len()

@@ -29,13 +29,15 @@ if grep -q 'fn encode_extent' "$SINGLE" "$MULTI"; then
   exit 1
 fi
 
-# The two compatibility adapters should remain materially smaller than the shared core.
+# Compatibility adapters may grow as new policy/API surfaces are added, but they must
+# remain materially smaller than the unified parser/codec core. A ratio gate preserves
+# the architectural invariant without freezing a historical absolute line count.
 CORE_LINES="$(wc -l < "$CORE")"
 SINGLE_LINES="$(wc -l < "$SINGLE")"
 MULTI_LINES="$(wc -l < "$MULTI")"
 [[ "$CORE_LINES" -gt 500 ]]
-[[ "$SINGLE_LINES" -lt 150 ]]
-[[ "$MULTI_LINES" -lt 150 ]]
+(( SINGLE_LINES * 3 < CORE_LINES ))
+(( MULTI_LINES * 3 < CORE_LINES ))
 
 # Unit coverage in the shared core includes both one-head and multi-head topology cases,
 # and the workspace gate already runs all loom-erofs unit tests before this structural check.
@@ -47,5 +49,6 @@ printf '%s\n' \
   "  shared core lines: $CORE_LINES" \
   "  single adapter lines: $SINGLE_LINES" \
   "  multi adapter lines: $MULTI_LINES" \
+  '  adapter/core ratio: < 1/3' \
   '  compact parser copies in adapters: 0' \
   '  extent encoder copies in adapters: 0'

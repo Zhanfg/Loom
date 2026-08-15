@@ -12,6 +12,7 @@ pub use compressed::{
 mod compressed;
 pub use multi_index::{compile_multi_pcluster_swap, CompiledMultiSwap, MultiIndexError};
 mod multi_index;
+mod multi_lz4;
 use loom_map::LoomMap;
 use loom_view::{EffectiveBlockStore, ViewError};
 use std::fmt;
@@ -528,6 +529,9 @@ mod tests {
         block[0..8].copy_from_slice(&7_u64.to_le_bytes());
         block[8..10].copy_from_slice(&12_u16.to_le_bytes());
         block[12..19].copy_from_slice(b"payload");
-        assert_eq!(find_in_directory_block(&block, b"payload").unwrap(), Some(7));
+        assert_eq!(
+            find_in_directory_block(&block, b"payload").unwrap(),
+            Some(7)
+        );
     }
 }

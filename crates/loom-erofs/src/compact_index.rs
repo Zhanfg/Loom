@@ -66,10 +66,6 @@ impl CompiledSwap {
 
     /// Compiles the Stage 19 two-block compact big-pcluster oracle path.
     ///
-    /// This preserves the existing scalar compact result shape while allowing the shadow to
-    /// contain two physical blocks. `encoded_bytes` reports the complete 8 KiB physical
-    /// footprint; Stage 20 will add Loom-owned encoding into that footprint.
-    ///
     /// # Errors
     /// Returns [`IndexError`] for malformed/unsupported big-pcluster metadata, CBLKCNT
     /// mismatch, incompatible replacement topology, I/O, or effective-view failures.
@@ -84,24 +80,23 @@ impl CompiledSwap {
             replacement_image_path,
         )
         .map_err(map_big_error)?;
-        let block_size = usize::try_from(compiled.block_size)
-            .map_err(|_| CoreError::ArithmeticOverflow)?;
-        let encoded_bytes = compiled
-            .physical_blocks
-            .checked_mul(block_size)
-            .ok_or(CoreError::ArithmeticOverflow)?;
-        Ok(Self {
-            map: compiled.map,
-            shadow: compiled.shadow,
-            block_size: compiled.block_size,
-            origin_nid: compiled.origin_nid,
-            origin_pcluster: compiled.origin_pcluster,
-            replacement_pcluster: compiled.replacement_pcluster,
-            encoded_bytes,
-            logical_lclusters: compiled.logical_lclusters,
-            compact_2b_entries: compiled.compact_2b_entries,
-            shadow_blocks: compiled.shadow_blocks,
-        })
+        Ok(from_big(compiled))
+    }
+
+    /// Self-encodes a plain payload into the existing Stage 20 two-block big-pcluster span.
+    ///
+    /// # Errors
+    /// Returns [`IndexError`] for malformed/unsupported CBLKCNT topology, replacement-size
+    /// mismatch, LZ4 footprint/validation failure, I/O, or effective-view failures.
+    pub fn compile_big_pcluster_lz4(
+        origin_path: &Path,
+        target_path: &str,
+        replacement_path: &Path,
+    ) -> Result<Self, IndexError> {
+        let compiled =
+            big_pcluster::compile_big_pcluster_lz4(origin_path, target_path, replacement_path)
+                .map_err(map_big_error)?;
+        Ok(from_big(compiled))
     }
 }
 
@@ -134,6 +129,21 @@ fn into_single(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
     })
 }
 
+fn from_big(compiled: big_pcluster::CompiledBigPclusterSwap) -> CompiledSwap {
+    CompiledSwap {
+        map: compiled.map,
+        shadow: compiled.shadow,
+        block_size: compiled.block_size,
+        origin_nid: compiled.origin_nid,
+        origin_pcluster: compiled.origin_pcluster,
+        replacement_pcluster: compiled.replacement_pcluster,
+        encoded_bytes: compiled.encoded_bytes,
+        logical_lclusters: compiled.logical_lclusters,
+        compact_2b_entries: compiled.compact_2b_entries,
+        shadow_blocks: compiled.shadow_blocks,
+    }
+}
+
 fn map_big_error(error: big_pcluster::BigPclusterError) -> CoreError {
     use big_pcluster::BigPclusterError as Big;
     match error {
@@ -144,6 +154,15 @@ fn map_big_error(error: big_pcluster::BigPclusterError) -> CoreError {
         Big::UnsupportedFilesystem(reason) => CoreError::UnsupportedFilesystem(reason),
         Big::UnsupportedInode(reason) => CoreError::UnsupportedInode(reason),
         Big::IncompatibleReplacement(reason) => CoreError::IncompatibleReplacement(reason),
+        Big::ReplacementSizeMismatch { expected, actual } => {
+            CoreError::ReplacementSizeMismatch { expected, actual }
+        }
+        Big::CompressionDoesNotFit { encoded, capacity } => CoreError::CompressionDoesNotFit {
+            head_lcn: 0,
+            encoded,
+            capacity,
+        },
+        Big::CompressionValidationFailed => CoreError::CompressionValidationFailed,
         Big::InvalidPath(reason) => CoreError::InvalidPath(reason),
         Big::PathNotFound(name) => CoreError::PathNotFound(name),
         Big::NotDirectory(nid) => CoreError::NotDirectory(nid),
