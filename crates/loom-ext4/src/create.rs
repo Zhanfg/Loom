@@ -73,7 +73,6 @@ const INODE_EXTRA_ISIZE: usize = 0x80;
 
 const EXTENT_MAGIC: u16 = 0xf30a;
 const EXTENT_HEADER_SIZE: usize = 12;
-const EXTENT_ENTRY_SIZE: usize = 12;
 const EXTENT_INLINE_MAX: u16 = 4;
 
 const DIRENT_HEADER: usize = 8;
@@ -111,7 +110,6 @@ struct GroupState {
     descriptor: Vec<u8>,
     block_bitmap_block: u64,
     inode_bitmap_block: u64,
-    inode_table_block: u64,
     block_bitmap: Vec<u8>,
     inode_bitmap: Vec<u8>,
     free_blocks: u32,
@@ -164,8 +162,10 @@ impl Ext4Image {
         }
 
         let (parent_path, name) = split_parent(target_path)?;
-        if self.resolve_path(target_path).is_ok() {
-            return Err(Ext4Error::InvalidPath("target path already exists"));
+        match self.resolve_path(target_path) {
+            Ok(_) => return Err(Ext4Error::InvalidPath("target path already exists")),
+            Err(Ext4Error::PathNotFound(_)) => {}
+            Err(error) => return Err(error),
         }
         let parent_inode_number = if parent_path == "/" {
             ROOT_INODE
@@ -205,7 +205,6 @@ impl Ext4Image {
         append_shadow_block(
             &mut shadow,
             &mut replacements,
-            inode_table_block,
             sectors_per_block,
             &inode_table_shadow,
         )?;
@@ -580,6 +579,7 @@ fn split_parent(path: &str) -> Result<(String, String), Ext4Error> {
     let components = parse_absolute_path(path)?;
     let name = components
         .last()
+        .copied()
         .ok_or(Ext4Error::InvalidPath("missing filename"))?
         .to_string();
     let parent = if components.len() == 1 {
@@ -859,7 +859,8 @@ fn verify_dirblock_checksum(block: &[u8], seed: u32) -> Result<(), Ext4Error> {
     }
     let tail = block.len() - DIRENT_TAIL_SIZE;
     if read_u32(block, tail)? != 0
-        || read_u16(block, tail + DIRENT_TAIL_REC_LEN)? != DIRENT_TAIL_SIZE as u16
+        || read_u16(block, tail + DIRENT_TAIL_REC_LEN)?
+            != u16::try_from(DIRENT_TAIL_SIZE).map_err(|_| Ext4Error::ArithmeticOverflow)?
         || block[tail + DIRENT_TAIL_RESERVED2] != 0
         || block[tail + DIRENT_TAIL_FILETYPE] != EXT4_FT_DIR_CSUM
     {
