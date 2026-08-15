@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 loom-map = { path = "../loom-map" }
 loom-types = { path = "../loom-types" }
+loom-view = { path = "../loom-view" }
 
 [lints]
 workspace = true
