@@ -66,3 +66,6 @@ jobs:
 
       - name: Stage 2 block-size matrix
         run: bash tests/integration/stage2_ext4_block_sizes.sh
+
+      - name: Stage 3 one-block allocator
+        run: bash tests/integration/stage3_ext4_one_block_growth.sh

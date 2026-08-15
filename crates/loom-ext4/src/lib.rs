@@ -1,8 +1,10 @@
 #![forbid(unsafe_code)]
 
+mod allocator;
 mod checksum;
 mod resize;
 
+pub use allocator::{compile_one_block_growth, CompiledGrowth};
 pub use resize::{compile_resize_within_allocation, CompiledResize};
 
 use loom_map::{LoomMap, ReplacementExtent};
