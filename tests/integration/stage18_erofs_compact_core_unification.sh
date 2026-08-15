@@ -15,7 +15,8 @@ grep -q 'fn read_compact_entry' "$CORE"
 grep -q 'fn reconstruct_head_pcluster' "$CORE"
 grep -q 'fn validate_nonheads' "$CORE"
 grep -q 'fn encode_extent' "$CORE"
-grep -q 'shared_core::compile_oracle' "$MULTI"
+grep -q 'pub(crate) fn compile_multi_oracle' "$CORE"
+grep -q 'shared_core::compile_multi_oracle' "$MULTI"
 grep -q 'shared_core::compile_lz4' "$MULTI"
 grep -q 'shared_core::compile_oracle' "$SINGLE"
 grep -q 'shared_core::compile_lz4' "$SINGLE"
@@ -26,6 +27,10 @@ if grep -q 'fn read_compact_entry' "$SINGLE" "$MULTI"; then
 fi
 if grep -q 'fn encode_extent' "$SINGLE" "$MULTI"; then
   echo 'Stage 18 regression: LZ4 extent encoding leaked back into an API adapter' >&2
+  exit 1
+fi
+if grep -Eq 'shared_core::compile_(oracle|big_oracle)' "$MULTI"; then
+  echo 'Stage 18 regression: multi adapter bypassed the unified compact topology dispatch' >&2
   exit 1
 fi
 
@@ -49,6 +54,7 @@ printf '%s\n' \
   "  shared core lines: $CORE_LINES" \
   "  single adapter lines: $SINGLE_LINES" \
   "  multi adapter lines: $MULTI_LINES" \
+  '  multi topology dispatch owner: compact_core' \
   '  adapter/core ratio: < 1/3' \
   '  compact parser copies in adapters: 0' \
   '  extent encoder copies in adapters: 0'
