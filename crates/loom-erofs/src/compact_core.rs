@@ -494,9 +494,7 @@ fn compile_big_spans(
                 .ok_or(CoreError::ArithmeticOverflow)?;
             let logical_block = origin_extent
                 .pcluster
-                .checked_add(
-                    u64::try_from(block_index).map_err(|_| CoreError::ArithmeticOverflow)?,
-                )
+                .checked_add(u64::try_from(block_index).map_err(|_| CoreError::ArithmeticOverflow)?)
                 .ok_or(CoreError::ArithmeticOverflow)?;
             view.block_mut(logical_block)
                 .map_err(CoreError::View)?
@@ -1170,8 +1168,7 @@ fn reconstruct_big_head_pcluster(
                     "big-pcluster compact pack contains plain delta0 <= 1",
                 ));
             }
-            slot -= isize::try_from(previous.low - 2)
-                .map_err(|_| CoreError::ArithmeticOverflow)?;
+            slot -= isize::try_from(previous.low - 2).map_err(|_| CoreError::ArithmeticOverflow)?;
             continue;
         }
         if previous.kind != LCLUSTER_HEAD1 {
@@ -1286,8 +1283,8 @@ fn validate_big_block_spans(extents: &[BigExtent], image_bytes: u64) -> Result<(
     let block_count = image_bytes / u64::from(BLOCK_SIZE);
     let mut previous_end = None;
     for extent in extents {
-        let count = u64::try_from(extent.physical_blocks)
-            .map_err(|_| CoreError::ArithmeticOverflow)?;
+        let count =
+            u64::try_from(extent.physical_blocks).map_err(|_| CoreError::ArithmeticOverflow)?;
         let end = extent
             .pcluster
             .checked_add(count)
