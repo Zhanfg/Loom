@@ -8,7 +8,6 @@ rust-version.workspace = true
 [dependencies]
 loom-map = { path = "../loom-map" }
 loom-view = { path = "../loom-view" }
-lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 
 [lints]
 workspace = true
