@@ -1,0 +1,25 @@
+name: diag-stage12
+
+on:
+  push:
+    branches:
+      - feat/stage20-erofs-big-pcluster-self-encode
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install filesystem dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y erofs-utils dmsetup util-linux
+          sudo modprobe loop || true
+          sudo modprobe dm_mod || true
+          sudo modprobe erofs || true
+      - name: Trace Stage 12
+        run: bash -x tests/integration/stage12_erofs_compact_pcluster.sh
