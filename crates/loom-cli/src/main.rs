@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod stage7_command;
+mod stage9_command;
 
 use loom_ext4::{
     compile_create_file, compile_grow_with_block_allocation, compile_remove_file,
@@ -38,6 +39,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "ext4-remove" => command_ext4_remove(&mut args)?,
         "ext4-selinux" => command_ext4_selinux(&mut args)?,
         "ext4-create-selinux" => stage7_command::command(&mut args)?,
+        "erofs-replace" => stage9_command::command(&mut args)?,
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command {other:?}").into()),
     }

@@ -154,8 +154,8 @@ impl ErofsImage {
             ));
         }
         let extended = format & 1 != 0;
-        let layout = u8::try_from((format >> 1) & 0x7)
-            .map_err(|_| ErofsError::ArithmeticOverflow)?;
+        let layout =
+            u8::try_from((format >> 1) & 0x7).map_err(|_| ErofsError::ArithmeticOverflow)?;
         if layout > 4 {
             return Err(ErofsError::UnsupportedInodeFeature(
                 "reserved EROFS inode data layout",
@@ -241,10 +241,8 @@ impl ErofsImage {
             .checked_mul(block_size)
             .ok_or(ErofsError::ArithmeticOverflow)?;
         ensure_range(self.image_bytes, offset, block_size)?;
-        let mut bytes = vec![
-            0_u8;
-            usize::try_from(block_size).map_err(|_| ErofsError::ArithmeticOverflow)?
-        ];
+        let mut bytes =
+            vec![0_u8; usize::try_from(block_size).map_err(|_| ErofsError::ArithmeticOverflow)?];
         read_exact_at(&mut self.file, offset, &mut bytes)?;
         Ok(bytes)
     }
@@ -338,7 +336,11 @@ fn find_in_directory_block(block: &[u8], target: &[u8]) -> Result<Option<u64>, E
                 .get(name_offset..)
                 .ok_or(ErofsError::CorruptDirectory)?;
             name_offset
-                .checked_add(tail.iter().position(|byte| *byte == 0).unwrap_or(tail.len()))
+                .checked_add(
+                    tail.iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(tail.len()),
+                )
                 .ok_or(ErofsError::ArithmeticOverflow)?
         };
         let entry_name = block
@@ -398,7 +400,9 @@ fn read_exact_at(file: &mut File, offset: u64, buffer: &mut [u8]) -> Result<(), 
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ErofsError> {
-    let end = offset.checked_add(2).ok_or(ErofsError::ArithmeticOverflow)?;
+    let end = offset
+        .checked_add(2)
+        .ok_or(ErofsError::ArithmeticOverflow)?;
     let raw: [u8; 2] = bytes
         .get(offset..end)
         .ok_or(ErofsError::UnexpectedEndOfStructure)?
@@ -408,7 +412,9 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ErofsError> {
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ErofsError> {
-    let end = offset.checked_add(4).ok_or(ErofsError::ArithmeticOverflow)?;
+    let end = offset
+        .checked_add(4)
+        .ok_or(ErofsError::ArithmeticOverflow)?;
     let raw: [u8; 4] = bytes
         .get(offset..end)
         .ok_or(ErofsError::UnexpectedEndOfStructure)?
@@ -418,7 +424,9 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ErofsError> {
 }
 
 fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ErofsError> {
-    let end = offset.checked_add(8).ok_or(ErofsError::ArithmeticOverflow)?;
+    let end = offset
+        .checked_add(8)
+        .ok_or(ErofsError::ArithmeticOverflow)?;
     let raw: [u8; 8] = bytes
         .get(offset..end)
         .ok_or(ErofsError::UnexpectedEndOfStructure)?
