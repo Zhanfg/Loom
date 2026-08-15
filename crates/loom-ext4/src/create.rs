@@ -317,7 +317,7 @@ impl Ext4Image {
         metadata: &FsMetadata,
     ) -> Result<GroupState, Ext4Error> {
         let descriptor_size = usize::from(self.superblock.descriptor_size);
-        let descriptor_start_block = if self.superblock.block_size == 1024 {
+        let descriptor_start_block: u64 = if self.superblock.block_size == 1024 {
             2
         } else {
             1
