@@ -16,56 +16,29 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: feat/stage4-ext4-create-file
-      - name: Move descriptor accounting before ownership transfer
+      - name: Apply ownership fix
         run: |
           python3 - <<'PY'
+          import re
           from pathlib import Path
           p = Path('crates/loom-ext4/src/create.rs')
           s = p.read_text()
-          old = '''        Ok(GroupState {
-            group,
-            descriptor_block,
-            descriptor_offset,
-            descriptor_block_bytes,
-            descriptor,
-            block_bitmap_block,
-            inode_bitmap_block,
-            inode_table_block,
-            block_bitmap,
-            inode_bitmap,
-            free_blocks: descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?,
-            free_inodes: descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?,
-            itable_unused: descriptor_u32_count(
-                &descriptor,
-                GD_ITABLE_UNUSED_LO,
-                GD_ITABLE_UNUSED_HI,
-            )?,
-        })'''
-          new = '''        let free_blocks =
-            descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?;
-        let free_inodes =
-            descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?;
-        let itable_unused =
-            descriptor_u32_count(&descriptor, GD_ITABLE_UNUSED_LO, GD_ITABLE_UNUSED_HI)?;
-
-        Ok(GroupState {
-            group,
-            descriptor_block,
-            descriptor_offset,
-            descriptor_block_bytes,
-            descriptor,
-            block_bitmap_block,
-            inode_bitmap_block,
-            inode_table_block,
-            block_bitmap,
-            inode_bitmap,
-            free_blocks,
-            free_inodes,
-            itable_unused,
-        })'''
-          if old not in s:
-              raise SystemExit('expected GroupState constructor not found')
-          p.write_text(s.replace(old, new, 1))
+          marker = '        Ok(GroupState {\n'
+          prefix = (
+              '        let free_blocks = descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?;\n'
+              '        let free_inodes = descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?;\n'
+              '        let itable_unused = descriptor_u32_count(&descriptor, GD_ITABLE_UNUSED_LO, GD_ITABLE_UNUSED_HI)?;\n\n'
+          )
+          if prefix not in s:
+              if marker not in s:
+                  raise SystemExit('GroupState constructor marker not found')
+              s = s.replace(marker, prefix + marker, 1)
+          s, n1 = re.subn(r'            free_blocks: descriptor_u32_count\(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI\)\?,\n', '            free_blocks,\n', s, count=1)
+          s, n2 = re.subn(r'            free_inodes: descriptor_u32_count\(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI\)\?,\n', '            free_inodes,\n', s, count=1)
+          s, n3 = re.subn(r'            itable_unused: descriptor_u32_count\(\n                &descriptor,\n                GD_ITABLE_UNUSED_LO,\n                GD_ITABLE_UNUSED_HI,\n            \)\?,\n', '            itable_unused,\n', s, count=1)
+          if (n1, n2, n3) != (1, 1, 1):
+              raise SystemExit(f'field rewrite mismatch: {(n1, n2, n3)}')
+          p.write_text(s)
           PY
           cargo fmt --all
       - name: Commit fix
