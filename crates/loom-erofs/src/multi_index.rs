@@ -26,9 +26,9 @@ pub struct CompiledMultiSwap {
     pub shadow_blocks: usize,
 }
 
-/// Compiles a compact EROFS oracle replacement over any supported one-block-per-extent
-/// topology. The unified compact core handles both the historical single-pcluster shape and
-/// the Stage 16+ multi-pcluster shape.
+/// Compiles a compact EROFS oracle replacement over any supported topology. The unified
+/// compact core dispatches ordinary one-block-per-extent layouts and big-pcluster layouts,
+/// including Stage 23 multi-extent big pclusters.
 ///
 /// # Errors
 /// Returns [`MultiIndexError`] for malformed/unsupported topology, incompatible replacement
@@ -38,26 +38,7 @@ pub fn compile_multi_pcluster_swap(
     target_path: &str,
     replacement_image_path: &Path,
 ) -> Result<CompiledMultiSwap, MultiIndexError> {
-    from_core(shared_core::compile_oracle(
-        origin_path,
-        target_path,
-        replacement_image_path,
-    )?)
-}
-
-/// Compiles a compact EROFS oracle replacement over a validated multi-extent big-pcluster
-/// topology. CBLKCNT parsing and HEAD physical-address reconstruction remain owned by the
-/// unified compact core.
-///
-/// # Errors
-/// Returns [`MultiIndexError`] for malformed/unsupported big-pcluster topology, incompatible
-/// replacement images, I/O failures, or effective-view failures.
-pub fn compile_multi_big_pcluster_swap(
-    origin_path: &Path,
-    target_path: &str,
-    replacement_image_path: &Path,
-) -> Result<CompiledMultiSwap, MultiIndexError> {
-    from_core(shared_core::compile_big_oracle(
+    from_core(shared_core::compile_multi_oracle(
         origin_path,
         target_path,
         replacement_image_path,
@@ -65,7 +46,8 @@ pub fn compile_multi_big_pcluster_swap(
 }
 
 impl CompiledMultiSwap {
-    /// Self-encodes all recovered logical extents through the unified compact core.
+    /// Self-encodes all recovered ordinary compact extents through the unified compact core.
+    /// Multi-extent big-pcluster self-encoding remains outside Stage 23.
     ///
     /// # Errors
     /// Returns [`MultiIndexError`] for malformed/unsupported topology, replacement-size
