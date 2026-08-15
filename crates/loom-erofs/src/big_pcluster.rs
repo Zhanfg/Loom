@@ -174,7 +174,8 @@ pub fn compile_big_pcluster_lz4(
     let mut origin = Image::open(origin_path)?;
     let origin_nid = origin.resolve_path(target_path)?;
     let extent = origin.read_big_extent(origin_nid)?;
-    let actual = u64::try_from(replacement.len()).map_err(|_| BigPclusterError::ArithmeticOverflow)?;
+    let actual =
+        u64::try_from(replacement.len()).map_err(|_| BigPclusterError::ArithmeticOverflow)?;
     if actual != extent.logical_size {
         return Err(BigPclusterError::ReplacementSizeMismatch {
             expected: extent.logical_size,
@@ -182,7 +183,8 @@ pub fn compile_big_pcluster_lz4(
         });
     }
 
-    let compressed = lz4::encode(&replacement).map_err(|_| BigPclusterError::CompressionValidationFailed)?;
+    let compressed =
+        lz4::encode(&replacement).map_err(|_| BigPclusterError::CompressionValidationFailed)?;
     let capacity = extent
         .physical_blocks
         .checked_mul(BLOCK_BYTES)
@@ -215,13 +217,7 @@ pub fn compile_big_pcluster_lz4(
         return Err(BigPclusterError::CompressionValidationFailed);
     }
 
-    compile_span(
-        origin_path,
-        extent,
-        extent.pcluster,
-        span,
-        compressed.len(),
-    )
+    compile_span(origin_path, extent, extent.pcluster, span, compressed.len())
 }
 
 fn compile_span(
@@ -241,8 +237,8 @@ fn compile_span(
         ));
     }
 
-    let mut view = EffectiveBlockStore::open(origin_path, BLOCK_SIZE)
-        .map_err(BigPclusterError::View)?;
+    let mut view =
+        EffectiveBlockStore::open(origin_path, BLOCK_SIZE).map_err(BigPclusterError::View)?;
     for block_index in 0..extent.physical_blocks {
         let start = block_index
             .checked_mul(BLOCK_BYTES)
@@ -316,8 +312,8 @@ impl Image {
             ));
         }
         let extended = format & 1 != 0;
-        let layout = u8::try_from((format >> 1) & 7)
-            .map_err(|_| BigPclusterError::ArithmeticOverflow)?;
+        let layout =
+            u8::try_from((format >> 1) & 7).map_err(|_| BigPclusterError::ArithmeticOverflow)?;
         if layout > 4 {
             return Err(BigPclusterError::UnsupportedInode(
                 "reserved EROFS inode data layout",
@@ -403,9 +399,9 @@ impl Image {
             entries.push(self.read_compact_entry(ebase, logical_lclusters, lcn)?);
         }
         validate_big_single_extent(&entries, logical_lclusters)?;
-        let head = entries
-            .first()
-            .ok_or(BigPclusterError::InvalidFilesystem("compact index stream is empty"))?;
+        let head = entries.first().ok_or(BigPclusterError::InvalidFilesystem(
+            "compact index stream is empty",
+        ))?;
         let pcluster = head.base_pblk;
         let block_count = self.bytes / u64::from(BLOCK_SIZE);
         if pcluster
@@ -571,9 +567,9 @@ fn validate_big_single_extent(
     entries: &[CompactEntry],
     total: usize,
 ) -> Result<(), BigPclusterError> {
-    let head = entries
-        .first()
-        .ok_or(BigPclusterError::InvalidFilesystem("compact index stream is empty"))?;
+    let head = entries.first().ok_or(BigPclusterError::InvalidFilesystem(
+        "compact index stream is empty",
+    ))?;
     if head.kind != LCLUSTER_HEAD1 || head.low != 0 || head.slot != 0 {
         return Err(BigPclusterError::InvalidFilesystem(
             "big-pcluster extent must begin with slot-0 zero-offset HEAD1",
@@ -756,10 +752,7 @@ fn xattr_ibody_size(count: u16) -> Result<u64, BigPclusterError> {
         .ok_or(BigPclusterError::ArithmeticOverflow)
 }
 
-fn find_in_directory_block(
-    block: &[u8],
-    target: &[u8],
-) -> Result<Option<u64>, BigPclusterError> {
+fn find_in_directory_block(block: &[u8], target: &[u8]) -> Result<Option<u64>, BigPclusterError> {
     if block.len() < DIRENT_SIZE {
         return Err(BigPclusterError::CorruptDirectory);
     }
@@ -786,7 +779,11 @@ fn find_in_directory_block(
                 .get(name_offset..)
                 .ok_or(BigPclusterError::CorruptDirectory)?;
             name_offset
-                .checked_add(tail.iter().position(|byte| *byte == 0).unwrap_or(tail.len()))
+                .checked_add(
+                    tail.iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(tail.len()),
+                )
                 .ok_or(BigPclusterError::ArithmeticOverflow)?
         };
         if name_end < name_offset || name_end > block.len() {
@@ -846,11 +843,7 @@ fn ensure_range(bytes: u64, offset: u64, length: u64) -> Result<(), BigPclusterE
     Ok(())
 }
 
-fn read_exact_at(
-    file: &mut File,
-    offset: u64,
-    buffer: &mut [u8],
-) -> Result<(), BigPclusterError> {
+fn read_exact_at(file: &mut File, offset: u64, buffer: &mut [u8]) -> Result<(), BigPclusterError> {
     file.seek(SeekFrom::Start(offset))
         .map_err(BigPclusterError::Io)?;
     file.read_exact(buffer).map_err(BigPclusterError::Io)
@@ -901,14 +894,8 @@ pub enum BigPclusterError {
     UnsupportedFilesystem(&'static str),
     UnsupportedInode(&'static str),
     IncompatibleReplacement(&'static str),
-    ReplacementSizeMismatch {
-        expected: u64,
-        actual: u64,
-    },
-    CompressionDoesNotFit {
-        encoded: usize,
-        capacity: usize,
-    },
+    ReplacementSizeMismatch { expected: u64, actual: u64 },
+    CompressionDoesNotFit { encoded: usize, capacity: usize },
     CompressionValidationFailed,
     InvalidPath(&'static str),
     PathNotFound(String),

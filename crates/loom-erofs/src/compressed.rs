@@ -216,8 +216,8 @@ pub fn compile_lz4_replacement(
     }
 
     let compressed = encode_lz4_block(&replacement)?;
-    let capacity = usize::try_from(origin.sb.block_size)
-        .map_err(|_| CompressedError::ArithmeticOverflow)?;
+    let capacity =
+        usize::try_from(origin.sb.block_size).map_err(|_| CompressedError::ArithmeticOverflow)?;
     if compressed.len() > capacity {
         return Err(CompressedError::CompressionDoesNotFit {
             encoded: compressed.len(),
@@ -537,8 +537,7 @@ fn encode_lz4_block(input: &[u8]) -> Result<Vec<u8>, CompressedError> {
         let valid = candidate != usize::MAX
             && cursor > candidate
             && cursor - candidate <= usize::from(u16::MAX)
-            && input[candidate..candidate + LZ4_MIN_MATCH]
-                == input[cursor..cursor + LZ4_MIN_MATCH];
+            && input[candidate..candidate + LZ4_MIN_MATCH] == input[cursor..cursor + LZ4_MIN_MATCH];
         if !valid {
             cursor += 1;
             continue;
@@ -550,14 +549,7 @@ fn encode_lz4_block(input: &[u8]) -> Result<Vec<u8>, CompressedError> {
         {
             match_len += 1;
         }
-        emit_lz4_sequence(
-            &mut output,
-            input,
-            anchor,
-            cursor,
-            candidate,
-            match_len,
-        )?;
+        emit_lz4_sequence(&mut output, input, anchor, cursor, candidate, match_len)?;
 
         let next = cursor
             .checked_add(match_len)
@@ -634,9 +626,7 @@ fn emit_lz4_sequence(
 
 fn emit_lz4_last_literals(output: &mut Vec<u8>, literals: &[u8]) -> Result<(), CompressedError> {
     let nibble = literals.len().min(15);
-    output.push(
-        u8::try_from(nibble << 4).map_err(|_| CompressedError::ArithmeticOverflow)?,
-    );
+    output.push(u8::try_from(nibble << 4).map_err(|_| CompressedError::ArithmeticOverflow)?);
     if literals.len() >= 15 {
         emit_lz4_length(output, literals.len() - 15)?;
     }

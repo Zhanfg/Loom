@@ -93,12 +93,9 @@ impl CompiledSwap {
         target_path: &str,
         replacement_path: &Path,
     ) -> Result<Self, IndexError> {
-        let compiled = big_pcluster::compile_big_pcluster_lz4(
-            origin_path,
-            target_path,
-            replacement_path,
-        )
-        .map_err(map_big_error)?;
+        let compiled =
+            big_pcluster::compile_big_pcluster_lz4(origin_path, target_path, replacement_path)
+                .map_err(map_big_error)?;
         Ok(from_big(compiled))
     }
 }

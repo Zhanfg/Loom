@@ -282,7 +282,10 @@ fn compile_blocks(
     })
 }
 
-fn validate_compatible_topology(origin: &Topology, replacement: &Topology) -> Result<(), CoreError> {
+fn validate_compatible_topology(
+    origin: &Topology,
+    replacement: &Topology,
+) -> Result<(), CoreError> {
     if origin.logical_size != replacement.logical_size {
         return Err(CoreError::IncompatibleReplacement(
             "logical file sizes differ",
@@ -429,8 +432,8 @@ impl Image {
     fn read_topology(&mut self, nid: u64) -> Result<Topology, CoreError> {
         let inode = self.read_inode(nid)?;
         let logical_lclusters = validate_target_inode(&inode)?;
-        let compressed_blocks = usize::try_from(inode.data_word)
-            .map_err(|_| CoreError::ArithmeticOverflow)?;
+        let compressed_blocks =
+            usize::try_from(inode.data_word).map_err(|_| CoreError::ArithmeticOverflow)?;
         if compressed_blocks == 0 {
             return Err(CoreError::InvalidFilesystem(
                 "compact inode reports zero encoded physical blocks",
@@ -490,7 +493,11 @@ impl Image {
         })
     }
 
-    fn read_all_entries(&mut self, ebase: u64, total: usize) -> Result<Vec<CompactEntry>, CoreError> {
+    fn read_all_entries(
+        &mut self,
+        ebase: u64,
+        total: usize,
+    ) -> Result<Vec<CompactEntry>, CoreError> {
         let mut entries = Vec::with_capacity(total);
         for lcn in 0..total {
             entries.push(self.read_compact_entry(ebase, total, lcn)?);
@@ -596,13 +603,15 @@ impl Image {
         let pack_bytes = entry_bytes
             .checked_mul(slots)
             .ok_or(CoreError::ArithmeticOverflow)?;
-        let pack_bytes_u64 = u64::try_from(pack_bytes).map_err(|_| CoreError::ArithmeticOverflow)?;
+        let pack_bytes_u64 =
+            u64::try_from(pack_bytes).map_err(|_| CoreError::ArithmeticOverflow)?;
         let pack_start = pos - (pos % pack_bytes_u64);
         ensure_range(self.bytes, pack_start, pack_bytes_u64)?;
         let mut pack = vec![0_u8; pack_bytes];
         read_exact_at(&mut self.file, pack_start, &mut pack)?;
 
-        let entry_bytes_u64 = u64::try_from(entry_bytes).map_err(|_| CoreError::ArithmeticOverflow)?;
+        let entry_bytes_u64 =
+            u64::try_from(entry_bytes).map_err(|_| CoreError::ArithmeticOverflow)?;
         let slot = usize::try_from((pos - pack_start) / entry_bytes_u64)
             .map_err(|_| CoreError::ArithmeticOverflow)?;
         if slot >= slots {
@@ -666,7 +675,11 @@ fn validate_target_inode(inode: &Inode) -> Result<usize, CoreError> {
     usize::try_from(inode.size / u64::from(BLOCK_SIZE)).map_err(|_| CoreError::ArithmeticOverflow)
 }
 
-fn validate_nonheads(entries: &[CompactEntry], heads: &[Head], total: usize) -> Result<(), CoreError> {
+fn validate_nonheads(
+    entries: &[CompactEntry],
+    heads: &[Head],
+    total: usize,
+) -> Result<(), CoreError> {
     for (head_index, head) in heads.iter().enumerate() {
         let next_head = heads.get(head_index + 1).map_or(total, |next| next.lcn);
         if next_head <= head.lcn {
@@ -675,18 +688,21 @@ fn validate_nonheads(entries: &[CompactEntry], heads: &[Head], total: usize) -> 
             ));
         }
         for lcn in head.lcn + 1..next_head {
-            let entry = entries
-                .get(lcn)
-                .ok_or(CoreError::InvalidFilesystem("missing compact NONHEAD entry"))?;
+            let entry = entries.get(lcn).ok_or(CoreError::InvalidFilesystem(
+                "missing compact NONHEAD entry",
+            ))?;
             if entry.kind != LCLUSTER_NONHEAD {
                 return Err(CoreError::InvalidFilesystem(
                     "compressed extent contains an unexpected non-NONHEAD entry",
                 ));
             }
             let expected = if entry.slot + 1 == entry.slots {
-                next_head.checked_sub(lcn).ok_or(CoreError::ArithmeticOverflow)?
+                next_head
+                    .checked_sub(lcn)
+                    .ok_or(CoreError::ArithmeticOverflow)?
             } else {
-                lcn.checked_sub(head.lcn).ok_or(CoreError::ArithmeticOverflow)?
+                lcn.checked_sub(head.lcn)
+                    .ok_or(CoreError::ArithmeticOverflow)?
             };
             if expected >= usize::from(D0_CBLKCNT) {
                 return Err(CoreError::UnsupportedInode(
@@ -755,7 +771,9 @@ fn compact_entry_position(
             .map_err(|_| CoreError::ArithmeticOverflow)?;
         return Ok((
             2,
-            ebase.checked_add(delta).ok_or(CoreError::ArithmeticOverflow)?,
+            ebase
+                .checked_add(delta)
+                .ok_or(CoreError::ArithmeticOverflow)?,
         ));
     }
 
@@ -773,11 +791,16 @@ fn compact_entry_position(
         .checked_sub(regions.initial_4b)
         .ok_or(CoreError::ArithmeticOverflow)?;
     if relative < regions.compact_2b {
-        let delta = u64::try_from(relative.checked_mul(2).ok_or(CoreError::ArithmeticOverflow)?)
-            .map_err(|_| CoreError::ArithmeticOverflow)?;
+        let delta = u64::try_from(
+            relative
+                .checked_mul(2)
+                .ok_or(CoreError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| CoreError::ArithmeticOverflow)?;
         return Ok((
             1,
-            pos.checked_add(delta).ok_or(CoreError::ArithmeticOverflow)?,
+            pos.checked_add(delta)
+                .ok_or(CoreError::ArithmeticOverflow)?,
         ));
     }
 
@@ -794,11 +817,16 @@ fn compact_entry_position(
     let trailing = relative
         .checked_sub(regions.compact_2b)
         .ok_or(CoreError::ArithmeticOverflow)?;
-    let delta = u64::try_from(trailing.checked_mul(4).ok_or(CoreError::ArithmeticOverflow)?)
-        .map_err(|_| CoreError::ArithmeticOverflow)?;
+    let delta = u64::try_from(
+        trailing
+            .checked_mul(4)
+            .ok_or(CoreError::ArithmeticOverflow)?,
+    )
+    .map_err(|_| CoreError::ArithmeticOverflow)?;
     Ok((
         2,
-        pos.checked_add(delta).ok_or(CoreError::ArithmeticOverflow)?,
+        pos.checked_add(delta)
+            .ok_or(CoreError::ArithmeticOverflow)?,
     ))
 }
 
@@ -881,7 +909,11 @@ fn find_in_directory_block(block: &[u8], target: &[u8]) -> Result<Option<u64>, C
                 .get(name_offset..)
                 .ok_or(CoreError::CorruptDirectory)?;
             name_offset
-                .checked_add(tail.iter().position(|byte| *byte == 0).unwrap_or(tail.len()))
+                .checked_add(
+                    tail.iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(tail.len()),
+                )
                 .ok_or(CoreError::ArithmeticOverflow)?
         };
         if name_end < name_offset || name_end > block.len() {
@@ -932,7 +964,9 @@ fn div_ceil(value: u64, divisor: u64) -> Result<u64, CoreError> {
 }
 
 fn ensure_range(bytes: u64, offset: u64, length: u64) -> Result<(), CoreError> {
-    let end = offset.checked_add(length).ok_or(CoreError::ArithmeticOverflow)?;
+    let end = offset
+        .checked_add(length)
+        .ok_or(CoreError::ArithmeticOverflow)?;
     if end > bytes {
         return Err(CoreError::UnexpectedEndOfImage);
     }
@@ -1071,7 +1105,10 @@ mod tests {
             advise: ADVISE_COMPACTED_2B,
             logical_lclusters: 2,
             compact_2b_entries: 0,
-            heads: vec![Head { lcn: 0, pcluster: 10 }],
+            heads: vec![Head {
+                lcn: 0,
+                pcluster: 10,
+            }],
         };
         let mut relocated = single.clone();
         relocated.heads[0].pcluster = 100;
