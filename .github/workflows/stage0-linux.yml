@@ -75,3 +75,6 @@ jobs:
 
       - name: Stage 5 remove-file weaving
         run: bash tests/integration/stage5_ext4_remove_file.sh
+
+      - name: Stage 6 SELinux xattr weaving
+        run: bash tests/integration/stage6_ext4_selinux_xattr.sh
