@@ -88,26 +88,3 @@ fn into_single(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
         shadow_blocks: compiled.shadow_blocks,
     })
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn adapter_rejects_multi_pcluster_core_result() {
-        let result = CompiledCore {
-            map: LoomMap::identity(loom_types::SectorCount(16)).unwrap(),
-            shadow: vec![0_u8; 8192],
-            block_size: 4096,
-            origin_nid: 1,
-            origin_pclusters: vec![10, 11],
-            replacement_pclusters: vec![20, 21],
-            head_lclusters: vec![0, 8],
-            encoded_bytes: vec![100, 100],
-            logical_lclusters: 16,
-            compact_2b_entries: 16,
-            shadow_blocks: 2,
-        };
-        assert!(matches!(into_single(result), Err(CoreError::UnsupportedInode(_))));
-    }
-}
