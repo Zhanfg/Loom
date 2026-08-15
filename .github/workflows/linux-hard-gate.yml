@@ -1,0 +1,43 @@
+name: linux-hard-gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - 'feat/**'
+
+permissions:
+  contents: read
+
+jobs:
+  linux-hard-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install filesystem test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
+
+      - name: Prepare host kernel facilities
+        run: |
+          sudo modprobe loop || true
+          sudo modprobe dm_mod || true
+          sudo modprobe dm_linear || true
+          sudo modprobe erofs || true
+          sudo losetup -f
+          sudo dmsetup version
+
+      - name: Run canonical Linux hard gate
+        run: bash tests/ci/linux-hard-gate.sh
