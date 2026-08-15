@@ -25,5 +25,6 @@ bash tests/integration/stage6_ext4_selinux_xattr.sh
 bash tests/integration/stage7_ext4_transaction_view.sh
 bash tests/integration/stage9_erofs_flat_plain.sh
 bash tests/integration/stage10_erofs_compressed_pcluster.sh
+bash tests/integration/stage11_erofs_lz4_encoder.sh
 
 printf '%s\n' 'Loom Linux filesystem hard gate PASS'
