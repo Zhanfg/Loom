@@ -126,20 +126,26 @@ fn into_big(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
 }
 
 fn into_scalar(compiled: CompiledCore) -> Result<CompiledSwap, IndexError> {
-    let origin_pcluster = *compiled
-        .origin_pclusters
-        .first()
-        .ok_or(CoreError::InvalidFilesystem("compact core returned no origin pcluster"))?;
-    let replacement_pcluster = *compiled
-        .replacement_pclusters
-        .first()
-        .ok_or(CoreError::InvalidFilesystem(
-            "compact core returned no replacement pcluster",
-        ))?;
+    let origin_pcluster =
+        *compiled
+            .origin_pclusters
+            .first()
+            .ok_or(CoreError::InvalidFilesystem(
+                "compact core returned no origin pcluster",
+            ))?;
+    let replacement_pcluster =
+        *compiled
+            .replacement_pclusters
+            .first()
+            .ok_or(CoreError::InvalidFilesystem(
+                "compact core returned no replacement pcluster",
+            ))?;
     let encoded_bytes = *compiled
         .encoded_bytes
         .first()
-        .ok_or(CoreError::InvalidFilesystem("compact core returned no encoded length"))?;
+        .ok_or(CoreError::InvalidFilesystem(
+            "compact core returned no encoded length",
+        ))?;
     Ok(CompiledSwap {
         map: compiled.map,
         shadow: compiled.shadow,
