@@ -18,6 +18,10 @@ pub struct LoomMap {
 }
 
 impl LoomMap {
+    /// Builds a complete virtual-device map containing one shadow replacement.
+    ///
+    /// # Errors
+    /// Returns [`MapError`] when the replacement is empty, out of bounds, or overflows.
     pub fn single_replacement(
         total_sectors: SectorCount,
         logical_start: Sector,
@@ -34,6 +38,10 @@ impl LoomMap {
         )
     }
 
+    /// Builds a complete virtual-device map from sparse shadow replacements.
+    ///
+    /// # Errors
+    /// Returns [`MapError`] for invalid, overlapping, out-of-bounds, or overflowing extents.
     pub fn from_replacements(
         total_sectors: SectorCount,
         replacements: &[ReplacementExtent],
@@ -45,7 +53,8 @@ impl LoomMap {
         let mut replacements = replacements.to_vec();
         replacements.sort_by_key(|replacement| replacement.logical_start.0);
 
-        let mut extents = Vec::with_capacity(replacements.len().saturating_mul(2).saturating_add(1));
+        let mut extents =
+            Vec::with_capacity(replacements.len().saturating_mul(2).saturating_add(1));
         let mut cursor = 0_u64;
 
         for replacement in replacements {
@@ -124,6 +133,10 @@ impl LoomMap {
         &self.extents
     }
 
+    /// Validates that the map covers the virtual device exactly once and without gaps.
+    ///
+    /// # Errors
+    /// Returns [`MapError`] if any extent is invalid or the map is not contiguous.
     pub fn validate(&self) -> Result<(), MapError> {
         if self.total_sectors.0 == 0 {
             return Err(MapError::EmptyDevice);
@@ -153,6 +166,10 @@ impl LoomMap {
         Ok(())
     }
 
+    /// Lowers this map to a Linux device-mapper linear table.
+    ///
+    /// # Errors
+    /// Returns [`MapError`] if the map is invalid or a backing-device name is unsafe.
     pub fn to_dm_linear_table(
         &self,
         origin_device: &str,

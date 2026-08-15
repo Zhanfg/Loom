@@ -5,6 +5,10 @@ use std::fs;
 use std::io;
 use std::path::Path;
 
+/// Pads one payload to exactly one shadow block.
+///
+/// # Errors
+/// Returns [`PackError`] when the block size is zero or the payload is larger than the block.
 pub fn pack_block(input: &[u8], block_size: usize) -> Result<Vec<u8>, PackError> {
     if block_size == 0 {
         return Err(PackError::ZeroBlockSize);
@@ -21,6 +25,10 @@ pub fn pack_block(input: &[u8], block_size: usize) -> Result<Vec<u8>, PackError>
     Ok(block)
 }
 
+/// Reads a payload, packs it to one block, and writes the block to disk.
+///
+/// # Errors
+/// Returns [`PackError`] for invalid block sizing or filesystem I/O failures.
 pub fn pack_file(
     input_path: &Path,
     output_path: &Path,

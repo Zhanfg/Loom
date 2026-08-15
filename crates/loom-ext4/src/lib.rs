@@ -45,6 +45,14 @@ pub struct CompiledReplacement {
     pub data_blocks: usize,
 }
 
+/// Compiles one same-size ext4 path replacement into shadow blocks and a Loom map.
+///
+/// The origin is opened read-only. Stage 1 deliberately rejects filesystem or inode
+/// features whose on-disk semantics are not modeled yet.
+///
+/// # Errors
+/// Returns [`Ext4Error`] for malformed/unsupported ext4 structures, invalid paths,
+/// size mismatches, mapping failures, or filesystem I/O errors.
 pub fn compile_same_size_replacement(
     origin_path: &Path,
     target_path: &str,
@@ -123,8 +131,8 @@ impl Ext4Image {
             return Err(Ext4Error::UnsupportedInodeFeature("fs-verity"));
         }
 
-        let replacement_len = u64::try_from(replacement.len())
-            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let replacement_len =
+            u64::try_from(replacement.len()).map_err(|_| Ext4Error::ArithmeticOverflow)?;
         if replacement_len != inode.size {
             return Err(Ext4Error::ReplacementSizeMismatch {
                 original: inode.size,
@@ -542,9 +550,7 @@ impl Superblock {
         };
         let blocks_count = (blocks_count_high << 32) | blocks_count_low;
         if blocks_count == 0 {
-            return Err(Ext4Error::InvalidFilesystem(
-                "filesystem has zero blocks",
-            ));
+            return Err(Ext4Error::InvalidFilesystem("filesystem has zero blocks"));
         }
 
         Ok(Self {
@@ -618,7 +624,9 @@ fn parse_absolute_path(path: &str) -> Result<Vec<&str>, Ext4Error> {
             return Err(Ext4Error::InvalidPath("invalid path component"));
         }
         if component.len() > 255 || component.as_bytes().contains(&0) {
-            return Err(Ext4Error::InvalidPath("path component is not ext4-compatible"));
+            return Err(Ext4Error::InvalidPath(
+                "path component is not ext4-compatible",
+            ));
         }
         components.push(component);
     }
@@ -631,9 +639,7 @@ fn read_exact_at(file: &mut File, offset: u64, buffer: &mut [u8]) -> Result<(), 
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, Ext4Error> {
-    let end = offset
-        .checked_add(2)
-        .ok_or(Ext4Error::ArithmeticOverflow)?;
+    let end = offset.checked_add(2).ok_or(Ext4Error::ArithmeticOverflow)?;
     let raw: [u8; 2] = bytes
         .get(offset..end)
         .ok_or(Ext4Error::UnexpectedEndOfStructure)?
@@ -643,9 +649,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, Ext4Error> {
 }
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, Ext4Error> {
-    let end = offset
-        .checked_add(4)
-        .ok_or(Ext4Error::ArithmeticOverflow)?;
+    let end = offset.checked_add(4).ok_or(Ext4Error::ArithmeticOverflow)?;
     let raw: [u8; 4] = bytes
         .get(offset..end)
         .ok_or(Ext4Error::UnexpectedEndOfStructure)?
