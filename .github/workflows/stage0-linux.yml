@@ -72,3 +72,6 @@ jobs:
 
       - name: Stage 4 create-file weaving
         run: bash tests/integration/stage4_ext4_create_file.sh
+
+      - name: Stage 5 remove-file weaving
+        run: bash tests/integration/stage5_ext4_remove_file.sh
