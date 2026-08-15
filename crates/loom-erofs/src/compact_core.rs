@@ -37,7 +37,6 @@ const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
 const FEATURE_BIG_PCLUSTER: u32 = 0x0000_0002;
 const SUPPORTED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER;
 const BIG_REQUIRED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER;
-const MIN_BIG_PHYSICAL_BLOCKS: usize = 2;
 
 #[derive(Debug)]
 pub(crate) struct CompiledCore {
@@ -186,6 +185,21 @@ pub(crate) fn compile_multi_oracle(
     }
 }
 
+pub(crate) fn compile_multi_lz4(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_path: &Path,
+) -> Result<CompiledCore, CoreError> {
+    let origin = Image::open(origin_path)?;
+    match origin.sb.incompat {
+        FEATURE_LZ4_0PADDING => compile_lz4(origin_path, target_path, replacement_path),
+        BIG_REQUIRED_INCOMPAT => compile_big_lz4(origin_path, target_path, replacement_path),
+        _ => Err(CoreError::UnsupportedFilesystem(
+            "multi compact self-encode supports only ordinary LZ4_0PADDING or big-pcluster compact images",
+        )),
+    }
+}
+
 pub(crate) fn compile_lz4(
     origin_path: &Path,
     target_path: &str,
@@ -280,18 +294,6 @@ pub(crate) fn compile_big_lz4(
     let mut origin = Image::open(origin_path)?;
     let origin_nid = origin.resolve_path(target_path)?;
     let topology = origin.read_big_topology(origin_nid)?;
-    if topology.extents.len() != 1 {
-        return Err(CoreError::UnsupportedInode(
-            "big-pcluster self-encode currently requires exactly one big extent",
-        ));
-    }
-    let origin_extent = topology.extents[0];
-    if origin_extent.physical_blocks < MIN_BIG_PHYSICAL_BLOCKS {
-        return Err(CoreError::UnsupportedInode(
-            "single-extent big-pcluster self-encode requires at least two physical blocks",
-        ));
-    }
-
     let actual = u64::try_from(replacement.len()).map_err(|_| CoreError::ArithmeticOverflow)?;
     if actual != topology.logical_size {
         return Err(CoreError::ReplacementSizeMismatch {
@@ -300,47 +302,73 @@ pub(crate) fn compile_big_lz4(
         });
     }
 
-    let capacity = origin_extent
-        .physical_blocks
-        .checked_mul(BLOCK_BYTES)
-        .ok_or(CoreError::ArithmeticOverflow)?;
-    let compressed =
-        lz4::encode(&replacement).map_err(|_| CoreError::CompressionValidationFailed)?;
-    if compressed.len() > capacity {
-        return Err(CoreError::CompressionDoesNotFit {
-            head_lcn: origin_extent.lcn,
-            encoded: compressed.len(),
-            capacity,
-        });
-    }
-    if compressed.first().copied().unwrap_or(0) == 0 {
-        return Err(CoreError::CompressionValidationFailed);
-    }
-    if lz4::decode(&compressed, replacement.len())
-        .map_err(|_| CoreError::CompressionValidationFailed)?
-        != replacement
-    {
-        return Err(CoreError::CompressionValidationFailed);
+    // Transaction boundary: encode and validate every logical extent before opening
+    // EffectiveBlockStore. A later footprint failure therefore cannot materialize a
+    // partial shadow view.
+    let mut encoded_spans = Vec::with_capacity(topology.extents.len());
+    let mut encoded_bytes = Vec::with_capacity(topology.extents.len());
+    for (index, extent) in topology.extents.iter().enumerate() {
+        let next_lcn = topology
+            .extents
+            .get(index + 1)
+            .map_or(topology.logical_lclusters, |next| next.lcn);
+        let start = extent
+            .lcn
+            .checked_mul(BLOCK_BYTES)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let end = next_lcn
+            .checked_mul(BLOCK_BYTES)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let logical_extent = replacement
+            .get(start..end)
+            .ok_or(CoreError::InvalidFilesystem(
+                "recovered big logical extent lies beyond replacement payload",
+            ))?;
+        let capacity = extent
+            .physical_blocks
+            .checked_mul(BLOCK_BYTES)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let compressed =
+            lz4::encode(logical_extent).map_err(|_| CoreError::CompressionValidationFailed)?;
+        if compressed.len() > capacity {
+            return Err(CoreError::CompressionDoesNotFit {
+                head_lcn: extent.lcn,
+                encoded: compressed.len(),
+                capacity,
+            });
+        }
+        if compressed.first().copied().unwrap_or(0) == 0 {
+            return Err(CoreError::CompressionValidationFailed);
+        }
+        if lz4::decode(&compressed, logical_extent.len())
+            .map_err(|_| CoreError::CompressionValidationFailed)?
+            != logical_extent
+        {
+            return Err(CoreError::CompressionValidationFailed);
+        }
+
+        let mut span = vec![0_u8; capacity];
+        let padded_start = capacity
+            .checked_sub(compressed.len())
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        span[padded_start..].copy_from_slice(&compressed);
+        if lz4::decode_0padding(&span, logical_extent.len())
+            .map_err(|_| CoreError::CompressionValidationFailed)?
+            != logical_extent
+        {
+            return Err(CoreError::CompressionValidationFailed);
+        }
+        encoded_bytes.push(compressed.len());
+        encoded_spans.push(span);
     }
 
-    let mut span = vec![0_u8; capacity];
-    let start = capacity
-        .checked_sub(compressed.len())
-        .ok_or(CoreError::ArithmeticOverflow)?;
-    span[start..].copy_from_slice(&compressed);
-    if lz4::decode_0padding(&span, replacement.len())
-        .map_err(|_| CoreError::CompressionValidationFailed)?
-        != replacement
-    {
-        return Err(CoreError::CompressionValidationFailed);
-    }
-
+    let replacement_extents = topology.extents.clone();
     compile_big_spans(
         origin_path,
         &topology,
-        &[origin_extent],
-        vec![span],
-        vec![compressed.len()],
+        &replacement_extents,
+        encoded_spans,
+        encoded_bytes,
     )
 }
 
