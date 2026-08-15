@@ -28,6 +28,11 @@ const LZ4_ALGORITHM: u8 = 0;
 const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
 const FEATURE_COMPR_CFGS_OR_BIG_PCLUSTER: u32 = 0x0000_0002;
 const SUPPORTED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_COMPR_CFGS_OR_BIG_PCLUSTER;
+const LZ4_MIN_MATCH: usize = 4;
+const LZ4_LAST_LITERALS: usize = 5;
+const LZ4_MFLIMIT: usize = 12;
+const LZ4_HASH_LOG: u32 = 16;
+const LZ4_HASH_SIZE: usize = 1 << LZ4_HASH_LOG;
 
 #[derive(Debug)]
 pub struct CompiledPclusterSwap {
@@ -209,7 +214,7 @@ pub fn compile_lz4_replacement(
         });
     }
 
-    let compressed = lz4_flex::block::compress(&replacement);
+    let compressed = encode_lz4_block(&replacement)?;
     let capacity = usize::try_from(origin.sb.block_size)
         .map_err(|_| CompressedError::ArithmeticOverflow)?;
     if compressed.len() > capacity {
@@ -219,10 +224,8 @@ pub fn compile_lz4_replacement(
         });
     }
 
-    let mut decoded = vec![0_u8; replacement.len()];
-    let decoded_len = lz4_flex::block::decompress_into(&compressed, &mut decoded)
-        .map_err(|_| CompressedError::CompressionValidationFailed)?;
-    if decoded_len != replacement.len() || decoded != replacement {
+    let decoded = decode_lz4_block(&compressed, replacement.len())?;
+    if decoded != replacement {
         return Err(CompressedError::CompressionValidationFailed);
     }
 
@@ -518,6 +521,223 @@ impl Image {
     }
 }
 
+fn encode_lz4_block(input: &[u8]) -> Result<Vec<u8>, CompressedError> {
+    let mut output = Vec::with_capacity(input.len());
+    let mut table = vec![usize::MAX; LZ4_HASH_SIZE];
+    let mut anchor = 0_usize;
+    let mut cursor = 0_usize;
+    let last_match_start = input.len().saturating_sub(LZ4_MFLIMIT);
+    let match_end = input.len().saturating_sub(LZ4_LAST_LITERALS);
+
+    while cursor <= last_match_start && cursor + LZ4_MIN_MATCH <= input.len() {
+        let hash = lz4_hash(input, cursor)?;
+        let candidate = table[hash];
+        table[hash] = cursor;
+        let valid = candidate != usize::MAX
+            && cursor > candidate
+            && cursor - candidate <= usize::from(u16::MAX)
+            && input[candidate..candidate + LZ4_MIN_MATCH]
+                == input[cursor..cursor + LZ4_MIN_MATCH];
+        if !valid {
+            cursor += 1;
+            continue;
+        }
+
+        let mut match_len = LZ4_MIN_MATCH;
+        while cursor + match_len < match_end
+            && input[candidate + match_len] == input[cursor + match_len]
+        {
+            match_len += 1;
+        }
+        emit_lz4_sequence(
+            &mut output,
+            input,
+            anchor,
+            cursor,
+            candidate,
+            match_len,
+        )?;
+
+        let next = cursor
+            .checked_add(match_len)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        let mut update = cursor + 1;
+        while update < next && update <= last_match_start {
+            let update_hash = lz4_hash(input, update)?;
+            table[update_hash] = update;
+            update += 1;
+        }
+        cursor = next;
+        anchor = next;
+    }
+
+    emit_lz4_last_literals(&mut output, &input[anchor..])?;
+    Ok(output)
+}
+
+fn lz4_hash(input: &[u8], offset: usize) -> Result<usize, CompressedError> {
+    let end = offset
+        .checked_add(LZ4_MIN_MATCH)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
+    let bytes: [u8; 4] = input
+        .get(offset..end)
+        .ok_or(CompressedError::CompressionValidationFailed)?
+        .try_into()
+        .map_err(|_| CompressedError::CompressionValidationFailed)?;
+    let value = u32::from_le_bytes(bytes).wrapping_mul(2_654_435_761);
+    let hash = value >> (32 - LZ4_HASH_LOG);
+    usize::try_from(hash).map_err(|_| CompressedError::ArithmeticOverflow)
+}
+
+fn emit_lz4_sequence(
+    output: &mut Vec<u8>,
+    input: &[u8],
+    anchor: usize,
+    match_start: usize,
+    match_ref: usize,
+    match_len: usize,
+) -> Result<(), CompressedError> {
+    let literal_len = match_start
+        .checked_sub(anchor)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
+    let match_code = match_len
+        .checked_sub(LZ4_MIN_MATCH)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
+    let literal_nibble = literal_len.min(15);
+    let match_nibble = match_code.min(15);
+    let token = u8::try_from((literal_nibble << 4) | match_nibble)
+        .map_err(|_| CompressedError::ArithmeticOverflow)?;
+    output.push(token);
+    if literal_len >= 15 {
+        emit_lz4_length(output, literal_len - 15)?;
+    }
+    output.extend_from_slice(
+        input
+            .get(anchor..match_start)
+            .ok_or(CompressedError::CompressionValidationFailed)?,
+    );
+
+    let offset = match_start
+        .checked_sub(match_ref)
+        .ok_or(CompressedError::ArithmeticOverflow)?;
+    let offset = u16::try_from(offset).map_err(|_| CompressedError::CompressionValidationFailed)?;
+    if offset == 0 {
+        return Err(CompressedError::CompressionValidationFailed);
+    }
+    output.extend_from_slice(&offset.to_le_bytes());
+    if match_code >= 15 {
+        emit_lz4_length(output, match_code - 15)?;
+    }
+    Ok(())
+}
+
+fn emit_lz4_last_literals(output: &mut Vec<u8>, literals: &[u8]) -> Result<(), CompressedError> {
+    let nibble = literals.len().min(15);
+    output.push(
+        u8::try_from(nibble << 4).map_err(|_| CompressedError::ArithmeticOverflow)?,
+    );
+    if literals.len() >= 15 {
+        emit_lz4_length(output, literals.len() - 15)?;
+    }
+    output.extend_from_slice(literals);
+    Ok(())
+}
+
+fn emit_lz4_length(output: &mut Vec<u8>, mut length: usize) -> Result<(), CompressedError> {
+    while length >= 255 {
+        output.push(255);
+        length -= 255;
+    }
+    output.push(u8::try_from(length).map_err(|_| CompressedError::ArithmeticOverflow)?);
+    Ok(())
+}
+
+fn decode_lz4_block(encoded: &[u8], expected: usize) -> Result<Vec<u8>, CompressedError> {
+    let mut input_pos = 0_usize;
+    let mut output = Vec::with_capacity(expected);
+    while input_pos < encoded.len() {
+        let token = encoded[input_pos];
+        input_pos += 1;
+
+        let mut literal_len = usize::from(token >> 4);
+        if literal_len == 15 {
+            literal_len = literal_len
+                .checked_add(read_lz4_length(encoded, &mut input_pos)?)
+                .ok_or(CompressedError::ArithmeticOverflow)?;
+        }
+        let literal_end = input_pos
+            .checked_add(literal_len)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        let literals = encoded
+            .get(input_pos..literal_end)
+            .ok_or(CompressedError::CompressionValidationFailed)?;
+        if output.len().saturating_add(literals.len()) > expected {
+            return Err(CompressedError::CompressionValidationFailed);
+        }
+        output.extend_from_slice(literals);
+        input_pos = literal_end;
+        if input_pos == encoded.len() {
+            break;
+        }
+
+        let offset_end = input_pos
+            .checked_add(2)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        let offset_bytes: [u8; 2] = encoded
+            .get(input_pos..offset_end)
+            .ok_or(CompressedError::CompressionValidationFailed)?
+            .try_into()
+            .map_err(|_| CompressedError::CompressionValidationFailed)?;
+        input_pos = offset_end;
+        let offset = usize::from(u16::from_le_bytes(offset_bytes));
+        if offset == 0 || offset > output.len() {
+            return Err(CompressedError::CompressionValidationFailed);
+        }
+
+        let mut match_len = usize::from(token & 0x0f) + LZ4_MIN_MATCH;
+        if token & 0x0f == 15 {
+            match_len = match_len
+                .checked_add(read_lz4_length(encoded, &mut input_pos)?)
+                .ok_or(CompressedError::ArithmeticOverflow)?;
+        }
+        if output.len().saturating_add(match_len) > expected {
+            return Err(CompressedError::CompressionValidationFailed);
+        }
+        for _ in 0..match_len {
+            let source = output
+                .len()
+                .checked_sub(offset)
+                .ok_or(CompressedError::CompressionValidationFailed)?;
+            let byte = *output
+                .get(source)
+                .ok_or(CompressedError::CompressionValidationFailed)?;
+            output.push(byte);
+        }
+    }
+    if output.len() != expected {
+        return Err(CompressedError::CompressionValidationFailed);
+    }
+    Ok(output)
+}
+
+fn read_lz4_length(encoded: &[u8], input_pos: &mut usize) -> Result<usize, CompressedError> {
+    let mut total = 0_usize;
+    loop {
+        let byte = *encoded
+            .get(*input_pos)
+            .ok_or(CompressedError::CompressionValidationFailed)?;
+        *input_pos = input_pos
+            .checked_add(1)
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        total = total
+            .checked_add(usize::from(byte))
+            .ok_or(CompressedError::ArithmeticOverflow)?;
+        if byte != 255 {
+            return Ok(total);
+        }
+    }
+}
+
 fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, CompressedError> {
     ensure_range(bytes, SB_OFFSET, SB_SIZE as u64)?;
     let mut raw = [0_u8; SB_SIZE];
@@ -790,12 +1010,26 @@ mod tests {
 
     #[test]
     fn raw_lz4_block_round_trips_without_size_prefix() {
-        let input = vec![b'L'; 8192];
-        let compressed = lz4_flex::block::compress(&input);
+        let mut input = vec![b'L'; 8192];
+        input[64..87].copy_from_slice(b"LOOM-STAGE11-ROUNDTRIP");
+        let compressed = encode_lz4_block(&input).unwrap();
         assert!(compressed.len() < 4096);
-        let mut decoded = vec![0_u8; input.len()];
-        let written = lz4_flex::block::decompress_into(&compressed, &mut decoded).unwrap();
-        assert_eq!(written, input.len());
+        let decoded = decode_lz4_block(&compressed, input.len()).unwrap();
         assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn incompressible_block_exceeds_one_pcluster() {
+        let mut state = 0x4c4f_4f4d_u32;
+        let mut input = vec![0_u8; 8192];
+        for byte in &mut input {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            *byte = state as u8;
+        }
+        let compressed = encode_lz4_block(&input).unwrap();
+        assert!(compressed.len() > 4096);
+        assert_eq!(decode_lz4_block(&compressed, input.len()).unwrap(), input);
     }
 }
