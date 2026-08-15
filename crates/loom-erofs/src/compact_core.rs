@@ -31,8 +31,7 @@ const LCLUSTER_TYPE_MASK: u16 = 3;
 const ADVISE_COMPACTED_2B: u16 = 0x0001;
 const ADVISE_BIG_PCLUSTER_1: u16 = 0x0002;
 const ADVISE_BIG_PCLUSTER_2: u16 = 0x0004;
-const BIG_ADVISE: u16 =
-    ADVISE_COMPACTED_2B | ADVISE_BIG_PCLUSTER_1 | ADVISE_BIG_PCLUSTER_2;
+const BIG_ADVISE: u16 = ADVISE_COMPACTED_2B | ADVISE_BIG_PCLUSTER_1 | ADVISE_BIG_PCLUSTER_2;
 const LZ4_ALGORITHM: u8 = 0;
 const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
 const FEATURE_BIG_PCLUSTER: u32 = 0x0000_0002;
@@ -267,7 +266,8 @@ pub(crate) fn compile_big_lz4(
         .physical_blocks
         .checked_mul(BLOCK_BYTES)
         .ok_or(CoreError::ArithmeticOverflow)?;
-    let compressed = lz4::encode(&replacement).map_err(|_| CoreError::CompressionValidationFailed)?;
+    let compressed =
+        lz4::encode(&replacement).map_err(|_| CoreError::CompressionValidationFailed)?;
     if compressed.len() > capacity {
         return Err(CoreError::CompressionDoesNotFit {
             head_lcn: 0,
@@ -697,10 +697,7 @@ impl Image {
                 "big-pcluster proof requires COMPACTED_2B plus both big-pcluster advice bits",
             ));
         }
-        if map.algorithm != LZ4_ALGORITHM
-            || map.secondary_algorithm != 0
-            || map.cluster_bits != 0
-        {
+        if map.algorithm != LZ4_ALGORITHM || map.secondary_algorithm != 0 || map.cluster_bits != 0 {
             return Err(CoreError::UnsupportedInode(
                 "big-pcluster proof requires HEAD1 LZ4 with 4 KiB logical clusters",
             ));
