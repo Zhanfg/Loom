@@ -48,3 +48,6 @@ jobs:
 
       - name: Stage 1 partial final block
         run: bash tests/integration/stage1_ext4_partial_block.sh
+
+      - name: Stage 1.1 ext4 block-size matrix
+        run: bash tests/integration/stage1_ext4_block_sizes.sh
