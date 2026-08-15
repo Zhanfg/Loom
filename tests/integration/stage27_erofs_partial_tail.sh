@@ -37,9 +37,9 @@ trap 'rc=$?; printf "Stage 27 FAIL line=%s status=%s command=%s\n" "$LINENO" "$r
 
 mkdir -p "$ORD_ROOT" "$BIG_ROOT" "$MOUNT_DIR"
 FILE_BYTES=$((24 * 4096 - 123))
-TAIL_BYTES=$((FILE_BYTES - 23 * 4096))
+EOF_CLUSTER_BYTES=$((FILE_BYTES - 23 * 4096))
 [[ "$FILE_BYTES" -eq 98181 ]]
-[[ "$TAIL_BYTES" -eq 3973 ]]
+[[ "$EOF_CLUSTER_BYTES" -eq 3973 ]]
 
 ORD_ORIGINAL="$WORK/ordinary-original.bin"
 ORD_REPLACEMENT="$WORK/ordinary-replacement.bin"
@@ -91,9 +91,9 @@ fsck.erofs "$BIG_IMG" >/dev/null
 ORD_HASH_BEFORE="$(sha256sum "$ORD_IMG" | awk '{print $1}')"
 BIG_HASH_BEFORE="$(sha256sum "$BIG_IMG" | awk '{print $1}')"
 
-# Ordinary compact: mkfs may terminate the final compressed extent inside the last logical
-# cluster and convert the remainder into a raw PLAIN pcluster. Loom must preserve that byte
-# offset rather than rounding the boundary back to lcluster 23.
+# Ordinary compact: official EROFS mapping treats the final partial-file PLAIN index as
+# an EOF sentinel. It must not become a fourth data pcluster or shadow block. The three
+# actual HEAD1 data extents cover [0, 32768), [32768, 65536), and [65536, EOF).
 CURRENT_LOOP="$(sudo losetup --find --show --read-only "$ORD_IMG")"
 CURRENT_MAPPER="loom-stage27-ordinary-${RANDOM}-${RANDOM}"
 ORD_SHADOW="$WORK/ordinary.shadow"
@@ -111,44 +111,27 @@ ORD_OUTPUT="$(
 )"
 printf '%s\n' "$ORD_OUTPUT"
 echo "$ORD_OUTPUT" | grep -q 'mode=multi-encode'
+echo "$ORD_OUTPUT" | grep -q 'physical_pclusters=3'
 echo "$ORD_OUTPUT" | grep -q 'logical_lclusters=24'
+echo "$ORD_OUTPUT" | grep -q 'head_lclusters=\[0, 8, 16\]'
+echo "$ORD_OUTPUT" | grep -q 'shadow_blocks=3'
 
 ORD_HEADS="$(printf '%s\n' "$ORD_OUTPUT" | sed -n 's/.*head_lclusters=\(\[[^]]*\]\).*/\1/p')"
-ORD_OFFSETS="$(printf '%s\n' "$ORD_OUTPUT" | sed -n 's/.*head_cluster_offsets=\(\[[^]]*\]\).*/\1/p')"
 ORD_ENCODED="$(printf '%s\n' "$ORD_OUTPUT" | sed -n 's/.*encoded_bytes=\(\[[^]]*\]\).*/\1/p')"
-ORD_PCLUSTERS="$(printf '%s\n' "$ORD_OUTPUT" | sed -n 's/.*physical_pclusters=\([0-9][0-9]*\).*/\1/p')"
-ORD_SHADOW_BLOCKS="$(printf '%s\n' "$ORD_OUTPUT" | sed -n 's/.*shadow_blocks=\([0-9][0-9]*\).*/\1/p')"
-[[ -n "$ORD_HEADS" && -n "$ORD_OFFSETS" && -n "$ORD_ENCODED" && -n "$ORD_PCLUSTERS" && -n "$ORD_SHADOW_BLOCKS" ]]
-
-read -r ORD_PLAIN_OFFSET ORD_PLAIN_BYTES <<< "$(python3 - "$FILE_BYTES" "$ORD_HEADS" "$ORD_OFFSETS" "$ORD_ENCODED" "$ORD_PCLUSTERS" "$ORD_SHADOW_BLOCKS" <<'PY'
+python3 - "$FILE_BYTES" "$ORD_HEADS" "$ORD_ENCODED" <<'PY'
 import ast
 import sys
 size = int(sys.argv[1])
 heads = ast.literal_eval(sys.argv[2])
-offsets = ast.literal_eval(sys.argv[3])
-encoded = ast.literal_eval(sys.argv[4])
-pclusters = int(sys.argv[5])
-shadow_blocks = int(sys.argv[6])
-assert len(heads) >= 3
-assert heads[0] == 0
-assert heads == sorted(heads)
-assert len(offsets) == len(encoded) == len(heads) == pclusters == shadow_blocks
-assert offsets[0] == 0
-assert all(offset == 0 for offset in offsets[:-1])
-assert heads[-1] == 23
-assert 0 < offsets[-1] < 4096
-starts = [head * 4096 + offset for head, offset in zip(heads, offsets)]
-assert starts[0] == 0
-assert all(a < b for a, b in zip(starts, starts[1:]))
-plain_bytes = size - starts[-1]
-assert 0 < plain_bytes <= 4096
-assert encoded[-1] == plain_bytes
+encoded = ast.literal_eval(sys.argv[3])
+assert heads == [0, 8, 16]
+assert len(encoded) == 3
 assert all(0 < n <= 4096 for n in encoded)
-print(offsets[-1], plain_bytes)
+starts = [h * 4096 for h in heads]
+lengths = [starts[1] - starts[0], starts[2] - starts[1], size - starts[2]]
+assert lengths == [32768, 32768, 32645]
 PY
-)"
-[[ -n "$ORD_PLAIN_OFFSET" && -n "$ORD_PLAIN_BYTES" ]]
-[[ "$(stat -c %s "$ORD_SHADOW")" -eq $((ORD_SHADOW_BLOCKS * 4096)) ]]
+[[ "$(stat -c %s "$ORD_SHADOW")" -eq 12288 ]]
 
 CURRENT_SHADOW_LOOP="$(sudo losetup --find --show --read-only "$ORD_SHADOW")"
 sed -i "s|LOOM_SHADOW_PLACEHOLDER|$CURRENT_SHADOW_LOOP|g" "$ORD_TABLE"
@@ -162,11 +145,11 @@ sudo fsck.erofs "/dev/mapper/$CURRENT_MAPPER" >/dev/null
 ORD_HASH_AFTER="$(sha256sum "$ORD_IMG" | awk '{print $1}')"
 [[ "$ORD_HASH_BEFORE" == "$ORD_HASH_AFTER" ]]
 cleanup_current
-printf '%s\n' 'Stage 27 ordinary compact partial-tail mount/fsck PASS'
+printf '%s\n' 'Stage 27 ordinary compact EOF-sentinel mount/fsck PASS'
 
-# Big-pcluster: the same non-block-aligned logical EOF must truncate only the final
-# logical extent while preserving its recovered physical CBLKCNT capacity. The currently
-# supported bigpcl2 topology remains lcluster-aligned, so every exported offset must be zero.
+# Big-pcluster path uses the same exact logical EOF bound while preserving each recovered
+# physical CBLKCNT capacity. Any format-specific EOF metadata remains parser-owned and is
+# not counted as a data extent.
 CURRENT_LOOP="$(sudo losetup --find --show --read-only "$BIG_IMG")"
 CURRENT_MAPPER="loom-stage27-big-${RANDOM}-${RANDOM}"
 BIG_SHADOW="$WORK/big.shadow"
@@ -187,28 +170,24 @@ echo "$BIG_OUTPUT" | grep -q 'mode=multi-encode'
 echo "$BIG_OUTPUT" | grep -q 'logical_lclusters=24'
 
 BIG_HEADS="$(printf '%s\n' "$BIG_OUTPUT" | sed -n 's/.*head_lclusters=\(\[[^]]*\]\).*/\1/p')"
-BIG_OFFSETS="$(printf '%s\n' "$BIG_OUTPUT" | sed -n 's/.*head_cluster_offsets=\(\[[^]]*\]\).*/\1/p')"
 BIG_ENCODED="$(printf '%s\n' "$BIG_OUTPUT" | sed -n 's/.*encoded_bytes=\(\[[^]]*\]\).*/\1/p')"
 BIG_ORIGIN_PCLUSTERS="$(printf '%s\n' "$BIG_OUTPUT" | sed -n 's/.*origin_pclusters=\(\[[^]]*\]\).*/\1/p')"
 BIG_SHADOW_BLOCKS="$(printf '%s\n' "$BIG_OUTPUT" | sed -n 's/.*shadow_blocks=\([0-9][0-9]*\).*/\1/p')"
-[[ -n "$BIG_HEADS" && -n "$BIG_OFFSETS" && -n "$BIG_ENCODED" && -n "$BIG_ORIGIN_PCLUSTERS" && -n "$BIG_SHADOW_BLOCKS" ]]
+[[ -n "$BIG_HEADS" && -n "$BIG_ENCODED" && -n "$BIG_ORIGIN_PCLUSTERS" && -n "$BIG_SHADOW_BLOCKS" ]]
 
-BIG_LAST_HEAD="$(python3 - "$FILE_BYTES" "$BIG_HEADS" "$BIG_OFFSETS" "$BIG_ENCODED" <<'PY'
+BIG_LAST_HEAD="$(python3 - "$FILE_BYTES" "$BIG_HEADS" "$BIG_ENCODED" <<'PY'
 import ast
 import sys
 size = int(sys.argv[1])
 heads = ast.literal_eval(sys.argv[2])
-offsets = ast.literal_eval(sys.argv[3])
-encoded = ast.literal_eval(sys.argv[4])
+encoded = ast.literal_eval(sys.argv[3])
 assert len(heads) >= 3
 assert heads[0] == 0
 assert heads == sorted(heads)
-assert len(offsets) == len(encoded) == len(heads)
-assert all(offset == 0 for offset in offsets)
+assert len(encoded) == len(heads)
 last_start = heads[-1] * 4096
 last_len = size - last_start
 assert 0 < last_len <= 32768
-assert last_len % 4096 == 3973
 assert all(n > 4096 for n in encoded)
 print(heads[-1])
 PY
@@ -231,8 +210,8 @@ BIG_HASH_AFTER="$(sha256sum "$BIG_IMG" | awk '{print $1}')"
 cleanup_current
 printf '%s\n' 'Stage 27 big-pcluster partial-tail mount/fsck PASS'
 
-# Final partial big extent overflow remains transactional: all earlier extents fit, but the
-# actual EOF-bounded final extent is made incompressible before EffectiveBlockStore opens.
+# Final big extent overflow remains transactional. All earlier extents fit; the EOF-bounded
+# final extent is made incompressible and must fail before EffectiveBlockStore materializes.
 cp "$BIG_REPLACEMENT" "$BIG_OVERFLOW"
 python3 - "$BIG_OVERFLOW" "$BIG_LAST_HEAD" <<'PY'
 import sys
@@ -268,19 +247,16 @@ printf '%s\n' \
   'Stage 27 partial final EROFS lcluster PASS' \
   "  logical bytes: $FILE_BYTES" \
   '  logical lclusters: 24 (ceil)' \
-  "  final lcluster bytes: $TAIL_BYTES" \
-  "  ordinary HEAD lclusters: $ORD_HEADS" \
-  "  ordinary head cluster offsets: $ORD_OFFSETS" \
-  "  ordinary PLAIN EOF offset: $ORD_PLAIN_OFFSET" \
-  "  ordinary PLAIN raw bytes: $ORD_PLAIN_BYTES" \
+  "  EOF sentinel cluster offset: $EOF_CLUSTER_BYTES" \
+  '  ordinary data HEAD lclusters: [0, 8, 16]' \
+  '  ordinary physical/shadow pclusters: 3' \
   "  ordinary encoded bytes: $ORD_ENCODED" \
   "  big HEAD lclusters: $BIG_HEADS" \
-  "  big head cluster offsets: $BIG_OFFSETS" \
   "  big origin pclusters: $BIG_ORIGIN_PCLUSTERS" \
   "  big encoded bytes: $BIG_ENCODED" \
-  '  ordinary partial-tail mount/fsck: PASS' \
+  '  ordinary EOF-sentinel mount/fsck: PASS' \
   '  big partial-tail mount/fsck: PASS' \
-  '  final partial-extent overflow side effects: none' \
+  '  final big-extent overflow side effects: none' \
   '  authoritative origins: unchanged' \
   "  ordinary origin sha256: $ORD_HASH_AFTER" \
   "  big origin sha256: $BIG_HASH_AFTER"
