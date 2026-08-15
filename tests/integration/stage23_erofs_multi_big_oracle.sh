@@ -92,6 +92,7 @@ OUTPUT="$(
     "$ORIGIN_IMG" /000payload.bin "$REPLACEMENT_IMG" \
     "$SHADOW" "$ORIGIN_LOOP" LOOM_SHADOW_PLACEHOLDER "$TABLE"
 )"
+printf '%s\n' "$OUTPUT"
 
 echo "$OUTPUT" | grep -q 'mode=multi'
 echo "$OUTPUT" | grep -q 'physical_pclusters=3'
