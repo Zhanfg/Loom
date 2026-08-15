@@ -2,9 +2,11 @@
 
 mod allocate;
 mod checksum;
+mod create;
 mod resize;
 
 pub use allocate::{compile_grow_with_block_allocation, CompiledAllocationGrow};
+pub use create::{compile_create_file, CompiledCreateFile};
 pub use resize::{compile_resize_within_allocation, CompiledResize};
 
 use loom_map::{LoomMap, ReplacementExtent};

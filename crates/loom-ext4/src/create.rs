@@ -248,8 +248,7 @@ impl Ext4Image {
             &group.descriptor_block_bytes,
         )?;
 
-        let (superblock_block, superblock_shadow) =
-            self.build_superblock_for_create(&metadata)?;
+        let (superblock_block, superblock_shadow) = self.build_superblock_for_create(&metadata)?;
         append_shadow_block(
             &mut shadow,
             &mut replacements,
@@ -258,11 +257,9 @@ impl Ext4Image {
             &superblock_shadow,
         )?;
 
-        let map = LoomMap::from_replacements(
-            SectorCount(self.image_bytes / SECTOR_SIZE),
-            &replacements,
-        )
-        .map_err(Ext4Error::Map)?;
+        let map =
+            LoomMap::from_replacements(SectorCount(self.image_bytes / SECTOR_SIZE), &replacements)
+                .map_err(Ext4Error::Map)?;
         let shadow_blocks = shadow.len() / block_size;
 
         Ok(CompiledCreateFile {
@@ -320,17 +317,20 @@ impl Ext4Image {
         metadata: &FsMetadata,
     ) -> Result<GroupState, Ext4Error> {
         let descriptor_size = usize::from(self.superblock.descriptor_size);
-        let descriptor_start_block = if self.superblock.block_size == 1024 { 2 } else { 1 };
+        let descriptor_start_block = if self.superblock.block_size == 1024 {
+            2
+        } else {
+            1
+        };
         let descriptor_byte_offset = u64::from(group)
             .checked_mul(u64::from(self.superblock.descriptor_size))
             .ok_or(Ext4Error::ArithmeticOverflow)?;
         let descriptor_block = descriptor_start_block
             .checked_add(descriptor_byte_offset / u64::from(self.superblock.block_size))
             .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let descriptor_offset = usize::try_from(
-            descriptor_byte_offset % u64::from(self.superblock.block_size),
-        )
-        .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let descriptor_offset =
+            usize::try_from(descriptor_byte_offset % u64::from(self.superblock.block_size))
+                .map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let descriptor_end = descriptor_offset
             .checked_add(descriptor_size)
             .ok_or(Ext4Error::ArithmeticOverflow)?;
@@ -413,16 +413,8 @@ impl Ext4Image {
             inode_table_block,
             block_bitmap,
             inode_bitmap,
-            free_blocks: descriptor_u32_count(
-                &descriptor,
-                GD_FREE_BLOCKS_LO,
-                GD_FREE_BLOCKS_HI,
-            )?,
-            free_inodes: descriptor_u32_count(
-                &descriptor,
-                GD_FREE_INODES_LO,
-                GD_FREE_INODES_HI,
-            )?,
+            free_blocks: descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?,
+            free_inodes: descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?,
             itable_unused: descriptor_u32_count(
                 &descriptor,
                 GD_ITABLE_UNUSED_LO,
@@ -452,18 +444,19 @@ impl Ext4Image {
         let table_block = table_start
             .checked_add(byte_offset / block_size)
             .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let inode_offset = usize::try_from(byte_offset % block_size)
-            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let inode_offset =
+            usize::try_from(byte_offset % block_size).map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let inode_size = usize::from(self.superblock.inode_size);
         let inode_end = inode_offset
             .checked_add(inode_size)
             .ok_or(Ext4Error::ArithmeticOverflow)?;
         let mut inode_table = self.read_block(table_block)?;
-        let raw = inode_table
-            .get_mut(inode_offset..inode_end)
-            .ok_or(Ext4Error::InvalidFilesystem(
-                "new inode record crosses inode-table block",
-            ))?;
+        let raw =
+            inode_table
+                .get_mut(inode_offset..inode_end)
+                .ok_or(Ext4Error::InvalidFilesystem(
+                    "new inode record crosses inode-table block",
+                ))?;
         raw.fill(0);
         write_u16(raw, INODE_MODE, MODE_REGULAR | 0o644)?;
         write_u16(raw, INODE_UID, 0)?;
@@ -544,10 +537,15 @@ impl Ext4Image {
         let mut raw = metadata.raw_superblock;
         let free_blocks = superblock_free_blocks(&raw, self.superblock.has_64bit)?
             .checked_sub(1)
-            .ok_or(Ext4Error::InvalidFilesystem("superblock free blocks is zero"))?;
-        let free_inodes = read_u32(&raw, SB_FREE_INODES)?
-            .checked_sub(1)
-            .ok_or(Ext4Error::InvalidFilesystem("superblock free inodes is zero"))?;
+            .ok_or(Ext4Error::InvalidFilesystem(
+                "superblock free blocks is zero",
+            ))?;
+        let free_inodes =
+            read_u32(&raw, SB_FREE_INODES)?
+                .checked_sub(1)
+                .ok_or(Ext4Error::InvalidFilesystem(
+                    "superblock free inodes is zero",
+                ))?;
         write_u32(&mut raw, SB_FREE_BLOCKS_LO, low_u32(free_blocks))?;
         if self.superblock.has_64bit {
             write_u32(
@@ -646,7 +644,9 @@ fn allocate_inode(
     superblock: &super::Superblock,
 ) -> Result<u32, Ext4Error> {
     if group.free_inodes == 0 {
-        return Err(Ext4Error::InvalidFilesystem("parent group has no free inode"));
+        return Err(Ext4Error::InvalidFilesystem(
+            "parent group has no free inode",
+        ));
     }
     let group_base = group
         .group
@@ -662,9 +662,7 @@ fn allocate_inode(
         }
         if !bitmap_is_set(&group.inode_bitmap, bit)? {
             bitmap_set(&mut group.inode_bitmap, bit)?;
-            let initialized = bit
-                .checked_add(1)
-                .ok_or(Ext4Error::ArithmeticOverflow)?;
+            let initialized = bit.checked_add(1).ok_or(Ext4Error::ArithmeticOverflow)?;
             let new_unused = superblock.inodes_per_group.saturating_sub(initialized);
             group.itable_unused = group.itable_unused.min(new_unused);
             return Ok(inode_number);
@@ -681,7 +679,9 @@ fn allocate_data_block(
     blocks_count: u64,
 ) -> Result<u64, Ext4Error> {
     if group.free_blocks == 0 {
-        return Err(Ext4Error::InvalidFilesystem("parent group has no free block"));
+        return Err(Ext4Error::InvalidFilesystem(
+            "parent group has no free block",
+        ));
     }
     let group_first = metadata
         .first_data_block
