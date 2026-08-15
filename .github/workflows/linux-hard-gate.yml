@@ -6,104 +6,29 @@ on:
   push:
     branches:
       - main
-      - feat/stage28-erofs-inline-directory-tail
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  stage28-inline-dir-patch:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/stage28-erofs-inline-directory-tail'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: feat/stage28-erofs-inline-directory-tail
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Add flat-inline directory tail traversal
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('crates/loom-erofs/src/compact_core.rs')
-          text = path.read_text()
-          old = '\n'.join([
-              '        if directory.layout == DATA_FLAT_INLINE && directory.size % block_size != 0 {',
-              '            return Err(CoreError::UnsupportedInode(',
-              '                "target may lie in unsupported inline directory tail",',
-              '            ));',
-              '        }',
-              '        Err(CoreError::PathNotFound(',
-          ])
-          new = '\n'.join([
-              '        if directory.layout == DATA_FLAT_INLINE && directory.size % block_size != 0 {',
-              '            let tail_len = usize::try_from(directory.size % block_size)',
-              '                .map_err(|_| CoreError::ArithmeticOverflow)?;',
-              '            let tail_offset = directory',
-              '                .offset',
-              '                .checked_add(directory.isize)',
-              '                .and_then(|value| value.checked_add(directory.xattr_size))',
-              '                .ok_or(CoreError::ArithmeticOverflow)?;',
-              '            let block_offset = usize::try_from(tail_offset % block_size)',
-              '                .map_err(|_| CoreError::ArithmeticOverflow)?;',
-              '            if block_offset',
-              '                .checked_add(tail_len)',
-              '                .ok_or(CoreError::ArithmeticOverflow)?',
-              '                > BLOCK_BYTES',
-              '            {',
-              '                return Err(CoreError::InvalidFilesystem(',
-              '                    "inline directory tail crosses its metadata block",',
-              '                ));',
-              '            }',
-              '            ensure_range(',
-              '                self.bytes,',
-              '                tail_offset,',
-              '                u64::try_from(tail_len).map_err(|_| CoreError::ArithmeticOverflow)?,',
-              '            )?;',
-              '            let mut tail = vec![0_u8; tail_len];',
-              '            read_exact_at(&mut self.file, tail_offset, &mut tail)?;',
-              '            if let Some(nid) = find_in_directory_block(&tail, name)? {',
-              '                return Ok(nid);',
-              '            }',
-              '        }',
-              '        Err(CoreError::PathNotFound(',
-          ])
-          assert text.count(old) == 1
-          text = text.replace(old, new, 1)
-          path.write_text(text)
-          PY
-          cargo fmt --all
-          grep -q 'inline directory tail crosses its metadata block' crates/loom-erofs/src/compact_core.rs
-          ! grep -q 'unsupported inline directory tail' crates/loom-erofs/src/compact_core.rs
-      - name: Commit patch and restore canonical workflow
-        shell: bash
-        run: |
-          git config user.name 'Loom Stage 28 maintainer'
-          git config user.email 'actions@users.noreply.github.com'
-          git checkout 03b62a6d00a9995c583e5fd92f411f5584730164 -- .github/workflows/linux-hard-gate.yml
-          git add crates/loom-erofs/src/compact_core.rs .github/workflows/linux-hard-gate.yml
-          git commit -m 'stage28: traverse flat-inline directory tails'
-          git push origin HEAD:feat/stage28-erofs-inline-directory-tail
-
   linux-hard-gate:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
       - name: Install filesystem test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
+
       - name: Prepare host kernel facilities
         run: |
           sudo modprobe loop || true
@@ -111,5 +36,6 @@ jobs:
           sudo modprobe erofs || true
           sudo losetup -f
           sudo dmsetup version
+
       - name: Run canonical Linux hard gate
         run: bash tests/ci/linux-hard-gate.sh
