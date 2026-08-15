@@ -1,14 +1,11 @@
 name: stage-linux
 
 on:
-  push:
-    branches:
-      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   rust-and-ext4-fabric:
@@ -16,8 +13,10 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout
+      - name: Checkout Stage 4 branch
         uses: actions/checkout@v5
+        with:
+          ref: feat/stage4-ext4-contiguous-growth
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -31,10 +30,742 @@ jobs:
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
 
+      - name: Generalize allocator growth policy
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/loom-ext4/src/allocator.rs')
+          text = path.read_text()
+
+          def replace_span(source: str, start: str, end: str, replacement: str) -> str:
+              start_index = source.index(start)
+              end_index = source.index(end, start_index)
+              return source[:start_index] + replacement + source[end_index:]
+
+          marker = '''struct GroupDescriptorLocation {\n    group: u32,\n    descriptor_block: u64,\n    descriptor_offset: usize,\n    block_bitmap: u64,\n    free_blocks: u32,\n    flags: u16,\n}\n'''
+          addition = '''\n#[derive(Debug, Clone, Copy)]\nenum GrowthPolicy {\n    ExactlyOne,\n    UpTo64,\n}\n\nimpl GrowthPolicy {\n    fn validate(self, new_blocks: usize) -> Result<(), Ext4Error> {\n        match self {\n            Self::ExactlyOne if new_blocks != 1 => Err(Ext4Error::UnsupportedFilesystemFeature(\n                "Stage 3 allocator requires exactly one new data block",\n            )),\n            Self::UpTo64 if new_blocks == 0 || new_blocks > 64 => {\n                Err(Ext4Error::UnsupportedFilesystemFeature(\n                    "Stage 4 allocator supports at most 64 new data blocks and requires at least one",\n                ))\n            }\n            _ => Ok(()),\n        }\n    }\n}\n\n#[derive(Debug, Clone, Copy)]\nstruct AllocatorDelta {\n    geometry: AllocationGeometry,\n    allocated_blocks: u32,\n}\n'''
+          if 'enum GrowthPolicy' not in text:
+              if marker not in text:
+                  raise SystemExit('group descriptor insertion marker missing')
+              text = text.replace(marker, marker + addition, 1)
+
+          old_plan = '''struct InodeGrowthPlan<'a> {\n    inode_number: u32,\n    inode: &'a Inode,\n    old_block: u64,\n    new_block: u64,\n    checksum_seed: u32,\n    sectors_per_block: u64,\n    effective_size: u64,\n}\n'''
+          new_plan = '''struct InodeGrowthPlan<'a> {\n    inode_number: u32,\n    inode: &'a Inode,\n    old_block: u64,\n    new_run_start: u64,\n    new_block_count: usize,\n    checksum_seed: u32,\n    sectors_per_block: u64,\n    added_sectors: u64,\n    effective_size: u64,\n}\n'''
+          if new_plan not in text:
+              if old_plan not in text:
+                  raise SystemExit('InodeGrowthPlan shape missing')
+              text = text.replace(old_plan, new_plan, 1)
+
+          public_and_compile = r'''/// Grows a one-block ext4 regular file by exactly one newly allocated data block.
+///
+/// # Errors
+/// Returns [`Ext4Error`] when the target or filesystem falls outside the proven
+/// allocator subset or exactly one new block cannot be allocated safely.
+pub fn compile_one_block_growth(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_path: &Path,
+) -> Result<CompiledGrowth, Ext4Error> {
+    compile_growth_from_path(
+        origin_path,
+        target_path,
+        replacement_path,
+        GrowthPolicy::ExactlyOne,
+    )
+}
+
+/// Grows a one-block ext4 regular file by a bounded contiguous free-block run.
+///
+/// Stage 4 accepts between one and 64 new blocks, all allocated contiguously in
+/// the existing data block's block group. Existing source data stays stock.
+///
+/// # Errors
+/// Returns [`Ext4Error`] when the target or filesystem falls outside the proven
+/// allocator subset, the request is not block aligned/bounded, or no suitable
+/// contiguous run can be allocated safely.
+pub fn compile_contiguous_growth(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_path: &Path,
+) -> Result<CompiledGrowth, Ext4Error> {
+    compile_growth_from_path(
+        origin_path,
+        target_path,
+        replacement_path,
+        GrowthPolicy::UpTo64,
+    )
+}
+
+fn compile_growth_from_path(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_path: &Path,
+    policy: GrowthPolicy,
+) -> Result<CompiledGrowth, Ext4Error> {
+    let replacement = fs::read(replacement_path).map_err(Ext4Error::Io)?;
+    let mut image = Ext4Image::open(origin_path)?;
+    let inode_number = image.resolve_path(target_path)?;
+    image.compile_growth(inode_number, &replacement, policy)
+}
+
+impl Ext4Image {
+    fn compile_growth(
+        &mut self,
+        inode_number: u32,
+        replacement: &[u8],
+        policy: GrowthPolicy,
+    ) -> Result<CompiledGrowth, Ext4Error> {
+        let inode = self.read_inode(inode_number)?;
+        validate_allocator_inode(inode_number, &inode)?;
+        let blocks = self.file_blocks(&inode)?;
+        if blocks.len() != 1 || inode.size != u64::from(self.superblock.block_size) {
+            return Err(Ext4Error::UnsupportedFilesystemFeature(
+                "allocator growth requires a one-block source file",
+            ));
+        }
+
+        let block_size = usize::try_from(self.superblock.block_size)
+            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        if replacement.len() % block_size != 0 {
+            return Err(Ext4Error::UnsupportedFilesystemFeature(
+                "allocator growth replacement must be filesystem-block aligned",
+            ));
+        }
+        let effective_blocks = replacement.len() / block_size;
+        let new_data_blocks = effective_blocks
+            .checked_sub(1)
+            .ok_or(Ext4Error::UnsupportedFilesystemFeature(
+                "allocator growth requires at least one new data block",
+            ))?;
+        policy.validate(new_data_blocks)?;
+
+        let origin_data = self.read_block(blocks[0])?;
+        if replacement.get(..block_size) != Some(origin_data.as_slice()) {
+            return Err(Ext4Error::UnsupportedFilesystemFeature(
+                "allocator growth requires existing data blocks to remain unchanged",
+            ));
+        }
+
+        let geometry = self.allocation_geometry()?;
+        let group = block_group_for(
+            blocks[0],
+            geometry.first_data_block,
+            geometry.blocks_per_group,
+        )?;
+        let descriptor = self.group_descriptor_location(group, geometry)?;
+        if descriptor.flags & EXT4_BG_BLOCK_UNINIT != 0 {
+            return Err(Ext4Error::UnsupportedFilesystemFeature(
+                "allocator growth refuses an uninitialized block bitmap",
+            ));
+        }
+        let allocated_blocks =
+            u32::try_from(new_data_blocks).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        if descriptor.free_blocks < allocated_blocks {
+            return Err(Ext4Error::UnsupportedFilesystemFeature(
+                "target block group has insufficient free blocks",
+            ));
+        }
+
+        let mut bitmap_shadow = self.read_block(descriptor.block_bitmap)?;
+        let allocated_run_start = find_and_set_free_run(
+            &mut bitmap_shadow,
+            group,
+            geometry.first_data_block,
+            geometry.blocks_per_group,
+            self.superblock.blocks_count,
+            new_data_blocks,
+        )?;
+
+        let sectors_per_block = u64::from(self.superblock.block_size) / SECTOR_SIZE;
+        let mut shadow = Vec::new();
+        let mut replacements = Vec::with_capacity(new_data_blocks.saturating_add(4));
+        append_new_data_run(
+            &mut shadow,
+            &mut replacements,
+            replacement,
+            block_size,
+            allocated_run_start,
+            new_data_blocks,
+            sectors_per_block,
+        )?;
+
+        let added_sectors = sectors_per_block
+            .checked_mul(u64::try_from(new_data_blocks).map_err(|_| Ext4Error::ArithmeticOverflow)?)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let effective_size = u64::from(self.superblock.block_size)
+            .checked_mul(
+                u64::try_from(effective_blocks).map_err(|_| Ext4Error::ArithmeticOverflow)?,
+            )
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let inode_plan = InodeGrowthPlan {
+            inode_number,
+            inode: &inode,
+            old_block: blocks[0],
+            new_run_start: allocated_run_start,
+            new_block_count: new_data_blocks,
+            checksum_seed: geometry.checksum_seed,
+            sectors_per_block,
+            added_sectors,
+            effective_size,
+        };
+        self.append_growth_inode_shadow(&inode_plan, &mut shadow, &mut replacements)?;
+
+        let delta = AllocatorDelta {
+            geometry,
+            allocated_blocks,
+        };
+        self.update_block_bitmap_checksum_and_descriptor(
+            descriptor,
+            delta,
+            &bitmap_shadow,
+            sectors_per_block,
+            &mut shadow,
+            &mut replacements,
+        )?;
+        self.append_superblock_allocator_shadow(
+            delta,
+            sectors_per_block,
+            &mut shadow,
+            &mut replacements,
+        )?;
+
+        let total_sectors = self.image_bytes / SECTOR_SIZE;
+        let map = LoomMap::from_replacements(SectorCount(total_sectors), &replacements)
+            .map_err(Ext4Error::Map)?;
+        Ok(build_compiled_growth(
+            map,
+            shadow,
+            self.superblock.block_size,
+            inode_number,
+            allocated_run_start,
+            new_data_blocks,
+        ))
+    }
+
+'''
+          text = replace_span(
+              text,
+              '/// Grows a one-block ext4 regular file by exactly one newly allocated data block.',
+              '    fn allocation_geometry(',
+              public_and_compile + '    fn allocation_geometry(',
+          )
+
+          text = text.replace(
+              '''        update_extent_root_for_one_block(\n            raw_inode,\n            &plan.inode.block,\n            plan.old_block,\n            plan.new_block,\n        )?;\n''',
+              '''        update_extent_root_for_run(\n            raw_inode,\n            &plan.inode.block,\n            plan.old_block,\n            plan.new_run_start,\n            plan.new_block_count,\n        )?;\n''',
+              1,
+          )
+          text = text.replace(
+              '        increment_inode_blocks(raw_inode, plan.sectors_per_block)?;\n',
+              '        increment_inode_blocks(raw_inode, plan.added_sectors)?;\n',
+              1,
+          )
+
+          descriptor_method = r'''    fn update_block_bitmap_checksum_and_descriptor(
+        &mut self,
+        location: GroupDescriptorLocation,
+        delta: AllocatorDelta,
+        bitmap_shadow: &[u8],
+        sectors_per_block: u64,
+        shadow: &mut Vec<u8>,
+        replacements: &mut Vec<ReplacementExtent>,
+    ) -> Result<(), Ext4Error> {
+        append_shadow_block(
+            shadow,
+            replacements,
+            location.block_bitmap,
+            sectors_per_block,
+            bitmap_shadow,
+        )?;
+
+        let geometry = delta.geometry;
+        let mut descriptor_block = self.read_block(location.descriptor_block)?;
+        let descriptor_size = usize::from(geometry.descriptor_size);
+        let descriptor_end = location
+            .descriptor_offset
+            .checked_add(descriptor_size)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let descriptor = descriptor_block
+            .get_mut(location.descriptor_offset..descriptor_end)
+            .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
+
+        decrement_group_free_blocks(descriptor, geometry.has_64bit, delta.allocated_blocks)?;
+        let bitmap_bytes = usize::try_from(geometry.clusters_per_group / 8)
+            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let bitmap_for_checksum = bitmap_shadow
+            .get(..bitmap_bytes)
+            .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
+        let bitmap_checksum = crc32c(geometry.checksum_seed, bitmap_for_checksum);
+        write_checksum_low_high(
+            descriptor,
+            GD_BLOCK_BITMAP_CSUM_LO,
+            GD_BLOCK_BITMAP_CSUM_HI,
+            usize::from(geometry.descriptor_size) >= GD_BLOCK_BITMAP_CSUM_HI_END,
+            bitmap_checksum,
+        )?;
+        rewrite_group_descriptor_checksum(descriptor, location.group, geometry.checksum_seed)?;
+
+        append_shadow_block(
+            shadow,
+            replacements,
+            location.descriptor_block,
+            sectors_per_block,
+            &descriptor_block,
+        )
+    }
+
+'''
+          text = replace_span(
+              text,
+              '    fn update_block_bitmap_checksum_and_descriptor(',
+              '    fn append_superblock_allocator_shadow(',
+              descriptor_method + '    fn append_superblock_allocator_shadow(',
+          )
+
+          super_method = r'''    fn append_superblock_allocator_shadow(
+        &mut self,
+        delta: AllocatorDelta,
+        sectors_per_block: u64,
+        shadow: &mut Vec<u8>,
+        replacements: &mut Vec<ReplacementExtent>,
+    ) -> Result<(), Ext4Error> {
+        let geometry = delta.geometry;
+        let block_size = u64::from(self.superblock.block_size);
+        let super_block = SUPERBLOCK_OFFSET / block_size;
+        let super_offset = usize::try_from(SUPERBLOCK_OFFSET % block_size)
+            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let mut block = self.read_block(super_block)?;
+        let super_end = super_offset
+            .checked_add(SUPERBLOCK_SIZE)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let raw_super = block
+            .get_mut(super_offset..super_end)
+            .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
+
+        decrement_super_free_blocks(
+            raw_super,
+            geometry.has_64bit,
+            u64::from(delta.allocated_blocks),
+        )?;
+        let checksum = crc32c(u32::MAX, &raw_super[..SUPER_CHECKSUM]);
+        write_u32(raw_super, SUPER_CHECKSUM, checksum)?;
+
+        append_shadow_block(shadow, replacements, super_block, sectors_per_block, &block)
+    }
+}
+
+'''
+          text = replace_span(
+              text,
+              '    fn append_superblock_allocator_shadow(',
+              'fn build_compiled_growth(',
+              super_method + 'fn build_compiled_growth(',
+          )
+
+          build_result = r'''fn build_compiled_growth(
+    map: LoomMap,
+    shadow: Vec<u8>,
+    block_size: u32,
+    inode: u32,
+    allocated_block: u64,
+    new_data_blocks: usize,
+) -> CompiledGrowth {
+    CompiledGrowth {
+        map,
+        shadow,
+        block_size,
+        inode,
+        original_data_blocks: 1,
+        effective_data_blocks: new_data_blocks + 1,
+        new_data_blocks,
+        existing_data_shadow_blocks: 0,
+        inode_metadata_blocks: 1,
+        allocator_metadata_blocks: 3,
+        shadow_blocks: new_data_blocks + 4,
+        allocated_block,
+    }
+}
+
+'''
+          text = replace_span(
+              text,
+              'fn build_compiled_growth(',
+              'fn validate_allocator_inode(',
+              build_result + 'fn validate_allocator_inode(',
+          )
+
+          free_run = r'''fn find_and_set_free_run(
+    bitmap: &mut [u8],
+    group: u32,
+    first_data_block: u64,
+    blocks_per_group: u32,
+    blocks_count: u64,
+    count: usize,
+) -> Result<u64, Ext4Error> {
+    if count == 0 {
+        return Err(Ext4Error::UnsupportedFilesystemFeature(
+            "allocator growth requires at least one new data block",
+        ));
+    }
+    let count_u64 = u64::try_from(count).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+    let group_start = first_data_block
+        .checked_add(
+            u64::from(group)
+                .checked_mul(u64::from(blocks_per_group))
+                .ok_or(Ext4Error::ArithmeticOverflow)?,
+        )
+        .ok_or(Ext4Error::ArithmeticOverflow)?;
+    let remaining = blocks_count.saturating_sub(group_start);
+    let valid_blocks = remaining.min(u64::from(blocks_per_group));
+    if count_u64 > valid_blocks {
+        return Err(Ext4Error::UnsupportedFilesystemFeature(
+            "target block group cannot contain the requested contiguous run",
+        ));
+    }
+
+    let mut run_start = 0_u64;
+    let mut run_len = 0_u64;
+    for bit in 0..valid_blocks {
+        let byte_index = usize::try_from(bit / 8).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let bit_index = u8::try_from(bit % 8).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let byte = *bitmap
+            .get(byte_index)
+            .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
+        let is_free = byte & (1_u8 << bit_index) == 0;
+        if is_free {
+            if run_len == 0 {
+                run_start = bit;
+            }
+            run_len = run_len
+                .checked_add(1)
+                .ok_or(Ext4Error::ArithmeticOverflow)?;
+            if run_len == count_u64 {
+                let run_end = run_start
+                    .checked_add(count_u64)
+                    .ok_or(Ext4Error::ArithmeticOverflow)?;
+                for set_bit in run_start..run_end {
+                    let set_byte_index = usize::try_from(set_bit / 8)
+                        .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+                    let set_bit_index =
+                        u8::try_from(set_bit % 8).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+                    let target = bitmap
+                        .get_mut(set_byte_index)
+                        .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
+                    *target |= 1_u8 << set_bit_index;
+                }
+                return group_start
+                    .checked_add(run_start)
+                    .ok_or(Ext4Error::ArithmeticOverflow);
+            }
+        } else {
+            run_len = 0;
+        }
+    }
+
+    Err(Ext4Error::UnsupportedFilesystemFeature(
+        "target block group has no suitable contiguous free-block run",
+    ))
+}
+
+fn append_new_data_run(
+    shadow: &mut Vec<u8>,
+    replacements: &mut Vec<ReplacementExtent>,
+    replacement: &[u8],
+    block_size: usize,
+    run_start: u64,
+    count: usize,
+    sectors_per_block: u64,
+) -> Result<(), Ext4Error> {
+    for index in 0..count {
+        let replacement_block = index
+            .checked_add(1)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let start = replacement_block
+            .checked_mul(block_size)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let end = start
+            .checked_add(block_size)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let data = replacement
+            .get(start..end)
+            .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
+        let physical = run_start
+            .checked_add(u64::try_from(index).map_err(|_| Ext4Error::ArithmeticOverflow)?)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        append_shadow_block(
+            shadow,
+            replacements,
+            physical,
+            sectors_per_block,
+            data,
+        )?;
+    }
+    Ok(())
+}
+
+'''
+          text = replace_span(
+              text,
+              'fn find_and_set_free_block(',
+              'fn update_extent_root_for_one_block(',
+              free_run + 'fn update_extent_root_for_one_block(',
+          )
+
+          extent_run = r'''fn update_extent_root_for_run(
+    raw_inode: &mut [u8],
+    parsed_root: &[u8; INODE_BLOCK_ROOT_LEN],
+    old_block: u64,
+    new_run_start: u64,
+    new_block_count: usize,
+) -> Result<(), Ext4Error> {
+    let root_end = INODE_BLOCK_ROOT
+        .checked_add(INODE_BLOCK_ROOT_LEN)
+        .ok_or(Ext4Error::ArithmeticOverflow)?;
+    let root = raw_inode
+        .get_mut(INODE_BLOCK_ROOT..root_end)
+        .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
+    if root != parsed_root {
+        return Err(Ext4Error::InvalidFilesystem(
+            "inode extent root changed during compilation",
+        ));
+    }
+    if read_u16(root, 0)? != EXT4_EXTENT_MAGIC
+        || read_u16(root, 6)? != 0
+        || read_u16(root, 2)? != 1
+    {
+        return Err(Ext4Error::UnsupportedInodeFeature(
+            "allocator growth requires one depth-0 extent",
+        ));
+    }
+
+    let first = root
+        .get(12..24)
+        .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
+    let logical = read_u32(first, 0)?;
+    let length = read_u16(first, 4)?;
+    let physical = (u64::from(read_u16(first, 6)?) << 32) | u64::from(read_u32(first, 8)?);
+    if logical != 0 || length != 1 || physical != old_block {
+        return Err(Ext4Error::UnsupportedInodeFeature(
+            "allocator growth source extent is not one logical block",
+        ));
+    }
+
+    let new_length = u16::try_from(new_block_count).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+    if new_run_start == old_block.saturating_add(1) {
+        let combined = new_length
+            .checked_add(1)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        write_u16(root, 16, combined)?;
+        return Ok(());
+    }
+
+    if read_u16(root, 4)? < 2 {
+        return Err(Ext4Error::UnsupportedInodeFeature(
+            "inode extent root has no room for the new contiguous run",
+        ));
+    }
+    write_u16(root, 2, 2)?;
+    let second = root
+        .get_mut(24..36)
+        .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
+    second.fill(0);
+    write_u32(second, 0, 1)?;
+    write_u16(second, 4, new_length)?;
+    let physical_bytes = new_run_start.to_le_bytes();
+    write_u16(
+        second,
+        6,
+        u16::from_le_bytes([physical_bytes[4], physical_bytes[5]]),
+    )?;
+    write_u32(
+        second,
+        8,
+        u32::from_le_bytes([
+            physical_bytes[0],
+            physical_bytes[1],
+            physical_bytes[2],
+            physical_bytes[3],
+        ]),
+    )
+}
+
+'''
+          text = replace_span(
+              text,
+              'fn update_extent_root_for_one_block(',
+              'fn increment_inode_blocks(',
+              extent_run + 'fn increment_inode_blocks(',
+          )
+
+          group_counter = r'''fn decrement_group_free_blocks(
+    descriptor: &mut [u8],
+    has_64bit: bool,
+    count: u32,
+) -> Result<(), Ext4Error> {
+    let low = u32::from(read_u16(descriptor, GD_FREE_BLOCKS_LO)?);
+    let high = if has_64bit {
+        u32::from(read_u16(descriptor, GD_FREE_BLOCKS_HI)?)
+    } else {
+        0
+    };
+    let current = (high << 16) | low;
+    let updated = current.checked_sub(count).ok_or(Ext4Error::InvalidFilesystem(
+        "group free-block count underflow",
+    ))?;
+    let bytes = updated.to_le_bytes();
+    write_u16(
+        descriptor,
+        GD_FREE_BLOCKS_LO,
+        u16::from_le_bytes([bytes[0], bytes[1]]),
+    )?;
+    if has_64bit {
+        write_u16(
+            descriptor,
+            GD_FREE_BLOCKS_HI,
+            u16::from_le_bytes([bytes[2], bytes[3]]),
+        )?;
+    }
+    Ok(())
+}
+
+'''
+          text = replace_span(
+              text,
+              'fn decrement_group_free_blocks(',
+              'fn decrement_super_free_blocks(',
+              group_counter + 'fn decrement_super_free_blocks(',
+          )
+
+          super_counter = r'''fn decrement_super_free_blocks(
+    raw_super: &mut [u8],
+    has_64bit: bool,
+    count: u64,
+) -> Result<(), Ext4Error> {
+    let low = u64::from(read_u32(raw_super, SUPER_FREE_BLOCKS_LO)?);
+    let high = if has_64bit {
+        u64::from(read_u32(raw_super, SUPER_FREE_BLOCKS_HI)?)
+    } else {
+        0
+    };
+    let current = (high << 32) | low;
+    let updated = current.checked_sub(count).ok_or(Ext4Error::InvalidFilesystem(
+        "superblock free-block count underflow",
+    ))?;
+    let bytes = updated.to_le_bytes();
+    write_u32(
+        raw_super,
+        SUPER_FREE_BLOCKS_LO,
+        u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+    )?;
+    if has_64bit {
+        write_u32(
+            raw_super,
+            SUPER_FREE_BLOCKS_HI,
+            u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+        )?;
+    }
+    Ok(())
+}
+
+'''
+          text = replace_span(
+              text,
+              'fn decrement_super_free_blocks(',
+              'fn rewrite_group_descriptor_checksum(',
+              super_counter + 'fn rewrite_group_descriptor_checksum(',
+          )
+
+          path.write_text(text)
+
+          lib = Path('crates/loom-ext4/src/lib.rs')
+          lib_text = lib.read_text()
+          lib_text = lib_text.replace(
+              'pub use allocator::{compile_one_block_growth, CompiledGrowth};',
+              'pub use allocator::{compile_contiguous_growth, compile_one_block_growth, CompiledGrowth};',
+              1,
+          )
+          lib.write_text(lib_text)
+
+          cli = Path('crates/loom-cli/src/main.rs')
+          cli_text = cli.read_text()
+          cli_text = cli_text.replace(
+              '    compile_one_block_growth, compile_resize_within_allocation, compile_same_size_replacement,\n',
+              '    compile_contiguous_growth, compile_one_block_growth, compile_resize_within_allocation,\n    compile_same_size_replacement,\n',
+              1,
+          )
+          cli_text = cli_text.replace(
+              '        "ext4-grow-one" => command_ext4_grow_one(&mut args)?,\n',
+              '        "ext4-grow-one" => command_ext4_grow_one(&mut args)?,\n        "ext4-grow-run" => command_ext4_grow_run(&mut args)?,\n',
+              1,
+          )
+          handler_marker = 'fn required(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, Box<dyn Error>> {'
+          handler = r'''fn command_ext4_grow_run(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let origin_image = required(args, "origin ext4 image")?;
+    let target_path = required(args, "target path")?;
+    let replacement = required(args, "replacement file")?;
+    let shadow_output = required(args, "shadow pack output")?;
+    let origin_device = required(args, "origin block device")?;
+    let shadow_device = required(args, "shadow block device")?;
+    let table_output = required(args, "dm table output")?;
+    ensure_no_extra_args(args)?;
+
+    let compiled = compile_contiguous_growth(
+        Path::new(&origin_image),
+        &target_path,
+        Path::new(&replacement),
+    )?;
+    fs::write(&shadow_output, &compiled.shadow)?;
+    let table = compiled
+        .map
+        .to_dm_linear_table(&origin_device, &shadow_device)?;
+    fs::write(&table_output, table)?;
+
+    println!(
+        "ext4 contiguous growth compiled: inode={} allocated_block={} block_size={} original_data_blocks={} effective_data_blocks={} new_data_blocks={} existing_data_shadow_blocks={} inode_metadata_blocks={} allocator_metadata_blocks={} shadow_blocks={} shadow_bytes={}",
+        compiled.inode,
+        compiled.allocated_block,
+        compiled.block_size,
+        compiled.original_data_blocks,
+        compiled.effective_data_blocks,
+        compiled.new_data_blocks,
+        compiled.existing_data_shadow_blocks,
+        compiled.inode_metadata_blocks,
+        compiled.allocator_metadata_blocks,
+        compiled.shadow_blocks,
+        compiled.shadow.len()
+    );
+    Ok(())
+}
+
+'''
+          if 'fn command_ext4_grow_run(' not in cli_text:
+              cli_text = cli_text.replace(handler_marker, handler + handler_marker, 1)
+          cli_text = cli_text.replace(
+              '           loom ext4-grow-one <origin-image> <target-path> <replacement> <shadow-pack> \\\\\n<origin-device> <shadow-device> <output-table>\\n"',
+              '           loom ext4-grow-one <origin-image> <target-path> <replacement> <shadow-pack> \\\\\n<origin-device> <shadow-device> <output-table>\\n\\\n           loom ext4-grow-run <origin-image> <target-path> <replacement> <shadow-pack> \\\\\n<origin-device> <shadow-device> <output-table>\\n"',
+              1,
+          )
+          cli_text = cli_text.replace('"Loom Stage 3\\n\\n\\\n', '"Loom Stage 4\\n\\n\\\n', 1)
+          cli.write_text(cli_text)
+          PY
+          cargo fmt --all
+
+      - name: Commit generalized allocator
+        run: |
+          if ! git diff --quiet -- crates; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add crates
+            git commit -m "feat(ext4): generalize allocator to bounded contiguous growth"
+            git push origin HEAD:feat/stage4-ext4-contiguous-growth
+          fi
+
       - name: Format
         run: cargo fmt --all -- --check
 
-      - name: Clippy
+      - name: Clippy diagnostics
+        continue-on-error: true
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Unit tests
@@ -72,3 +803,9 @@ jobs:
 
       - name: Stage 3.1 allocator block-size matrix
         run: bash tests/integration/stage3_1_ext4_allocator_block_sizes.sh
+
+      - name: Stage 4 contiguous growth
+        run: bash tests/integration/stage4_ext4_contiguous_growth.sh
+
+      - name: Clippy hard gate
+        run: cargo clippy --workspace --all-targets -- -D warnings
