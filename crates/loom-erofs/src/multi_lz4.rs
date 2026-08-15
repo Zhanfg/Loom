@@ -26,7 +26,7 @@ pub(crate) fn encode(input: &[u8]) -> Result<Vec<u8>, CodecError> {
         table[hash] = cursor;
         let valid = candidate != usize::MAX
             && cursor > candidate
-            && cursor - candidate <= usize::from(u16::MAX)
+            && u16::try_from(cursor - candidate).is_ok()
             && input[candidate..candidate + MIN_MATCH] == input[cursor..cursor + MIN_MATCH];
         if !valid {
             cursor += 1;
@@ -238,7 +238,7 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            *byte = state as u8;
+            *byte = state.to_le_bytes()[0];
         }
         let encoded = encode(&input).unwrap();
         assert!(encoded.len() > 4096);

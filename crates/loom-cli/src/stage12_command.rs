@@ -54,7 +54,7 @@ pub(crate) fn command(args: &mut impl Iterator<Item = String>) -> Result<(), Box
         )?
     };
     write_compiled(
-        compiled,
+        &compiled,
         if encode { "encode" } else { "oracle" },
         &shadow_output,
         &origin_device,
@@ -97,7 +97,7 @@ fn command_big(
         )?
     };
     write_compiled(
-        compiled,
+        &compiled,
         if encode { "big-encode" } else { "big-oracle" },
         &shadow_output,
         &origin_device,
@@ -107,7 +107,7 @@ fn command_big(
 }
 
 fn write_compiled(
-    compiled: CompiledCompactSwap,
+    compiled: &CompiledCompactSwap,
     mode: &str,
     shadow_output: &str,
     origin_device: &str,

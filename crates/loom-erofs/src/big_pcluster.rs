@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
-#[path = "multi_lz4.rs"]
-mod lz4;
+use crate::multi_lz4 as lz4;
 
 use loom_map::LoomMap;
 use loom_view::{EffectiveBlockStore, ViewError};
@@ -49,7 +48,6 @@ pub struct CompiledBigPclusterSwap {
     pub replacement_pcluster: u64,
     pub encoded_bytes: usize,
     pub logical_lclusters: usize,
-    pub physical_blocks: usize,
     pub compact_2b_entries: usize,
     pub shadow_blocks: usize,
 }
@@ -149,7 +147,7 @@ pub fn compile_big_pcluster_swap(
         origin_path,
         origin_extent,
         replacement_extent.pcluster,
-        replacement_span,
+        &replacement_span,
         PROOF_PHYSICAL_BLOCKS
             .checked_mul(BLOCK_BYTES)
             .ok_or(BigPclusterError::ArithmeticOverflow)?,
@@ -217,14 +215,20 @@ pub fn compile_big_pcluster_lz4(
         return Err(BigPclusterError::CompressionValidationFailed);
     }
 
-    compile_span(origin_path, extent, extent.pcluster, span, compressed.len())
+    compile_span(
+        origin_path,
+        extent,
+        extent.pcluster,
+        &span,
+        compressed.len(),
+    )
 }
 
 fn compile_span(
     origin_path: &Path,
     extent: Extent,
     replacement_pcluster: u64,
-    replacement_span: Vec<u8>,
+    replacement_span: &[u8],
     encoded_bytes: usize,
 ) -> Result<CompiledBigPclusterSwap, BigPclusterError> {
     let expected = extent
@@ -276,7 +280,6 @@ fn compile_span(
         replacement_pcluster,
         encoded_bytes,
         logical_lclusters: extent.logical_lclusters,
-        physical_blocks: extent.physical_blocks,
         compact_2b_entries: extent.compact_2b_entries,
         shadow_blocks: compiled.shadow_blocks,
     })

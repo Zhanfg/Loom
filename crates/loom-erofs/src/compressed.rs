@@ -536,7 +536,7 @@ fn encode_lz4_block(input: &[u8]) -> Result<Vec<u8>, CompressedError> {
         table[hash] = cursor;
         let valid = candidate != usize::MAX
             && cursor > candidate
-            && cursor - candidate <= usize::from(u16::MAX)
+            && u16::try_from(cursor - candidate).is_ok()
             && input[candidate..candidate + LZ4_MIN_MATCH] == input[cursor..cursor + LZ4_MIN_MATCH];
         if !valid {
             cursor += 1;
@@ -1017,7 +1017,7 @@ mod tests {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
-            *byte = state as u8;
+            *byte = state.to_le_bytes()[0];
         }
         let compressed = encode_lz4_block(&input).unwrap();
         assert!(compressed.len() > 4096);

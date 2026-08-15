@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
-#[path = "multi_lz4.rs"]
-mod lz4;
+use crate::multi_lz4 as lz4;
 
 use loom_map::LoomMap;
 use loom_view::{EffectiveBlockStore, ViewError};
