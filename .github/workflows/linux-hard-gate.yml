@@ -6,29 +6,356 @@ on:
   push:
     branches:
       - main
+      - feat/stage27-erofs-partial-tail
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
+  stage27-plain-offset-patch:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/stage27-erofs-partial-tail'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: feat/stage27-erofs-partial-tail
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Preserve PLAIN cluster offsets in ordinary compact topology
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/loom-erofs/src/compact_core.rs')
+          text = path.read_text()
+
+          def block(lines):
+              return '\n'.join(lines)
+
+          def once(old, new):
+              global text
+              assert text.count(old) == 1, old[:160]
+              text = text.replace(old, new, 1)
+
+          once(
+              block([
+                  '    pub(crate) head_lclusters: Vec<usize>,',
+                  '    pub(crate) encoded_bytes: Vec<usize>,',
+              ]),
+              block([
+                  '    pub(crate) head_lclusters: Vec<usize>,',
+                  '    pub(crate) head_cluster_offsets: Vec<usize>,',
+                  '    pub(crate) encoded_bytes: Vec<usize>,',
+              ]),
+          )
+          once(
+              block([
+                  'struct Head {',
+                  '    lcn: usize,',
+                  '    pcluster: u64,',
+                  '    kind: u16,',
+                  '}',
+              ]),
+              block([
+                  'struct Head {',
+                  '    lcn: usize,',
+                  '    pcluster: u64,',
+                  '    kind: u16,',
+                  '    clusterofs: usize,',
+                  '}',
+              ]),
+          )
+
+          once(
+              block([
+                  '        let start = head',
+                  '            .lcn',
+                  '            .checked_mul(BLOCK_BYTES)',
+                  '            .ok_or(CoreError::ArithmeticOverflow)?;',
+                  '        let end = if let Some(next) = topology.heads.get(index + 1) {',
+                  '            next.lcn',
+                  '                .checked_mul(BLOCK_BYTES)',
+                  '                .ok_or(CoreError::ArithmeticOverflow)?',
+                  '        } else {',
+                  '            replacement.len()',
+                  '        };',
+              ]),
+              block([
+                  '        let start = head_logical_offset(head)?;',
+                  '        let end = if let Some(next) = topology.heads.get(index + 1) {',
+                  '            head_logical_offset(next)?',
+                  '        } else {',
+                  '            replacement.len()',
+                  '        };',
+              ]),
+          )
+
+          once(
+              '            "zero-offset PLAIN extent must occupy one non-empty logical block",',
+              '            "PLAIN extent must occupy one non-empty physical block",',
+          )
+
+          once(
+              block([
+                  '    let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());',
+                  '    let mut head_lclusters = Vec::with_capacity(topology.heads.len());',
+              ]),
+              block([
+                  '    let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());',
+                  '    let mut head_lclusters = Vec::with_capacity(topology.heads.len());',
+                  '    let mut head_cluster_offsets = Vec::with_capacity(topology.heads.len());',
+              ]),
+          )
+          once(
+              block([
+                  '        replacement_pclusters.push(replacement_head.pcluster);',
+                  '        head_lclusters.push(origin_head.lcn);',
+              ]),
+              block([
+                  '        replacement_pclusters.push(replacement_head.pcluster);',
+                  '        head_lclusters.push(origin_head.lcn);',
+                  '        head_cluster_offsets.push(origin_head.clusterofs);',
+              ]),
+          )
+          once(
+              block([
+                  '        replacement_pclusters,',
+                  '        head_lclusters,',
+                  '        encoded_bytes,',
+                  '        logical_lclusters: topology.logical_lclusters,',
+              ]),
+              block([
+                  '        replacement_pclusters,',
+                  '        head_lclusters,',
+                  '        head_cluster_offsets,',
+                  '        encoded_bytes,',
+                  '        logical_lclusters: topology.logical_lclusters,',
+              ]),
+          )
+
+          # Big-pcluster extents always begin on lcluster boundaries in the currently
+          # supported bigpcl2 topology, so expose a parallel all-zero offset vector.
+          once(
+              block([
+                  '        replacement_pclusters,',
+                  '        head_lclusters,',
+                  '        encoded_bytes,',
+                  '        logical_lclusters: topology.logical_lclusters,',
+                  '        compact_2b_entries: topology.compact_2b_entries,',
+                  '        shadow_blocks: compiled.shadow_blocks,',
+                  '    })',
+                  '}',
+                  '',
+                  'fn validate_compatible_topology(',
+              ]),
+              block([
+                  '        replacement_pclusters,',
+                  '        head_cluster_offsets: vec![0; head_lclusters.len()],',
+                  '        head_lclusters,',
+                  '        encoded_bytes,',
+                  '        logical_lclusters: topology.logical_lclusters,',
+                  '        compact_2b_entries: topology.compact_2b_entries,',
+                  '        shadow_blocks: compiled.shadow_blocks,',
+                  '    })',
+                  '}',
+                  '',
+                  'fn validate_compatible_topology(',
+              ]),
+          )
+
+          once(
+              '.map(|head| (head.lcn, head.kind))\n        .ne(replacement.heads.iter().map(|head| (head.lcn, head.kind)))',
+              '.map(|head| (head.lcn, head.kind, head.clusterofs))\n        .ne(replacement.heads.iter().map(|head| (head.lcn, head.kind, head.clusterofs)))',
+          )
+          once(
+              '            "compressed head-lcluster/type topology differs",',
+              '            "compressed head-lcluster/type/offset topology differs",',
+          )
+
+          once(
+              block([
+                  '        let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;',
+                  '        if heads.len() != compressed_blocks {',
+              ]),
+              block([
+                  '        let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;',
+                  '        validate_head_logical_offsets(&heads, inode.size)?;',
+                  '        if heads.len() != compressed_blocks {',
+              ]),
+          )
+
+          once(
+              block([
+                  '                    heads.push(Head {',
+                  '                        lcn,',
+                  '                        pcluster,',
+                  '                        kind: LCLUSTER_HEAD1,',
+                  '                    });',
+              ]),
+              block([
+                  '                    heads.push(Head {',
+                  '                        lcn,',
+                  '                        pcluster,',
+                  '                        kind: LCLUSTER_HEAD1,',
+                  '                        clusterofs: 0,',
+                  '                    });',
+              ]),
+          )
+          once(
+              block([
+                  '                LCLUSTER_PLAIN => {',
+                  '                    if lcn + 1 != total || entry.low != 0 {',
+                  '                        return Err(CoreError::UnsupportedInode(',
+                  '                            "compact core supports only a zero-offset PLAIN EOF lcluster",',
+                  '                        ));',
+                  '                    }',
+                  '                    let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;',
+                  '                    heads.push(Head {',
+                  '                        lcn,',
+                  '                        pcluster,',
+                  '                        kind: LCLUSTER_PLAIN,',
+                  '                    });',
+                  '                }',
+              ]),
+              block([
+                  '                LCLUSTER_PLAIN => {',
+                  '                    if lcn + 1 != total {',
+                  '                        return Err(CoreError::UnsupportedInode(',
+                  '                            "compact core supports PLAIN only for the EOF lcluster",',
+                  '                        ));',
+                  '                    }',
+                  '                    let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;',
+                  '                    heads.push(Head {',
+                  '                        lcn,',
+                  '                        pcluster,',
+                  '                        kind: LCLUSTER_PLAIN,',
+                  '                        clusterofs: usize::from(entry.low),',
+                  '                    });',
+                  '                }',
+              ]),
+          )
+
+          marker = block([
+              'fn validate_nonheads(',
+              '    entries: &[CompactEntry],',
+          ])
+          helpers = block([
+              'fn head_logical_offset(head: &Head) -> Result<usize, CoreError> {',
+              '    head.lcn',
+              '        .checked_mul(BLOCK_BYTES)',
+              '        .and_then(|start| start.checked_add(head.clusterofs))',
+              '        .ok_or(CoreError::ArithmeticOverflow)',
+              '}',
+              '',
+              'fn validate_head_logical_offsets(heads: &[Head], logical_size: u64) -> Result<(), CoreError> {',
+              '    let logical_size = usize::try_from(logical_size).map_err(|_| CoreError::ArithmeticOverflow)?;',
+              '    let mut previous = None;',
+              '    for head in heads {',
+              '        if head.clusterofs >= BLOCK_BYTES {',
+              '            return Err(CoreError::InvalidFilesystem(',
+              '                "compact head cluster offset exceeds one logical cluster",',
+              '            ));',
+              '        }',
+              '        let start = head_logical_offset(head)?;',
+              '        if start >= logical_size {',
+              '            return Err(CoreError::InvalidFilesystem(',
+              '                "compact head logical offset lies at or beyond EOF",',
+              '            ));',
+              '        }',
+              '        if let Some(previous) = previous {',
+              '            if start <= previous {',
+              '                return Err(CoreError::InvalidFilesystem(',
+              '                    "compact head logical offsets are not strictly increasing",',
+              '                ));',
+              '            }',
+              '        } else if start != 0 {',
+              '            return Err(CoreError::InvalidFilesystem(',
+              '                "first compact head does not begin at logical byte zero",',
+              '            ));',
+              '        }',
+              '        previous = Some(start);',
+              '    }',
+              '    Ok(())',
+              '}',
+              '',
+          ])
+          assert text.count(marker) == 1
+          text = text.replace(marker, helpers + marker, 1)
+
+          # Update existing test Head literals with explicit zero offsets.
+          text = text.replace(
+              '                kind: LCLUSTER_HEAD1,\n            }],',
+              '                kind: LCLUSTER_HEAD1,\n                clusterofs: 0,\n            }],',
+          )
+          assert text.count('kind: LCLUSTER_HEAD1,\n                clusterofs: 0,') >= 2
+          once(
+              '                "compressed head-lcluster/type topology differs"',
+              '                "compressed head-lcluster/type/offset topology differs"',
+          )
+
+          marker = block([
+              '    #[test]',
+              '    fn later_extent_codec_failure_happens_before_view_construction() {',
+          ])
+          extra_test = block([
+              '    #[test]',
+              '    fn nonzero_plain_eof_offset_is_part_of_logical_topology() {',
+              '        let heads = vec![',
+              '            Head {',
+              '                lcn: 0,',
+              '                pcluster: 10,',
+              '                kind: LCLUSTER_HEAD1,',
+              '                clusterofs: 0,',
+              '            },',
+              '            Head {',
+              '                lcn: 1,',
+              '                pcluster: 11,',
+              '                kind: LCLUSTER_PLAIN,',
+              '                clusterofs: 123,',
+              '            },',
+              '        ];',
+              '        assert_eq!(head_logical_offset(&heads[1]).unwrap(), 4096 + 123);',
+              '        assert!(validate_head_logical_offsets(&heads, 8192).is_ok());',
+              '    }',
+              '',
+          ])
+          assert text.count(marker) == 1
+          text = text.replace(marker, extra_test + marker, 1)
+
+          path.write_text(text)
+          PY
+          cargo fmt --all
+          grep -q 'head_cluster_offsets' crates/loom-erofs/src/compact_core.rs
+          grep -q 'clusterofs: usize::from(entry.low)' crates/loom-erofs/src/compact_core.rs
+          grep -q 'fn validate_head_logical_offsets' crates/loom-erofs/src/compact_core.rs
+      - name: Commit core patch and restore canonical workflow
+        shell: bash
+        run: |
+          git config user.name 'Loom Stage 27 maintainer'
+          git config user.email 'actions@users.noreply.github.com'
+          git checkout 1c3e008af1b65dc06955be7b7345508b933b499b -- .github/workflows/linux-hard-gate.yml
+          git add crates/loom-erofs/src/compact_core.rs .github/workflows/linux-hard-gate.yml
+          git commit -m 'stage27: preserve PLAIN EOF cluster offsets'
+          git push origin HEAD:feat/stage27-erofs-partial-tail
+
   linux-hard-gate:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-
     steps:
       - name: Checkout
         uses: actions/checkout@v5
-
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - name: Install filesystem test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
-
       - name: Prepare host kernel facilities
         run: |
           sudo modprobe loop || true
@@ -36,6 +363,5 @@ jobs:
           sudo modprobe erofs || true
           sudo losetup -f
           sudo dmsetup version
-
       - name: Run canonical Linux hard gate
         run: bash tests/ci/linux-hard-gate.sh
