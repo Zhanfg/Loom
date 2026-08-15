@@ -2,8 +2,8 @@
 
 use super::checksum::{crc32c, rewrite_inode_checksum};
 use super::{
-    read_exact_at, read_u32, Ext4Error, Ext4Image, INODE_INLINE_DATA_FL, INODE_VERITY_FL,
-    MODE_REGULAR, SECTOR_SIZE, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
+    read_exact_at, read_u32, Ext4Error, Ext4Image, Inode, INODE_INLINE_DATA_FL,
+    INODE_VERITY_FL, MODE_REGULAR, SECTOR_SIZE, SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
 use loom_map::{LoomMap, ReplacementExtent};
 use loom_types::{Sector, SectorCount};
@@ -35,6 +35,14 @@ pub struct CompiledResize {
     pub effective_size: u64,
 }
 
+struct ResizeTarget {
+    inode: Inode,
+    blocks: Vec<u64>,
+    effective_size: u64,
+    block_size: usize,
+    sectors_per_block: u64,
+}
+
 /// Compiles an ext4 regular-file resize without changing allocator state.
 ///
 /// The effective size must remain inside the exact same number of already
@@ -62,113 +70,20 @@ impl Ext4Image {
         inode_number: u32,
         replacement: &[u8],
     ) -> Result<CompiledResize, Ext4Error> {
-        let inode = self.read_inode(inode_number)?;
-        if inode.file_type() != MODE_REGULAR {
-            return Err(Ext4Error::NotRegularFile(inode_number));
-        }
-        if inode.links_count != 1 {
-            return Err(Ext4Error::HardLinkedTarget {
-                inode: inode_number,
-                links: inode.links_count,
-            });
-        }
-        if inode.flags & INODE_INLINE_DATA_FL != 0 {
-            return Err(Ext4Error::UnsupportedInodeFeature("inline data"));
-        }
-        if inode.flags & INODE_VERITY_FL != 0 {
-            return Err(Ext4Error::UnsupportedInodeFeature("fs-verity"));
-        }
-
-        let effective_size =
-            u64::try_from(replacement.len()).map_err(|_| Ext4Error::ArithmeticOverflow)?;
-        if effective_size == inode.size {
-            return Err(Ext4Error::ResizeSizeUnchanged(inode.size));
-        }
-
-        let blocks = self.file_blocks(&inode)?;
-        let block_size_u64 = u64::from(self.superblock.block_size);
-        let block_size = usize::try_from(self.superblock.block_size)
-            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
-        let effective_blocks = blocks_for_size(effective_size, block_size_u64)?;
-        let existing_blocks =
-            u64::try_from(blocks.len()).map_err(|_| Ext4Error::ArithmeticOverflow)?;
-        if effective_blocks != existing_blocks || effective_blocks == 0 {
-            return Err(Ext4Error::ResizeCrossesAllocationBoundary {
-                original_size: inode.size,
-                effective_size,
-                allocated_blocks: existing_blocks,
-                required_blocks: effective_blocks,
-            });
-        }
-
-        let sectors_per_block = block_size_u64 / SECTOR_SIZE;
-        let mut shadow = Vec::new();
-        let mut replacements = Vec::with_capacity(blocks.len().saturating_add(1));
-        let mut data_shadow_blocks = 0_usize;
-
-        for (file_block_index, physical_block) in blocks.iter().copied().enumerate() {
-            let origin_block = self.read_block(physical_block)?;
-            let mut effective_block = origin_block.clone();
-            let replacement_offset = file_block_index
-                .checked_mul(block_size)
-                .ok_or(Ext4Error::ArithmeticOverflow)?;
-            let remaining = replacement.len().saturating_sub(replacement_offset);
-            let copy_len = remaining.min(block_size);
-            if copy_len != 0 {
-                let replacement_end = replacement_offset
-                    .checked_add(copy_len)
-                    .ok_or(Ext4Error::ArithmeticOverflow)?;
-                effective_block[..copy_len]
-                    .copy_from_slice(&replacement[replacement_offset..replacement_end]);
-            }
-
-            if effective_block == origin_block {
-                continue;
-            }
-
-            append_shadow_block(
-                &mut shadow,
-                &mut replacements,
-                physical_block,
-                sectors_per_block,
-                &effective_block,
-            )?;
-            data_shadow_blocks = data_shadow_blocks
-                .checked_add(1)
-                .ok_or(Ext4Error::ArithmeticOverflow)?;
-        }
-
-        let (inode_table_block, inode_offset_in_block) =
-            self.inode_record_location(inode_number)?;
-        let mut inode_table_shadow = self.read_block(inode_table_block)?;
-        let inode_size = usize::from(self.superblock.inode_size);
-        let inode_end = inode_offset_in_block
-            .checked_add(inode_size)
-            .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let raw_inode = inode_table_shadow
-            .get_mut(inode_offset_in_block..inode_end)
-            .ok_or(Ext4Error::InvalidFilesystem(
-                "inode record crosses inode-table filesystem block",
-            ))?;
-
-        write_u32(raw_inode, INODE_SIZE_LO_OFFSET, effective_size as u32)?;
-        write_u32(
-            raw_inode,
-            INODE_SIZE_HIGH_OFFSET,
-            (effective_size >> 32) as u32,
+        let target = self.prepare_resize_target(inode_number, replacement.len())?;
+        let (mut shadow, mut replacements, data_shadow_blocks) = self.compile_resize_data(
+            &target.blocks,
+            replacement,
+            target.block_size,
+            target.sectors_per_block,
         )?;
 
-        if let Some(fs_seed) = self.filesystem_checksum_seed()? {
-            rewrite_inode_checksum(raw_inode, fs_seed, inode_number)
-                .map_err(Ext4Error::Checksum)?;
-        }
-
-        append_shadow_block(
+        self.append_inode_metadata_shadow(
+            inode_number,
+            target.effective_size,
+            target.sectors_per_block,
             &mut shadow,
             &mut replacements,
-            inode_table_block,
-            sectors_per_block,
-            &inode_table_shadow,
         )?;
 
         let total_sectors = self.image_bytes / SECTOR_SIZE;
@@ -183,13 +98,137 @@ impl Ext4Image {
             shadow,
             block_size: self.superblock.block_size,
             inode: inode_number,
-            data_blocks: blocks.len(),
+            data_blocks: target.blocks.len(),
             data_shadow_blocks,
             metadata_blocks: 1,
             shadow_blocks,
-            original_size: inode.size,
-            effective_size,
+            original_size: target.inode.size,
+            effective_size: target.effective_size,
         })
+    }
+
+    fn prepare_resize_target(
+        &mut self,
+        inode_number: u32,
+        replacement_len: usize,
+    ) -> Result<ResizeTarget, Ext4Error> {
+        let inode = self.read_inode(inode_number)?;
+        validate_resize_inode(inode_number, &inode)?;
+
+        let effective_size =
+            u64::try_from(replacement_len).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        if effective_size == inode.size {
+            return Err(Ext4Error::ResizeSizeUnchanged(inode.size));
+        }
+
+        let blocks = self.file_blocks(&inode)?;
+        let block_size_u64 = u64::from(self.superblock.block_size);
+        let effective_blocks = blocks_for_size(effective_size, block_size_u64)?;
+        let existing_blocks =
+            u64::try_from(blocks.len()).map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        if effective_blocks != existing_blocks || effective_blocks == 0 {
+            return Err(Ext4Error::ResizeCrossesAllocationBoundary {
+                original_size: inode.size,
+                effective_size,
+                allocated_blocks: existing_blocks,
+                required_blocks: effective_blocks,
+            });
+        }
+
+        Ok(ResizeTarget {
+            inode,
+            blocks,
+            effective_size,
+            block_size: usize::try_from(self.superblock.block_size)
+                .map_err(|_| Ext4Error::ArithmeticOverflow)?,
+            sectors_per_block: block_size_u64 / SECTOR_SIZE,
+        })
+    }
+
+    fn compile_resize_data(
+        &mut self,
+        blocks: &[u64],
+        replacement: &[u8],
+        block_size: usize,
+        sectors_per_block: u64,
+    ) -> Result<(Vec<u8>, Vec<ReplacementExtent>, usize), Ext4Error> {
+        let mut shadow = Vec::new();
+        let mut replacements = Vec::with_capacity(blocks.len().saturating_add(1));
+        let mut changed_blocks = 0_usize;
+
+        for (file_block_index, physical_block) in blocks.iter().copied().enumerate() {
+            let origin_block = self.read_block(physical_block)?;
+            let effective_block = materialize_file_block(
+                &origin_block,
+                replacement,
+                file_block_index,
+                block_size,
+            )?;
+            if effective_block == origin_block {
+                continue;
+            }
+
+            append_shadow_block(
+                &mut shadow,
+                &mut replacements,
+                physical_block,
+                sectors_per_block,
+                &effective_block,
+            )?;
+            changed_blocks = changed_blocks
+                .checked_add(1)
+                .ok_or(Ext4Error::ArithmeticOverflow)?;
+        }
+
+        Ok((shadow, replacements, changed_blocks))
+    }
+
+    fn append_inode_metadata_shadow(
+        &mut self,
+        inode_number: u32,
+        effective_size: u64,
+        sectors_per_block: u64,
+        shadow: &mut Vec<u8>,
+        replacements: &mut Vec<ReplacementExtent>,
+    ) -> Result<(), Ext4Error> {
+        let checksum_seed = self.filesystem_checksum_seed()?;
+        let (inode_table_block, inode_offset_in_block) =
+            self.inode_record_location(inode_number)?;
+        let mut inode_table_shadow = self.read_block(inode_table_block)?;
+        let inode_size = usize::from(self.superblock.inode_size);
+        let inode_end = inode_offset_in_block
+            .checked_add(inode_size)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        let raw_inode = inode_table_shadow
+            .get_mut(inode_offset_in_block..inode_end)
+            .ok_or(Ext4Error::InvalidFilesystem(
+                "inode record crosses inode-table filesystem block",
+            ))?;
+
+        let size_bytes = effective_size.to_le_bytes();
+        write_u32(
+            raw_inode,
+            INODE_SIZE_LO_OFFSET,
+            u32::from_le_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]),
+        )?;
+        write_u32(
+            raw_inode,
+            INODE_SIZE_HIGH_OFFSET,
+            u32::from_le_bytes([size_bytes[4], size_bytes[5], size_bytes[6], size_bytes[7]]),
+        )?;
+
+        if let Some(fs_seed) = checksum_seed {
+            rewrite_inode_checksum(raw_inode, fs_seed, inode_number)
+                .map_err(Ext4Error::Checksum)?;
+        }
+
+        append_shadow_block(
+            shadow,
+            replacements,
+            inode_table_block,
+            sectors_per_block,
+            &inode_table_shadow,
+        )
     }
 
     fn inode_record_location(&mut self, inode_number: u32) -> Result<(u64, usize), Ext4Error> {
@@ -264,6 +303,47 @@ impl Ext4Image {
             .ok_or(Ext4Error::UnexpectedEndOfStructure)?;
         Ok(Some(crc32c(u32::MAX, uuid)))
     }
+}
+
+fn validate_resize_inode(inode_number: u32, inode: &Inode) -> Result<(), Ext4Error> {
+    if inode.file_type() != MODE_REGULAR {
+        return Err(Ext4Error::NotRegularFile(inode_number));
+    }
+    if inode.links_count != 1 {
+        return Err(Ext4Error::HardLinkedTarget {
+            inode: inode_number,
+            links: inode.links_count,
+        });
+    }
+    if inode.flags & INODE_INLINE_DATA_FL != 0 {
+        return Err(Ext4Error::UnsupportedInodeFeature("inline data"));
+    }
+    if inode.flags & INODE_VERITY_FL != 0 {
+        return Err(Ext4Error::UnsupportedInodeFeature("fs-verity"));
+    }
+    Ok(())
+}
+
+fn materialize_file_block(
+    origin_block: &[u8],
+    replacement: &[u8],
+    file_block_index: usize,
+    block_size: usize,
+) -> Result<Vec<u8>, Ext4Error> {
+    let mut effective_block = origin_block.to_vec();
+    let replacement_offset = file_block_index
+        .checked_mul(block_size)
+        .ok_or(Ext4Error::ArithmeticOverflow)?;
+    let remaining = replacement.len().saturating_sub(replacement_offset);
+    let copy_len = remaining.min(block_size);
+    if copy_len != 0 {
+        let replacement_end = replacement_offset
+            .checked_add(copy_len)
+            .ok_or(Ext4Error::ArithmeticOverflow)?;
+        effective_block[..copy_len]
+            .copy_from_slice(&replacement[replacement_offset..replacement_end]);
+    }
+    Ok(effective_block)
 }
 
 fn blocks_for_size(size: u64, block_size: u64) -> Result<u64, Ext4Error> {
