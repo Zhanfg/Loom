@@ -66,10 +66,9 @@ fi
 dumpe2fs -h "$STOCK" 2>/dev/null | grep -q 'metadata_csum'
 STOCK_HASH_BEFORE="$(sha256sum "$STOCK" | awk '{print $1}')"
 
+# Keep block 0 stock; append eight deterministic non-zero blocks.
 cp "$ORIGINAL" "$GROWN"
-for index in $(seq 1 "$NEW_BLOCKS"); do
-  dd if=/dev/zero bs="$BLOCK_SIZE" count=1 status=none | tr '\000' "$(printf \\$(printf '%03o' $((66 + index))))" >> "$GROWN"
-done
+dd if=/dev/zero bs="$BLOCK_SIZE" count="$NEW_BLOCKS" status=none | tr '\000' 'B' >> "$GROWN"
 printf 'LOOM-STAGE4-LAST-BLOCK' | \
   dd of="$GROWN" bs=1 seek=$(((EFFECTIVE_BLOCKS - 1) * BLOCK_SIZE + 37)) conv=notrunc status=none
 
@@ -113,9 +112,7 @@ cmp "$DUMPED" "$ORIGINAL"
 # Stage 4 is deliberately bounded. More than 64 new blocks is rejected before
 # creating output artifacts so the PoC cannot silently become an unbounded allocator.
 cp "$ORIGINAL" "$TOO_LARGE"
-for _ in $(seq 1 65); do
-  dd if=/dev/zero bs="$BLOCK_SIZE" count=1 status=none | tr '\000' 'Z' >> "$TOO_LARGE"
-done
+dd if=/dev/zero bs="$BLOCK_SIZE" count=65 status=none | tr '\000' 'Z' >> "$TOO_LARGE"
 set +e
 REJECT_OUTPUT="$(
   "$LOOM" ext4-grow-run \
