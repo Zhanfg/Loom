@@ -78,3 +78,6 @@ jobs:
 
       - name: Stage 6 SELinux xattr weaving
         run: bash tests/integration/stage6_ext4_selinux_xattr.sh
+
+      - name: Stage 7 effective-view transaction
+        run: bash tests/integration/stage7_ext4_transaction_view.sh
