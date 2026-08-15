@@ -6,247 +6,29 @@ on:
   push:
     branches:
       - main
-      - feat/stage27-erofs-partial-tail
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  stage27-big-sentinel-patch:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/feat/stage27-erofs-partial-tail'
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          ref: feat/stage27-erofs-partial-tail
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Apply big-pcluster EOF sentinel semantics
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('crates/loom-erofs/src/compact_core.rs')
-          text = path.read_text()
-
-          def block(lines):
-              return '\n'.join(lines)
-
-          def once(old, new):
-              global text
-              count = text.count(old)
-              assert count == 1, (count, old[:180])
-              text = text.replace(old, new, 1)
-
-          once(
-              block([
-                  '    compact_2b_entries: usize,',
-                  '    extents: Vec<BigExtent>,',
-              ]),
-              block([
-                  '    compact_2b_entries: usize,',
-                  '    eof_plain_clusterofs: Option<usize>,',
-                  '    extents: Vec<BigExtent>,',
-              ]),
-          )
-
-          once(
-              block([
-                  '        let entries = self.read_all_entries(map.ebase, logical_lclusters)?;',
-                  '        let extents = recover_big_extents(&entries, logical_lclusters)?;',
-                  '        validate_big_total_physical_blocks(&extents, encoded_physical_blocks)?;',
-                  '        validate_big_block_spans(&extents, self.bytes)?;',
-                  '',
-                  '        Ok(BigTopology {',
-                  '            nid,',
-                  '            logical_size: inode.size,',
-                  '            logical_lclusters,',
-                  '            compact_2b_entries: map.regions.compact_2b,',
-                  '            extents,',
-                  '        })',
-              ]),
-              block([
-                  '        let entries = self.read_all_entries(map.ebase, logical_lclusters)?;',
-                  '        let eof_plain_clusterofs =',
-                  '            validate_eof_plain_sentinel(&entries, logical_lclusters, inode.size)?;',
-                  '        let extents =',
-                  '            recover_big_extents(&entries, logical_lclusters, eof_plain_clusterofs)?;',
-                  '        validate_big_total_physical_blocks(&extents, encoded_physical_blocks)?;',
-                  '        validate_big_block_spans(&extents, self.bytes)?;',
-                  '',
-                  '        Ok(BigTopology {',
-                  '            nid,',
-                  '            logical_size: inode.size,',
-                  '            logical_lclusters,',
-                  '            compact_2b_entries: map.regions.compact_2b,',
-                  '            eof_plain_clusterofs,',
-                  '            extents,',
-                  '        })',
-              ]),
-          )
-
-          once(
-              block([
-                  '    if origin.logical_size != replacement.logical_size',
-                  '        || origin.logical_lclusters != replacement.logical_lclusters',
-                  '        || origin.extents.len() != replacement.extents.len()',
-                  '    {',
-              ]),
-              block([
-                  '    if origin.logical_size != replacement.logical_size',
-                  '        || origin.logical_lclusters != replacement.logical_lclusters',
-                  '        || origin.eof_plain_clusterofs != replacement.eof_plain_clusterofs',
-                  '        || origin.extents.len() != replacement.extents.len()',
-                  '    {',
-              ]),
-          )
-          once(
-              '            "logical size/lcluster count or big-pcluster extent count differs",',
-              '            "logical size/lcluster count/EOF sentinel or big-pcluster extent count differs",',
-          )
-
-          once(
-              block([
-                  'fn recover_big_extents(',
-                  '    entries: &[CompactEntry],',
-                  '    total: usize,',
-                  ') -> Result<Vec<BigExtent>, CoreError> {',
-              ]),
-              block([
-                  'fn recover_big_extents(',
-                  '    entries: &[CompactEntry],',
-                  '    total: usize,',
-                  '    eof_plain_clusterofs: Option<usize>,',
-                  ') -> Result<Vec<BigExtent>, CoreError> {',
-              ]),
-          )
-          once(
-              block([
-                  '            LCLUSTER_NONHEAD => {}',
-                  '            _ => {',
-                  '                return Err(CoreError::UnsupportedInode(',
-                  '                    "big-pcluster core supports only HEAD1 and NONHEAD entries",',
-                  '                ))',
-                  '            }',
-              ]),
-              block([
-                  '            LCLUSTER_PLAIN => {',
-                  '                let expected = eof_plain_clusterofs.ok_or(',
-                  '                    CoreError::UnsupportedInode(',
-                  '                        "big-pcluster PLAIN is supported only as a partial-EOF sentinel",',
-                  '                    ),',
-                  '                )?;',
-                  '                if lcn + 1 != total || usize::from(entry.low) != expected {',
-                  '                    return Err(CoreError::InvalidFilesystem(',
-                  '                        "big-pcluster PLAIN does not match the validated EOF sentinel",',
-                  '                    ));',
-                  '                }',
-                  '            }',
-                  '            LCLUSTER_NONHEAD => {}',
-                  '            _ => {',
-                  '                return Err(CoreError::UnsupportedInode(',
-                  '                    "big-pcluster core supports only HEAD1, NONHEAD, and a partial-EOF PLAIN sentinel",',
-                  '                ))',
-                  '            }',
-              ]),
-          )
-
-          once(
-              '        let next_head = head_lcns.get(index + 1).copied().unwrap_or(total);',
-              block([
-                  '        let next_head = head_lcns.get(index + 1).copied().unwrap_or_else(|| {',
-                  '            if eof_plain_clusterofs.is_some() {',
-                  '                total.saturating_sub(1)',
-                  '            } else {',
-                  '                total',
-                  '            }',
-                  '        });',
-              ]),
-          )
-
-          # Make the shared sentinel error wording format-neutral now that both ordinary and
-          # big-pcluster readers use the same validated boundary rule.
-          text = text.replace(
-              'partial ordinary compact file lacks the expected PLAIN EOF sentinel',
-              'partial compact file lacks the expected PLAIN EOF sentinel',
-          )
-
-          # Existing synthetic big recovery tests are aligned and therefore pass None.
-          text = text.replace(
-              'recover_big_extents(&three_lcluster_big_entries(2), 3)',
-              'recover_big_extents(&three_lcluster_big_entries(2), 3, None)',
-          )
-          text = text.replace(
-              'recover_big_extents(&three_lcluster_big_entries(physical_blocks), 3)',
-              'recover_big_extents(&three_lcluster_big_entries(physical_blocks), 3, None)',
-          )
-          text = text.replace(
-              'recover_big_extents(&three_lcluster_big_entries(3), 3)',
-              'recover_big_extents(&three_lcluster_big_entries(3), 3, None)',
-          )
-          text = text.replace(
-              'recover_big_extents(&entries, entries.len())',
-              'recover_big_extents(&entries, entries.len(), None)',
-          )
-
-          # Add a focused proof that a PLAIN EOF sentinel is ignored by big extent recovery.
-          marker = block([
-              '    #[test]',
-              '    fn eight_kib_0padding_span_round_trips() {',
-          ])
-          test = block([
-              '    #[test]',
-              '    fn big_partial_eof_plain_is_not_a_data_extent() {',
-              '        let mut entries = three_lcluster_big_entries(2);',
-              '        entries.push(CompactEntry {',
-              '            kind: LCLUSTER_PLAIN,',
-              '            low: 3973,',
-              '            slot: 1,',
-              '            slots: 2,',
-              '            base_pblk: 102,',
-              '        });',
-              '        let extents = recover_big_extents(&entries, 4, Some(3973)).unwrap();',
-              '        assert_eq!(extents.len(), 1);',
-              '        assert_eq!(extents[0].physical_blocks, 2);',
-              '    }',
-              '',
-          ])
-          assert text.count(marker) == 1
-          text = text.replace(marker, test + marker, 1)
-
-          path.write_text(text)
-          PY
-          cargo fmt --all
-          grep -q 'big_partial_eof_plain_is_not_a_data_extent' crates/loom-erofs/src/compact_core.rs
-          grep -q 'big-pcluster PLAIN is supported only as a partial-EOF sentinel' crates/loom-erofs/src/compact_core.rs
-      - name: Commit big sentinel patch and restore canonical workflow
-        shell: bash
-        run: |
-          git config user.name 'Loom Stage 27 maintainer'
-          git config user.email 'actions@users.noreply.github.com'
-          git checkout 77d2d5326c7a380f9e032b5518e50510c1d7ed4d -- .github/workflows/linux-hard-gate.yml
-          git add crates/loom-erofs/src/compact_core.rs .github/workflows/linux-hard-gate.yml
-          git commit -m 'stage27: ignore validated big-pcluster EOF sentinels'
-          git push origin HEAD:feat/stage27-erofs-partial-tail
-
   linux-hard-gate:
-    if: github.event_name != 'push' || github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
       - name: Install filesystem test dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
+
       - name: Prepare host kernel facilities
         run: |
           sudo modprobe loop || true
@@ -254,5 +36,6 @@ jobs:
           sudo modprobe erofs || true
           sudo losetup -f
           sudo dmsetup version
+
       - name: Run canonical Linux hard gate
         run: bash tests/ci/linux-hard-gate.sh
