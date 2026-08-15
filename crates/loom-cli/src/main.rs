@@ -195,11 +195,8 @@ fn command_ext4_create(args: &mut impl Iterator<Item = String>) -> Result<(), Bo
     let table_output = required(args, "dm table output")?;
     ensure_no_extra_args(args)?;
 
-    let compiled = compile_create_file(
-        Path::new(&origin_image),
-        &target_path,
-        Path::new(&payload),
-    )?;
+    let compiled =
+        compile_create_file(Path::new(&origin_image), &target_path, Path::new(&payload))?;
     fs::write(&shadow_output, &compiled.shadow)?;
     let table = compiled
         .map
