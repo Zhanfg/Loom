@@ -1772,7 +1772,7 @@ mod tests {
         let mut entries = Vec::new();
         for slot in 0..9 {
             let entry = match slot {
-                0 => CompactEntry {
+                0 | 8 => CompactEntry {
                     kind: LCLUSTER_HEAD1,
                     low: 0,
                     slot,
@@ -1782,13 +1782,6 @@ mod tests {
                 1 => CompactEntry {
                     kind: LCLUSTER_NONHEAD,
                     low: D0_CBLKCNT | 3,
-                    slot,
-                    slots: 16,
-                    base_pblk: 100,
-                },
-                8 => CompactEntry {
-                    kind: LCLUSTER_HEAD1,
-                    low: 0,
                     slot,
                     slots: 16,
                     base_pblk: 100,
