@@ -90,10 +90,14 @@ fn from_core(compiled: CompiledCore) -> Result<CompiledMultiSwap, MultiIndexErro
         ));
     }
 
-    let expected_shadow_blocks = compiled.encoded_bytes.iter().try_fold(0_usize, |sum, bytes| {
-        sum.checked_add(bytes.div_ceil(BLOCK_BYTES))
-            .ok_or(CoreError::ArithmeticOverflow)
-    })?;
+    let expected_shadow_blocks =
+        compiled
+            .encoded_bytes
+            .iter()
+            .try_fold(0_usize, |sum, bytes| {
+                sum.checked_add(bytes.div_ceil(BLOCK_BYTES))
+                    .ok_or(CoreError::ArithmeticOverflow)
+            })?;
     if expected_shadow_blocks != compiled.shadow_blocks {
         return Err(CoreError::InvalidFilesystem(
             "compiled shadow block count does not match encoded extent footprints",
