@@ -23,75 +23,33 @@ jobs:
 
           lib = Path('crates/loom-ext4/src/lib.rs')
           s = lib.read_text()
-          old = 'mod resize;\nmod xattr;\n'
-          new = 'mod resize;\nmod transaction;\nmod xattr;\n'
-          if new not in s:
-              if old not in s: raise SystemExit('lib module marker missing')
-              s = s.replace(old, new, 1)
-          old = 'pub use resize::{compile_resize_within_allocation, CompiledResize};\npub use xattr::{compile_selinux_xattr, CompiledSelinuxXattr};\n'
-          new = 'pub use resize::{compile_resize_within_allocation, CompiledResize};\npub use transaction::{compile_create_with_selinux_transaction, CompiledCreateSelinuxTransaction};\npub use xattr::{compile_selinux_xattr, CompiledSelinuxXattr};\n'
-          if new not in s:
-              if old not in s: raise SystemExit('lib export marker missing')
-              s = s.replace(old, new, 1)
+          if 'mod transaction;\n' not in s:
+              marker = 'mod resize;\nmod xattr;\n'
+              if marker not in s:
+                  raise SystemExit('lib module marker missing')
+              s = s.replace(marker, 'mod resize;\nmod transaction;\nmod xattr;\n', 1)
+          export = 'pub use transaction::{compile_create_with_selinux_transaction, CompiledCreateSelinuxTransaction};\n'
+          if export not in s:
+              marker = 'pub use resize::{compile_resize_within_allocation, CompiledResize};\n'
+              if marker not in s:
+                  raise SystemExit('lib export marker missing')
+              s = s.replace(marker, marker + export, 1)
           lib.write_text(s)
 
-          cli = Path('crates/loom-cli/src/main.rs')
-          s = cli.read_text()
-          old = '    compile_create_file, compile_grow_with_block_allocation, compile_remove_file,\n    compile_resize_within_allocation, compile_same_size_replacement, compile_selinux_xattr,\n'
-          new = '    compile_create_file, compile_create_with_selinux_transaction,\n    compile_grow_with_block_allocation, compile_remove_file, compile_resize_within_allocation,\n    compile_same_size_replacement, compile_selinux_xattr,\n'
-          if old not in s: raise SystemExit('CLI import marker missing')
-          s = s.replace(old, new, 1)
-          old = '        "ext4-selinux" => command_ext4_selinux(&mut args)?,\n'
-          new = '        "ext4-selinux" => command_ext4_selinux(&mut args)?,\n        "ext4-create-selinux" => command_ext4_create_selinux(&mut args)?,\n'
-          if old not in s: raise SystemExit('CLI match marker missing')
-          s = s.replace(old, new, 1)
-          marker = '\nfn required(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, Box<dyn Error>> {'
-          function = r'''
-fn command_ext4_create_selinux(
-    args: &mut impl Iterator<Item = String>,
-) -> Result<(), Box<dyn Error>> {
-    let origin_image = required(args, "origin ext4 image")?;
-    let target_path = required(args, "new target path")?;
-    let payload = required(args, "payload file")?;
-    let value_file = required(args, "SELinux context bytes file")?;
-    let shadow_output = required(args, "shadow pack output")?;
-    let origin_device = required(args, "origin block device")?;
-    let shadow_device = required(args, "shadow block device")?;
-    let table_output = required(args, "dm table output")?;
-    ensure_no_extra_args(args)?;
-
-    let compiled = compile_create_with_selinux_transaction(
-        Path::new(&origin_image),
-        &target_path,
-        Path::new(&payload),
-        Path::new(&value_file),
-    )?;
-    fs::write(&shadow_output, &compiled.shadow)?;
-    let table = compiled
-        .map
-        .to_dm_linear_table(&origin_device, &shadow_device)?;
-    fs::write(&table_output, table)?;
-
-    println!(
-        "ext4 create-selinux transaction compiled: inode={} block_size={} value_bytes={} shadow_blocks={} shadow_bytes={}",
-        compiled.inode,
-        compiled.block_size,
-        compiled.value_bytes,
-        compiled.shadow_blocks,
-        compiled.shadow.len()
-    );
-    Ok(())
-}
-'''
-          if 'fn command_ext4_create_selinux(' not in s:
-              if marker not in s: raise SystemExit('CLI function insertion marker missing')
-              s = s.replace(marker, function + marker, 1)
-          old = '           loom ext4-selinux <origin-image> <target-path> <context-bytes-file> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\\n"\n'
-          new = '           loom ext4-selinux <origin-image> <target-path> <context-bytes-file> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\\n\\
-           loom ext4-create-selinux <origin-image> <target-path> <payload> <context-bytes-file> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\\n"\n'
-          if old in s:
-              s = s.replace(old, new, 1)
-          cli.write_text(s)
+          main = Path('crates/loom-cli/src/main.rs')
+          s = main.read_text()
+          if 'mod stage7_command;\n' not in s:
+              marker = '#![forbid(unsafe_code)]\n\n'
+              if marker not in s:
+                  raise SystemExit('CLI module marker missing')
+              s = s.replace(marker, marker + 'mod stage7_command;\n\n', 1)
+          command = '        "ext4-create-selinux" => stage7_command::command(&mut args)?,\n'
+          if command not in s:
+              marker = '        "ext4-selinux" => command_ext4_selinux(&mut args)?,\n'
+              if marker not in s:
+                  raise SystemExit('CLI match marker missing')
+              s = s.replace(marker, marker + command, 1)
+          main.write_text(s)
           PY
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -101,6 +59,6 @@ fn command_ext4_create_selinux(
           cargo fmt --all
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add crates/loom-ext4/src/lib.rs crates/loom-ext4/src/transaction.rs crates/loom-cli/src/main.rs tests/integration/stage7_ext4_transaction_view.sh
+          git add crates/loom-ext4/src/lib.rs crates/loom-ext4/src/transaction.rs crates/loom-cli/src/main.rs crates/loom-cli/src/stage7_command.rs tests/integration/stage7_ext4_transaction_view.sh
           git commit -m 'feat(ext4): wire Stage 7 effective-view transaction'
           git push origin HEAD:feat/stage7-ext4-transaction-view
