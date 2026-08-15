@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const SECTOR_SIZE: u64 = 512;
+const SECTOR_BYTES: usize = 512;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -256,8 +257,8 @@ fn diff_effective_image(
     }
 
     let total_sectors = origin_len / SECTOR_SIZE;
-    let mut origin_sector = [0_u8; SECTOR_SIZE as usize];
-    let mut effective_sector = [0_u8; SECTOR_SIZE as usize];
+    let mut origin_sector = [0_u8; SECTOR_BYTES];
+    let mut effective_sector = [0_u8; SECTOR_BYTES];
     let mut shadow = Vec::new();
     let mut replacements = Vec::new();
     let mut changed = 0_usize;
