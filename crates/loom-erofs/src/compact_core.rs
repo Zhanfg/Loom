@@ -221,22 +221,25 @@ pub(crate) fn compile_lz4(
     let mut encoded_blocks = Vec::with_capacity(topology.heads.len());
     let mut encoded_bytes = Vec::with_capacity(topology.heads.len());
     for (index, head) in topology.heads.iter().enumerate() {
-        let next_lcn = topology
-            .heads
-            .get(index + 1)
-            .map_or(topology.logical_lclusters, |next| next.lcn);
         let start = head
             .lcn
             .checked_mul(BLOCK_BYTES)
             .ok_or(CoreError::ArithmeticOverflow)?;
-        let end = next_lcn
-            .checked_mul(BLOCK_BYTES)
-            .ok_or(CoreError::ArithmeticOverflow)?;
+        let end = if let Some(next) = topology.heads.get(index + 1) {
+            next.lcn
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(CoreError::ArithmeticOverflow)?
+        } else {
+            replacement.len()
+        };
+        if start >= end || end > replacement.len() {
+            return Err(CoreError::InvalidFilesystem(
+                "recovered logical extent lies beyond replacement payload",
+            ));
+        }
         let extent = replacement
             .get(start..end)
-            .ok_or(CoreError::InvalidFilesystem(
-                "recovered logical extent lies beyond replacement payload",
-            ))?;
+            .ok_or(CoreError::UnexpectedEndOfStructure)?;
         let (block, encoded_len) = encode_extent(head.lcn, extent)?;
         encoded_blocks.push(block);
         encoded_bytes.push(encoded_len);
@@ -308,22 +311,25 @@ pub(crate) fn compile_big_lz4(
     let mut encoded_spans = Vec::with_capacity(topology.extents.len());
     let mut encoded_bytes = Vec::with_capacity(topology.extents.len());
     for (index, extent) in topology.extents.iter().enumerate() {
-        let next_lcn = topology
-            .extents
-            .get(index + 1)
-            .map_or(topology.logical_lclusters, |next| next.lcn);
         let start = extent
             .lcn
             .checked_mul(BLOCK_BYTES)
             .ok_or(CoreError::ArithmeticOverflow)?;
-        let end = next_lcn
-            .checked_mul(BLOCK_BYTES)
-            .ok_or(CoreError::ArithmeticOverflow)?;
+        let end = if let Some(next) = topology.extents.get(index + 1) {
+            next.lcn
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(CoreError::ArithmeticOverflow)?
+        } else {
+            replacement.len()
+        };
+        if start >= end || end > replacement.len() {
+            return Err(CoreError::InvalidFilesystem(
+                "recovered big logical extent lies beyond replacement payload",
+            ));
+        }
         let logical_extent = replacement
             .get(start..end)
-            .ok_or(CoreError::InvalidFilesystem(
-                "recovered big logical extent lies beyond replacement payload",
-            ))?;
+            .ok_or(CoreError::UnexpectedEndOfStructure)?;
         let capacity = extent
             .physical_blocks
             .checked_mul(BLOCK_BYTES)
@@ -1032,12 +1038,13 @@ fn validate_target_inode(inode: &Inode) -> Result<usize, CoreError> {
             "compact core requires EROFS_INODE_COMPRESSED_COMPACT",
         ));
     }
-    if inode.size < u64::from(BLOCK_SIZE) * 2 || inode.size % u64::from(BLOCK_SIZE) != 0 {
+    let logical_lclusters = div_ceil(inode.size, u64::from(BLOCK_SIZE))?;
+    if logical_lclusters < 2 {
         return Err(CoreError::UnsupportedInode(
-            "compact core requires a whole-block file of at least two lclusters",
+            "compact core requires at least two logical clusters",
         ));
     }
-    usize::try_from(inode.size / u64::from(BLOCK_SIZE)).map_err(|_| CoreError::ArithmeticOverflow)
+    usize::try_from(logical_lclusters).map_err(|_| CoreError::ArithmeticOverflow)
 }
 
 fn validate_nonheads(
