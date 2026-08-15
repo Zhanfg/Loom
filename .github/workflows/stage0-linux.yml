@@ -1,11 +1,14 @@
 name: stage-linux
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   rust-and-ext4-fabric:
@@ -13,10 +16,8 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout Stage 1 branch
+      - name: Checkout
         uses: actions/checkout@v5
-        with:
-          ref: feat/stage1-ext4-compiler
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -30,48 +31,10 @@ jobs:
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
 
-      - name: Normalize must-use API contracts once
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
+      - name: Format
+        run: cargo fmt --all -- --check
 
-          path = Path('crates/loom-map/src/lib.rs')
-          text = path.read_text()
-          edits = [
-              (
-                  '    pub fn total_sectors(&self) -> SectorCount {',
-                  '    #[must_use]\n    pub fn total_sectors(&self) -> SectorCount {'
-              ),
-              (
-                  '    pub fn extents(&self) -> &[Extent] {',
-                  '    #[must_use]\n    pub fn extents(&self) -> &[Extent] {'
-              ),
-          ]
-          changed = False
-          for needle, replacement in edits:
-              if replacement in text:
-                  continue
-              if needle not in text:
-                  raise SystemExit(f'expected API signature not found: {needle!r}')
-              text = text.replace(needle, replacement, 1)
-              changed = True
-          if changed:
-              path.write_text(text)
-          PY
-          cargo fmt --all
-
-      - name: Commit normalized sources
-        run: |
-          if ! git diff --quiet -- crates; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add crates
-            git commit -m "style: complete Stage 1 API contracts"
-            git push origin HEAD:feat/stage1-ext4-compiler
-          fi
-
-      - name: Clippy diagnostics
-        continue-on-error: true
+      - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Unit tests
@@ -82,6 +45,3 @@ jobs:
 
       - name: Stage 1 ext4 path compiler
         run: bash tests/integration/stage1_ext4_compiler.sh
-
-      - name: Clippy hard gate
-        run: cargo clippy --workspace --all-targets -- -D warnings
