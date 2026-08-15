@@ -1,11 +1,14 @@
 name: stage-linux
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   rust-and-ext4-fabric:
@@ -13,10 +16,8 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout Stage 3.1 branch
+      - name: Checkout
         uses: actions/checkout@v5
-        with:
-          ref: feat/stage3-1-ext4-allocator-block-sizes
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -29,52 +30,6 @@ jobs:
           sudo apt-get install -y e2fsprogs dmsetup util-linux
           sudo modprobe dm_mod
           sudo modprobe dm_linear || true
-
-      - name: Generalize allocator block geometry
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          path = Path('crates/loom-ext4/src/allocator.rs')
-          text = path.read_text()
-
-          block_guard = '''        if self.superblock.block_size != 4096 {\n            return Err(Ext4Error::UnsupportedFilesystemFeature(\n                "Stage 3 allocator currently requires 4096-byte ext4 blocks",\n            ));\n        }\n\n'''
-          text = text.replace(block_guard, '', 1)
-
-          old_struct = '''    checksum_seed: u32,\n    sectors_per_block: u64,\n}\n'''
-          new_struct = '''    checksum_seed: u32,\n    sectors_per_block: u64,\n    effective_size: u64,\n}\n'''
-          if new_struct not in text:
-              if old_struct not in text:
-                  raise SystemExit('InodeGrowthPlan fields not found')
-              text = text.replace(old_struct, new_struct, 1)
-
-          old_plan = '''            checksum_seed: geometry.checksum_seed,\n            sectors_per_block,\n        };\n'''
-          new_plan = '''            checksum_seed: geometry.checksum_seed,\n            sectors_per_block,\n            effective_size: u64::from(self.superblock.block_size)\n                .checked_mul(2)\n                .ok_or(Ext4Error::ArithmeticOverflow)?,\n        };\n'''
-          if new_plan not in text:
-              if old_plan not in text:
-                  raise SystemExit('InodeGrowthPlan construction not found')
-              text = text.replace(old_plan, new_plan, 1)
-
-          old_size = '        write_u64_split(raw_inode, INODE_SIZE_LO, INODE_SIZE_HIGH, 8192)?;\n'
-          new_size = '''        write_u64_split(\n            raw_inode,\n            INODE_SIZE_LO,\n            INODE_SIZE_HIGH,\n            plan.effective_size,\n        )?;\n'''
-          if new_size not in text:
-              if old_size not in text:
-                  raise SystemExit('fixed Stage 3 inode size not found')
-              text = text.replace(old_size, new_size, 1)
-
-          path.write_text(text)
-          PY
-          cargo fmt --all
-
-      - name: Commit geometry generalization
-        run: |
-          if ! git diff --quiet -- crates; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add crates
-            git commit -m "feat(ext4): generalize one-block allocator geometry"
-            git push origin HEAD:feat/stage3-1-ext4-allocator-block-sizes
-          fi
 
       - name: Format
         run: cargo fmt --all -- --check
