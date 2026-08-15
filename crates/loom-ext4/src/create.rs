@@ -205,6 +205,7 @@ impl Ext4Image {
         append_shadow_block(
             &mut shadow,
             &mut replacements,
+            inode_table_block,
             sectors_per_block,
             &inode_table_shadow,
         )?;
@@ -414,7 +415,6 @@ impl Ext4Image {
             descriptor,
             block_bitmap_block,
             inode_bitmap_block,
-            inode_table_block,
             block_bitmap,
             inode_bitmap,
             free_blocks,
