@@ -41,13 +41,23 @@ TABLE="$WORK/loom.table"
 truncate -s 64M "$STOCK"
 mkfs.ext4 -q -F -b 4096 "$STOCK"
 
-head -c 9000 /dev/zero > "$ORIGINAL"
+# Use fully non-zero input so debugfs cannot legitimately represent the file
+# with sparse holes. This test is about a dense file whose final block is partial.
+dd if=/dev/zero bs=9000 count=1 status=none | tr '\000' 'O' > "$ORIGINAL"
 printf 'LOOM-PARTIAL-ORIGINAL-HEAD' | dd of="$ORIGINAL" bs=1 seek=0 conv=notrunc status=none
 printf 'LOOM-PARTIAL-ORIGINAL-TAIL' | dd of="$ORIGINAL" bs=1 seek=8970 conv=notrunc status=none
 
 debugfs -w -R 'mkdir /system' "$STOCK" >/dev/null 2>&1
 debugfs -w -R 'mkdir /system/etc' "$STOCK" >/dev/null 2>&1
 debugfs -w -R "write $ORIGINAL /system/etc/partial.bin" "$STOCK" >/dev/null 2>&1
+
+# Fixture assertion only: this must be a dense 3-block file before Loom sees it.
+FIXTURE_BLOCKS="$(debugfs -R 'blocks /system/etc/partial.bin' "$STOCK" 2>/dev/null | wc -w)"
+if [[ "$FIXTURE_BLOCKS" -ne 3 ]]; then
+  echo "partial-block fixture is unexpectedly sparse: blocks=$FIXTURE_BLOCKS" >&2
+  debugfs -R 'stat /system/etc/partial.bin' "$STOCK" >&2 || true
+  exit 1
+fi
 
 set +e
 e2fsck -fy "$STOCK" >/dev/null
@@ -60,7 +70,7 @@ fi
 
 STOCK_HASH_BEFORE="$(sha256sum "$STOCK" | awk '{print $1}')"
 
-head -c 9000 /dev/zero > "$REPLACEMENT"
+dd if=/dev/zero bs=9000 count=1 status=none | tr '\000' 'R' > "$REPLACEMENT"
 printf 'LOOM-PARTIAL-REPLACED-HEAD' | dd of="$REPLACEMENT" bs=1 seek=0 conv=notrunc status=none
 printf 'LOOM-PARTIAL-REPLACED-TAIL' | dd of="$REPLACEMENT" bs=1 seek=8970 conv=notrunc status=none
 
