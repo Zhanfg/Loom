@@ -2,11 +2,11 @@
 
 use super::checksum::{crc32c, rewrite_inode_checksum, verify_inode_checksum};
 use super::{
-    compile_create_file, read_exact_at, read_u16, read_u32, Ext4Error, Ext4Image, SECTOR_SIZE,
+    compile_create_file, read_exact_at, read_u16, read_u32, Ext4Error, Ext4Image,
     SUPERBLOCK_OFFSET, SUPERBLOCK_SIZE,
 };
 use loom_map::LoomMap;
-use loom_types::Source;
+use loom_view::EffectiveBlockStore;
 use std::fs;
 use std::path::Path;
 
@@ -40,92 +40,17 @@ pub struct CompiledCreateSelinuxTransaction {
     pub shadow_blocks: usize,
 }
 
-/// Mutable editor over a compiled Loom shadow image.
-///
-/// It never reads or writes the authoritative origin. It only resolves logical
-/// filesystem blocks that are already shadow-backed by an earlier operation and
-/// returns the corresponding bytes inside the existing shadow pack.
-struct EffectiveShadowEditor {
-    map: LoomMap,
-    shadow: Vec<u8>,
-    block_size: u32,
-}
-
-impl EffectiveShadowEditor {
-    fn new(map: LoomMap, shadow: Vec<u8>, block_size: u32) -> Result<Self, Ext4Error> {
-        if block_size == 0 || u64::from(block_size) % SECTOR_SIZE != 0 {
-            return Err(Ext4Error::InvalidFilesystem(
-                "transaction block size is not sector aligned",
-            ));
-        }
-        Ok(Self {
-            map,
-            shadow,
-            block_size,
-        })
-    }
-
-    fn shadow_block_mut(&mut self, fs_block: u64) -> Result<&mut [u8], Ext4Error> {
-        let sectors_per_block = u64::from(self.block_size) / SECTOR_SIZE;
-        let logical_sector = fs_block
-            .checked_mul(sectors_per_block)
-            .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let logical_end = logical_sector
-            .checked_add(sectors_per_block)
-            .ok_or(Ext4Error::ArithmeticOverflow)?;
-
-        let extent = self
-            .map
-            .extents()
-            .iter()
-            .find(|extent| {
-                if extent.source != Source::Shadow {
-                    return false;
-                }
-                let start = extent.logical_start.0;
-                let Some(end) = start.checked_add(extent.sector_count.0) else {
-                    return false;
-                };
-                logical_sector >= start && logical_end <= end
-            })
-            .ok_or(Ext4Error::InvalidFilesystem(
-                "transaction target block is not shadow-backed",
-            ))?;
-
-        let sector_delta = logical_sector
-            .checked_sub(extent.logical_start.0)
-            .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let shadow_sector = extent
-            .source_start
-            .0
-            .checked_add(sector_delta)
-            .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let byte_start = shadow_sector
-            .checked_mul(SECTOR_SIZE)
-            .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let byte_end = byte_start
-            .checked_add(u64::from(self.block_size))
-            .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let start = usize::try_from(byte_start).map_err(|_| Ext4Error::ArithmeticOverflow)?;
-        let end = usize::try_from(byte_end).map_err(|_| Ext4Error::ArithmeticOverflow)?;
-        self.shadow
-            .get_mut(start..end)
-            .ok_or(Ext4Error::InvalidFilesystem(
-                "shadow mapping points outside transaction pack",
-            ))
-    }
-}
-
 /// Compiles a two-operation effective-view transaction:
 /// 1. create one regular file;
 /// 2. attach `security.selinux` to the inode created by operation 1.
 ///
-/// The second operation mutates the inode-table block already emitted by CREATE,
-/// proving metadata-block collision coalescing without materializing a second image.
+/// Stage 8 routes the operation chain through the filesystem-agnostic
+/// [`EffectiveBlockStore`]. The CREATE output is rehydrated into a transaction-owned
+/// effective view, then the already-shadowed inode-table block is mutated in place.
 ///
 /// # Errors
-/// Returns [`Ext4Error`] when either operation is unsupported, the CREATE result
-/// does not expose its inode block through shadow storage, or checksum/xattr rules fail.
+/// Returns [`Ext4Error`] when either operation is unsupported, effective-view
+/// rehydration fails, or checksum/xattr rules fail.
 pub fn compile_create_with_selinux_transaction(
     origin_path: &Path,
     target_path: &str,
@@ -145,8 +70,14 @@ pub fn compile_create_with_selinux_transaction(
     let (inode_table_block, inode_offset) = inode_record_location(&mut image, created.inode)?;
     let inode_size = usize::from(image.superblock.inode_size);
 
-    let mut editor = EffectiveShadowEditor::new(created.map, created.shadow, created.block_size)?;
-    let table_block = editor.shadow_block_mut(inode_table_block)?;
+    let mut view = EffectiveBlockStore::from_compiled(
+        origin_path,
+        created.block_size,
+        &created.map,
+        &created.shadow,
+    )
+    .map_err(Ext4Error::View)?;
+    let table_block = view.block_mut(inode_table_block).map_err(Ext4Error::View)?;
     let inode_end = inode_offset
         .checked_add(inode_size)
         .ok_or(Ext4Error::ArithmeticOverflow)?;
@@ -161,16 +92,14 @@ pub fn compile_create_with_selinux_transaction(
     write_empty_ibody_selinux_xattr(raw_inode, &value)?;
     rewrite_inode_checksum(raw_inode, checksum_seed, created.inode).map_err(Ext4Error::Checksum)?;
 
-    let block_size =
-        usize::try_from(editor.block_size).map_err(|_| Ext4Error::ArithmeticOverflow)?;
-    let shadow_blocks = editor.shadow.len() / block_size;
+    let finalized = view.finalize().map_err(Ext4Error::View)?;
     Ok(CompiledCreateSelinuxTransaction {
-        map: editor.map,
-        shadow: editor.shadow,
-        block_size: created.block_size,
+        map: finalized.map,
+        shadow: finalized.shadow,
+        block_size: finalized.block_size,
         inode: created.inode,
         value_bytes: value.len(),
-        shadow_blocks,
+        shadow_blocks: finalized.shadow_blocks,
     })
 }
 
@@ -341,34 +270,4 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), Ext4Erro
         .ok_or(Ext4Error::UnexpectedEndOfStructure)?
         .copy_from_slice(&value.to_le_bytes());
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use loom_map::ReplacementExtent;
-    use loom_types::{Sector, SectorCount};
-
-    #[test]
-    fn editor_locates_block_inside_merged_shadow_extent() {
-        let map = LoomMap::from_replacements(
-            SectorCount(64),
-            &[
-                ReplacementExtent {
-                    logical_start: Sector(8),
-                    sector_count: SectorCount(8),
-                    shadow_start: Sector(0),
-                },
-                ReplacementExtent {
-                    logical_start: Sector(16),
-                    sector_count: SectorCount(8),
-                    shadow_start: Sector(8),
-                },
-            ],
-        )
-        .unwrap();
-        let mut editor = EffectiveShadowEditor::new(map, vec![0_u8; 8192], 4096).unwrap();
-        editor.shadow_block_mut(2).unwrap()[0] = 0x5a;
-        assert_eq!(editor.shadow[4096], 0x5a);
-    }
 }

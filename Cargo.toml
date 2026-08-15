@@ -3,6 +3,7 @@ members = [
     "crates/loom-types",
     "crates/loom-map",
     "crates/loom-pack",
+    "crates/loom-view",
     "crates/loom-ext4",
     "crates/loom-cli",
 ]
