@@ -1536,12 +1536,7 @@ mod tests {
                     base_pblk: 102,
                 },
             ];
-            assert!(validate_big_single_extent(
-                &entries,
-                3,
-                usize::from(physical_blocks)
-            )
-            .is_ok());
+            assert!(validate_big_single_extent(&entries, 3, usize::from(physical_blocks)).is_ok());
         }
     }
 
