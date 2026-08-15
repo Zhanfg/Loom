@@ -72,13 +72,19 @@ struct Topology {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BigExtent {
+    lcn: usize,
+    pcluster: u64,
+    physical_blocks: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct BigTopology {
     nid: u64,
     logical_size: u64,
     logical_lclusters: usize,
-    pcluster: u64,
-    physical_blocks: usize,
     compact_2b_entries: usize,
+    extents: Vec<BigExtent>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,6 +169,23 @@ pub(crate) fn compile_oracle(
     )
 }
 
+pub(crate) fn compile_multi_oracle(
+    origin_path: &Path,
+    target_path: &str,
+    replacement_image_path: &Path,
+) -> Result<CompiledCore, CoreError> {
+    let origin = Image::open(origin_path)?;
+    match origin.sb.incompat {
+        FEATURE_LZ4_0PADDING => compile_oracle(origin_path, target_path, replacement_image_path),
+        BIG_REQUIRED_INCOMPAT => {
+            compile_big_oracle(origin_path, target_path, replacement_image_path)
+        }
+        _ => Err(CoreError::UnsupportedFilesystem(
+            "multi compact oracle supports only ordinary LZ4_0PADDING or big-pcluster compact images",
+        )),
+    }
+}
+
 pub(crate) fn compile_lz4(
     origin_path: &Path,
     target_path: &str,
@@ -228,19 +251,22 @@ pub(crate) fn compile_big_oracle(
     let replacement_topology = replacement.read_big_topology(replacement_nid)?;
     validate_big_compatible_topology(&origin_topology, &replacement_topology)?;
 
-    let replacement_span = replacement.read_span(
-        replacement_topology.pcluster,
-        replacement_topology.physical_blocks,
-    )?;
-    let encoded_bytes = replacement_topology
-        .physical_blocks
-        .checked_mul(BLOCK_BYTES)
-        .ok_or(CoreError::ArithmeticOverflow)?;
-    compile_big_span(
+    let mut replacement_spans = Vec::with_capacity(replacement_topology.extents.len());
+    let mut encoded_bytes = Vec::with_capacity(replacement_topology.extents.len());
+    for extent in &replacement_topology.extents {
+        replacement_spans.push(replacement.read_span(extent.pcluster, extent.physical_blocks)?);
+        encoded_bytes.push(
+            extent
+                .physical_blocks
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(CoreError::ArithmeticOverflow)?,
+        );
+    }
+    compile_big_spans(
         origin_path,
-        origin_topology,
-        replacement_topology.pcluster,
-        &replacement_span,
+        &origin_topology,
+        &replacement_topology.extents,
+        replacement_spans,
         encoded_bytes,
     )
 }
@@ -254,6 +280,18 @@ pub(crate) fn compile_big_lz4(
     let mut origin = Image::open(origin_path)?;
     let origin_nid = origin.resolve_path(target_path)?;
     let topology = origin.read_big_topology(origin_nid)?;
+    if topology.extents.len() != 1 {
+        return Err(CoreError::UnsupportedInode(
+            "big-pcluster self-encode currently requires exactly one big extent",
+        ));
+    }
+    let origin_extent = topology.extents[0];
+    if origin_extent.physical_blocks < MIN_BIG_PHYSICAL_BLOCKS {
+        return Err(CoreError::UnsupportedInode(
+            "single-extent big-pcluster self-encode requires at least two physical blocks",
+        ));
+    }
+
     let actual = u64::try_from(replacement.len()).map_err(|_| CoreError::ArithmeticOverflow)?;
     if actual != topology.logical_size {
         return Err(CoreError::ReplacementSizeMismatch {
@@ -262,7 +300,7 @@ pub(crate) fn compile_big_lz4(
         });
     }
 
-    let capacity = topology
+    let capacity = origin_extent
         .physical_blocks
         .checked_mul(BLOCK_BYTES)
         .ok_or(CoreError::ArithmeticOverflow)?;
@@ -270,7 +308,7 @@ pub(crate) fn compile_big_lz4(
         lz4::encode(&replacement).map_err(|_| CoreError::CompressionValidationFailed)?;
     if compressed.len() > capacity {
         return Err(CoreError::CompressionDoesNotFit {
-            head_lcn: 0,
+            head_lcn: origin_extent.lcn,
             encoded: compressed.len(),
             capacity,
         });
@@ -297,12 +335,12 @@ pub(crate) fn compile_big_lz4(
         return Err(CoreError::CompressionValidationFailed);
     }
 
-    compile_big_span(
+    compile_big_spans(
         origin_path,
-        topology,
-        topology.pcluster,
-        &span,
-        compressed.len(),
+        &topology,
+        &[origin_extent],
+        vec![span],
+        vec![compressed.len()],
     )
 }
 
@@ -400,47 +438,80 @@ fn compile_blocks(
     })
 }
 
-fn compile_big_span(
+fn compile_big_spans(
     origin_path: &Path,
-    topology: BigTopology,
-    replacement_pcluster: u64,
-    replacement_span: &[u8],
-    encoded_bytes: usize,
+    topology: &BigTopology,
+    replacement_extents: &[BigExtent],
+    replacement_spans: Vec<Vec<u8>>,
+    encoded_bytes: Vec<usize>,
 ) -> Result<CompiledCore, CoreError> {
-    let expected = topology
-        .physical_blocks
-        .checked_mul(BLOCK_BYTES)
-        .ok_or(CoreError::ArithmeticOverflow)?;
-    if replacement_span.len() != expected {
+    if replacement_extents.len() != topology.extents.len()
+        || replacement_spans.len() != topology.extents.len()
+        || encoded_bytes.len() != topology.extents.len()
+    {
         return Err(CoreError::InvalidFilesystem(
-            "big-pcluster replacement span length differs from CBLKCNT footprint",
+            "big-pcluster compiler received inconsistent extent vectors",
         ));
     }
 
+    let expected_shadow_blocks = topology.extents.iter().try_fold(0_usize, |sum, extent| {
+        sum.checked_add(extent.physical_blocks)
+            .ok_or(CoreError::ArithmeticOverflow)
+    })?;
     let mut view = EffectiveBlockStore::open(origin_path, BLOCK_SIZE).map_err(CoreError::View)?;
-    for block_index in 0..topology.physical_blocks {
-        let start = block_index
+    let mut origin_pclusters = Vec::with_capacity(topology.extents.len());
+    let mut replacement_pclusters = Vec::with_capacity(topology.extents.len());
+    let mut head_lclusters = Vec::with_capacity(topology.extents.len());
+
+    for (((origin_extent, replacement_extent), span), _) in topology
+        .extents
+        .iter()
+        .zip(replacement_extents)
+        .zip(replacement_spans)
+        .zip(&encoded_bytes)
+    {
+        if origin_extent.physical_blocks != replacement_extent.physical_blocks {
+            return Err(CoreError::IncompatibleReplacement(
+                "big-pcluster physical-block footprint differs",
+            ));
+        }
+        let expected = origin_extent
+            .physical_blocks
             .checked_mul(BLOCK_BYTES)
             .ok_or(CoreError::ArithmeticOverflow)?;
-        let end = start
-            .checked_add(BLOCK_BYTES)
-            .ok_or(CoreError::ArithmeticOverflow)?;
-        let logical_block = topology
-            .pcluster
-            .checked_add(u64::try_from(block_index).map_err(|_| CoreError::ArithmeticOverflow)?)
-            .ok_or(CoreError::ArithmeticOverflow)?;
-        view.block_mut(logical_block)
-            .map_err(CoreError::View)?
-            .copy_from_slice(
-                replacement_span
-                    .get(start..end)
-                    .ok_or(CoreError::UnexpectedEndOfStructure)?,
-            );
+        if span.len() != expected {
+            return Err(CoreError::InvalidFilesystem(
+                "big-pcluster replacement span length differs from CBLKCNT footprint",
+            ));
+        }
+
+        for block_index in 0..origin_extent.physical_blocks {
+            let start = block_index
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            let end = start
+                .checked_add(BLOCK_BYTES)
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            let logical_block = origin_extent
+                .pcluster
+                .checked_add(u64::try_from(block_index).map_err(|_| CoreError::ArithmeticOverflow)?)
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            view.block_mut(logical_block)
+                .map_err(CoreError::View)?
+                .copy_from_slice(
+                    span.get(start..end)
+                        .ok_or(CoreError::UnexpectedEndOfStructure)?,
+                );
+        }
+        origin_pclusters.push(origin_extent.pcluster);
+        replacement_pclusters.push(replacement_extent.pcluster);
+        head_lclusters.push(origin_extent.lcn);
     }
+
     let compiled = view.finalize().map_err(CoreError::View)?;
-    if compiled.shadow_blocks != topology.physical_blocks {
+    if compiled.shadow_blocks != expected_shadow_blocks {
         return Err(CoreError::InvalidFilesystem(
-            "big-pcluster shadow block count differs from CBLKCNT",
+            "big-pcluster shadow block count differs from recovered CBLKCNT footprints",
         ));
     }
 
@@ -449,10 +520,10 @@ fn compile_big_span(
         shadow: compiled.shadow,
         block_size: compiled.block_size,
         origin_nid: topology.nid,
-        origin_pclusters: vec![topology.pcluster],
-        replacement_pclusters: vec![replacement_pcluster],
-        head_lclusters: vec![0],
-        encoded_bytes: vec![encoded_bytes],
+        origin_pclusters,
+        replacement_pclusters,
+        head_lclusters,
+        encoded_bytes,
         logical_lclusters: topology.logical_lclusters,
         compact_2b_entries: topology.compact_2b_entries,
         shadow_blocks: compiled.shadow_blocks,
@@ -507,11 +578,20 @@ fn validate_big_compatible_topology(
 ) -> Result<(), CoreError> {
     if origin.logical_size != replacement.logical_size
         || origin.logical_lclusters != replacement.logical_lclusters
-        || origin.physical_blocks != replacement.physical_blocks
+        || origin.extents.len() != replacement.extents.len()
     {
         return Err(CoreError::IncompatibleReplacement(
-            "logical size/lcluster count or big-pcluster footprint differs",
+            "logical size/lcluster count or big-pcluster extent count differs",
         ));
+    }
+    for (origin_extent, replacement_extent) in origin.extents.iter().zip(&replacement.extents) {
+        if origin_extent.lcn != replacement_extent.lcn
+            || origin_extent.physical_blocks != replacement_extent.physical_blocks
+        {
+            return Err(CoreError::IncompatibleReplacement(
+                "big-pcluster HEAD/physical-block footprint differs",
+            ));
+        }
     }
     Ok(())
 }
@@ -683,11 +763,11 @@ impl Image {
         }
         let inode = self.read_inode(nid)?;
         let logical_lclusters = validate_target_inode(&inode)?;
-        let physical_blocks =
+        let encoded_physical_blocks =
             usize::try_from(inode.data_word).map_err(|_| CoreError::ArithmeticOverflow)?;
-        if physical_blocks < MIN_BIG_PHYSICAL_BLOCKS {
-            return Err(CoreError::UnsupportedInode(
-                "single-extent big-pcluster mode requires at least two encoded physical blocks",
+        if encoded_physical_blocks == 0 {
+            return Err(CoreError::InvalidFilesystem(
+                "big-pcluster inode reports zero encoded physical blocks",
             ));
         }
 
@@ -704,19 +784,16 @@ impl Image {
         }
 
         let entries = self.read_all_entries(map.ebase, logical_lclusters)?;
-        validate_big_single_extent(&entries, logical_lclusters, physical_blocks)?;
-        let head = entries.first().ok_or(CoreError::InvalidFilesystem(
-            "compact index stream is empty",
-        ))?;
-        validate_block_span(head.base_pblk, physical_blocks, self.bytes)?;
+        let extents = recover_big_extents(&entries, logical_lclusters)?;
+        validate_big_total_physical_blocks(&extents, encoded_physical_blocks)?;
+        validate_big_block_spans(&extents, self.bytes)?;
 
         Ok(BigTopology {
             nid,
             logical_size: inode.size,
             logical_lclusters,
-            pcluster: head.base_pblk,
-            physical_blocks,
             compact_2b_entries: map.regions.compact_2b,
+            extents,
         })
     }
 
@@ -990,57 +1067,193 @@ fn validate_nonheads(
     Ok(())
 }
 
-fn validate_big_single_extent(
+fn recover_big_extents(
     entries: &[CompactEntry],
     total: usize,
-    physical_blocks: usize,
-) -> Result<(), CoreError> {
-    let head = entries.first().ok_or(CoreError::InvalidFilesystem(
-        "compact index stream is empty",
-    ))?;
-    if head.kind != LCLUSTER_HEAD1 || head.low != 0 || head.slot != 0 {
+) -> Result<Vec<BigExtent>, CoreError> {
+    if entries.len() != total {
         return Err(CoreError::InvalidFilesystem(
-            "big-pcluster extent must begin with slot-0 zero-offset HEAD1",
+            "big-pcluster index vector length differs from logical lcluster count",
         ));
     }
-    if total < 2 {
-        return Err(CoreError::UnsupportedInode(
-            "big pcluster needs a following index for CBLKCNT",
+
+    let mut head_lcns = Vec::new();
+    for (lcn, entry) in entries.iter().enumerate() {
+        match entry.kind {
+            LCLUSTER_HEAD1 => {
+                if entry.low != 0 {
+                    return Err(CoreError::UnsupportedInode(
+                        "big-pcluster core requires zero-offset HEAD1 lclusters",
+                    ));
+                }
+                head_lcns.push(lcn);
+            }
+            LCLUSTER_NONHEAD => {}
+            _ => {
+                return Err(CoreError::UnsupportedInode(
+                    "big-pcluster core supports only HEAD1 and NONHEAD entries",
+                ))
+            }
+        }
+    }
+    if head_lcns.first().copied() != Some(0) {
+        return Err(CoreError::InvalidFilesystem(
+            "first big-pcluster extent does not begin at lcluster zero",
         ));
     }
+
+    let mut extents = Vec::with_capacity(head_lcns.len());
+    for (index, &head_lcn) in head_lcns.iter().enumerate() {
+        let next_head = head_lcns.get(index + 1).copied().unwrap_or(total);
+        if next_head <= head_lcn {
+            return Err(CoreError::InvalidFilesystem(
+                "big-pcluster HEAD lclusters are not strictly increasing",
+            ));
+        }
+        let head = *entries
+            .get(head_lcn)
+            .ok_or(CoreError::UnexpectedEndOfStructure)?;
+        let pcluster = reconstruct_big_head_pcluster(entries, head_lcn, head)?;
+        let physical_blocks = validate_big_extent(entries, head_lcn, next_head)?;
+        extents.push(BigExtent {
+            lcn: head_lcn,
+            pcluster,
+            physical_blocks,
+        });
+    }
+    if extents.is_empty() {
+        return Err(CoreError::InvalidFilesystem(
+            "big-pcluster topology contains no HEAD",
+        ));
+    }
+    Ok(extents)
+}
+
+fn reconstruct_big_head_pcluster(
+    entries: &[CompactEntry],
+    lcn: usize,
+    head: CompactEntry,
+) -> Result<u64, CoreError> {
+    let pack_first_lcn = lcn
+        .checked_sub(head.slot)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    let mut slot = isize::try_from(head.slot).map_err(|_| CoreError::ArithmeticOverflow)?;
+    let mut nblk = 0_u64;
+
+    while slot > 0 {
+        slot -= 1;
+        let slot_usize = usize::try_from(slot).map_err(|_| CoreError::ArithmeticOverflow)?;
+        let previous_lcn = pack_first_lcn
+            .checked_add(slot_usize)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let previous = *entries
+            .get(previous_lcn)
+            .ok_or(CoreError::UnexpectedEndOfStructure)?;
+        if previous.kind == LCLUSTER_NONHEAD {
+            if previous.low & D0_CBLKCNT != 0 {
+                slot -= 1;
+                let cblkcnt = u64::from(previous.low & !D0_CBLKCNT);
+                if cblkcnt == 0 {
+                    return Err(CoreError::InvalidFilesystem(
+                        "big-pcluster CBLKCNT records zero physical blocks",
+                    ));
+                }
+                nblk = nblk
+                    .checked_add(cblkcnt)
+                    .ok_or(CoreError::ArithmeticOverflow)?;
+                continue;
+            }
+            if previous.low <= 1 {
+                return Err(CoreError::InvalidFilesystem(
+                    "big-pcluster compact pack contains plain delta0 <= 1",
+                ));
+            }
+            slot -= isize::try_from(previous.low - 2).map_err(|_| CoreError::ArithmeticOverflow)?;
+            continue;
+        }
+        if previous.kind != LCLUSTER_HEAD1 {
+            return Err(CoreError::UnsupportedInode(
+                "big-pcluster physical-address reconstruction encountered unsupported HEAD type",
+            ));
+        }
+        nblk = nblk.checked_add(1).ok_or(CoreError::ArithmeticOverflow)?;
+    }
+
+    head.base_pblk
+        .checked_add(nblk)
+        .ok_or(CoreError::ArithmeticOverflow)
+}
+
+fn validate_big_extent(
+    entries: &[CompactEntry],
+    head_lcn: usize,
+    next_head: usize,
+) -> Result<usize, CoreError> {
+    if next_head == head_lcn + 1 {
+        return Ok(1);
+    }
+    let cblk_lcn = head_lcn
+        .checked_add(1)
+        .ok_or(CoreError::ArithmeticOverflow)?;
     let cblk = entries
-        .get(1)
+        .get(cblk_lcn)
         .ok_or(CoreError::InvalidFilesystem("missing CBLKCNT index"))?;
     if cblk.kind != LCLUSTER_NONHEAD || cblk.low & D0_CBLKCNT == 0 {
         return Err(CoreError::InvalidFilesystem(
-            "first NONHEAD does not carry a CBLKCNT marker",
+            "first NONHEAD after big-pcluster HEAD does not carry CBLKCNT",
         ));
     }
-    let cblkcnt = usize::from(cblk.low & !D0_CBLKCNT);
-    if cblkcnt != physical_blocks {
+    let physical_blocks = usize::from(cblk.low & !D0_CBLKCNT);
+    if physical_blocks == 0 {
         return Err(CoreError::InvalidFilesystem(
-            "CBLKCNT does not match inode encoded physical-block count",
+            "big-pcluster CBLKCNT records zero physical blocks",
         ));
     }
-    for (lcn, entry) in entries.iter().enumerate().skip(2) {
+
+    for lcn in cblk_lcn + 1..next_head {
+        let entry = entries.get(lcn).ok_or(CoreError::InvalidFilesystem(
+            "missing big-pcluster NONHEAD entry",
+        ))?;
         if entry.kind != LCLUSTER_NONHEAD || entry.low & D0_CBLKCNT != 0 {
             return Err(CoreError::InvalidFilesystem(
                 "big-pcluster extent contains an unexpected entry after CBLKCNT",
             ));
         }
         let expected = if entry.slot + 1 == entry.slots {
-            total
+            next_head
                 .checked_sub(lcn)
                 .ok_or(CoreError::ArithmeticOverflow)?
         } else {
-            lcn
+            lcn.checked_sub(head_lcn)
+                .ok_or(CoreError::ArithmeticOverflow)?
         };
+        if expected >= usize::from(D0_CBLKCNT) {
+            return Err(CoreError::UnsupportedInode(
+                "big-pcluster NONHEAD distance exceeds compact delta field",
+            ));
+        }
         let expected = u16::try_from(expected).map_err(|_| CoreError::ArithmeticOverflow)?;
         if entry.low != expected {
             return Err(CoreError::InvalidFilesystem(
-                "NONHEAD lookback/lookahead disagrees with one-head big extent",
+                "NONHEAD lookback/lookahead disagrees with recovered big-pcluster HEAD topology",
             ));
         }
+    }
+    Ok(physical_blocks)
+}
+
+fn validate_big_total_physical_blocks(
+    extents: &[BigExtent],
+    encoded_physical_blocks: usize,
+) -> Result<(), CoreError> {
+    let recovered = extents.iter().try_fold(0_usize, |sum, extent| {
+        sum.checked_add(extent.physical_blocks)
+            .ok_or(CoreError::ArithmeticOverflow)
+    })?;
+    if recovered != encoded_physical_blocks {
+        return Err(CoreError::InvalidFilesystem(
+            "recovered CBLKCNT total does not match inode encoded physical-block count",
+        ));
     }
     Ok(())
 }
@@ -1066,16 +1279,29 @@ fn validate_head_blocks(heads: &[Head], image_bytes: u64) -> Result<(), CoreErro
     Ok(())
 }
 
-fn validate_block_span(block: u64, count: usize, image_bytes: u64) -> Result<(), CoreError> {
-    let count = u64::try_from(count).map_err(|_| CoreError::ArithmeticOverflow)?;
-    let end = block
-        .checked_add(count)
-        .ok_or(CoreError::ArithmeticOverflow)?;
+fn validate_big_block_spans(extents: &[BigExtent], image_bytes: u64) -> Result<(), CoreError> {
     let block_count = image_bytes / u64::from(BLOCK_SIZE);
-    if end > block_count {
-        return Err(CoreError::InvalidFilesystem(
-            "big pcluster extends beyond image",
-        ));
+    let mut previous_end = None;
+    for extent in extents {
+        let count =
+            u64::try_from(extent.physical_blocks).map_err(|_| CoreError::ArithmeticOverflow)?;
+        let end = extent
+            .pcluster
+            .checked_add(count)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        if end > block_count {
+            return Err(CoreError::InvalidFilesystem(
+                "big pcluster extends beyond image",
+            ));
+        }
+        if let Some(previous_end) = previous_end {
+            if extent.pcluster < previous_end {
+                return Err(CoreError::InvalidFilesystem(
+                    "big-pcluster physical spans overlap or move backwards",
+                ));
+            }
+        }
+        previous_end = Some(end);
     }
     Ok(())
 }
@@ -1482,9 +1708,8 @@ mod tests {
         assert_eq!((D0_CBLKCNT | 2) & !D0_CBLKCNT, 2);
     }
 
-    #[test]
-    fn one_head_two_block_extent_accepts_cblkcnt() {
-        let entries = vec![
+    fn three_lcluster_big_entries(physical_blocks: u16) -> Vec<CompactEntry> {
+        vec![
             CompactEntry {
                 kind: LCLUSTER_HEAD1,
                 low: 0,
@@ -1494,7 +1719,7 @@ mod tests {
             },
             CompactEntry {
                 kind: LCLUSTER_NONHEAD,
-                low: D0_CBLKCNT | 2,
+                low: D0_CBLKCNT | physical_blocks,
                 slot: 1,
                 slots: 2,
                 base_pblk: 100,
@@ -1506,71 +1731,87 @@ mod tests {
                 slots: 2,
                 base_pblk: 102,
             },
-        ];
-        assert!(validate_big_single_extent(&entries, 3, 2).is_ok());
+        ]
+    }
+
+    #[test]
+    fn one_head_two_block_extent_accepts_cblkcnt() {
+        let extents = recover_big_extents(&three_lcluster_big_entries(2), 3).unwrap();
+        assert_eq!(
+            extents,
+            vec![BigExtent {
+                lcn: 0,
+                pcluster: 100,
+                physical_blocks: 2,
+            }]
+        );
     }
 
     #[test]
     fn variable_cblkcnt_accepts_three_and_four_physical_blocks() {
         for physical_blocks in [3_u16, 4_u16] {
-            let entries = vec![
-                CompactEntry {
-                    kind: LCLUSTER_HEAD1,
-                    low: 0,
-                    slot: 0,
-                    slots: 2,
-                    base_pblk: 100,
-                },
-                CompactEntry {
-                    kind: LCLUSTER_NONHEAD,
-                    low: D0_CBLKCNT | physical_blocks,
-                    slot: 1,
-                    slots: 2,
-                    base_pblk: 100,
-                },
-                CompactEntry {
-                    kind: LCLUSTER_NONHEAD,
-                    low: 2,
-                    slot: 0,
-                    slots: 2,
-                    base_pblk: 102,
-                },
-            ];
-            assert!(validate_big_single_extent(&entries, 3, usize::from(physical_blocks)).is_ok());
+            let extents =
+                recover_big_extents(&three_lcluster_big_entries(physical_blocks), 3).unwrap();
+            assert_eq!(extents[0].physical_blocks, usize::from(physical_blocks));
         }
     }
 
     #[test]
-    fn cblkcnt_must_match_inode_physical_block_count() {
-        let entries = vec![
-            CompactEntry {
-                kind: LCLUSTER_HEAD1,
-                low: 0,
-                slot: 0,
-                slots: 2,
-                base_pblk: 100,
-            },
-            CompactEntry {
-                kind: LCLUSTER_NONHEAD,
-                low: D0_CBLKCNT | 3,
-                slot: 1,
-                slots: 2,
-                base_pblk: 100,
-            },
-            CompactEntry {
-                kind: LCLUSTER_NONHEAD,
-                low: 2,
-                slot: 0,
-                slots: 2,
-                base_pblk: 102,
-            },
-        ];
+    fn cblkcnt_total_must_match_inode_physical_block_count() {
+        let extents = recover_big_extents(&three_lcluster_big_entries(3), 3).unwrap();
         assert!(matches!(
-            validate_big_single_extent(&entries, 3, 4),
+            validate_big_total_physical_blocks(&extents, 4),
             Err(CoreError::InvalidFilesystem(
-                "CBLKCNT does not match inode encoded physical-block count"
+                "recovered CBLKCNT total does not match inode encoded physical-block count"
             ))
         ));
+    }
+
+    #[test]
+    fn later_big_head_reconstruction_accumulates_prior_cblkcnt() {
+        let mut entries = Vec::new();
+        for slot in 0..9 {
+            let entry = match slot {
+                0 | 8 => CompactEntry {
+                    kind: LCLUSTER_HEAD1,
+                    low: 0,
+                    slot,
+                    slots: 16,
+                    base_pblk: 100,
+                },
+                1 => CompactEntry {
+                    kind: LCLUSTER_NONHEAD,
+                    low: D0_CBLKCNT | 3,
+                    slot,
+                    slots: 16,
+                    base_pblk: 100,
+                },
+                _ => CompactEntry {
+                    kind: LCLUSTER_NONHEAD,
+                    low: u16::try_from(slot).unwrap(),
+                    slot,
+                    slots: 16,
+                    base_pblk: 100,
+                },
+            };
+            entries.push(entry);
+        }
+        let extents = recover_big_extents(&entries, entries.len()).unwrap();
+        assert_eq!(
+            extents,
+            vec![
+                BigExtent {
+                    lcn: 0,
+                    pcluster: 100,
+                    physical_blocks: 3,
+                },
+                BigExtent {
+                    lcn: 8,
+                    pcluster: 103,
+                    physical_blocks: 1,
+                },
+            ]
+        );
     }
 
     #[test]

@@ -4,6 +4,8 @@ use crate::compact_index::shared_core::{self, CompiledCore, CoreError};
 use loom_map::LoomMap;
 use std::path::Path;
 
+const BLOCK_BYTES: usize = 4096;
+
 pub type MultiIndexError = CoreError;
 
 #[derive(Debug)]
@@ -24,9 +26,9 @@ pub struct CompiledMultiSwap {
     pub shadow_blocks: usize,
 }
 
-/// Compiles a compact EROFS oracle replacement over any supported one-block-per-extent
-/// topology. The unified compact core handles both the historical single-pcluster shape and
-/// the Stage 16+ multi-pcluster shape.
+/// Compiles a compact EROFS oracle replacement over any supported topology. The unified
+/// compact core dispatches ordinary one-block-per-extent layouts and big-pcluster layouts,
+/// including Stage 23 multi-extent big pclusters.
 ///
 /// # Errors
 /// Returns [`MultiIndexError`] for malformed/unsupported topology, incompatible replacement
@@ -36,7 +38,7 @@ pub fn compile_multi_pcluster_swap(
     target_path: &str,
     replacement_image_path: &Path,
 ) -> Result<CompiledMultiSwap, MultiIndexError> {
-    from_core(shared_core::compile_oracle(
+    from_core(shared_core::compile_multi_oracle(
         origin_path,
         target_path,
         replacement_image_path,
@@ -44,7 +46,8 @@ pub fn compile_multi_pcluster_swap(
 }
 
 impl CompiledMultiSwap {
-    /// Self-encodes all recovered logical extents through the unified compact core.
+    /// Self-encodes all recovered ordinary compact extents through the unified compact core.
+    /// Multi-extent big-pcluster self-encoding remains outside Stage 23.
     ///
     /// # Errors
     /// Returns [`MultiIndexError`] for malformed/unsupported topology, replacement-size
@@ -81,10 +84,23 @@ fn from_core(compiled: CompiledCore) -> Result<CompiledMultiSwap, MultiIndexErro
     if physical_pclusters != compiled.replacement_pclusters.len()
         || physical_pclusters != compiled.head_lclusters.len()
         || physical_pclusters != compiled.encoded_bytes.len()
-        || physical_pclusters != compiled.shadow_blocks
     {
         return Err(CoreError::InvalidFilesystem(
             "compact adapter received inconsistent compiled vectors",
+        ));
+    }
+
+    let expected_shadow_blocks =
+        compiled
+            .encoded_bytes
+            .iter()
+            .try_fold(0_usize, |sum, bytes| {
+                sum.checked_add(bytes.div_ceil(BLOCK_BYTES))
+                    .ok_or(CoreError::ArithmeticOverflow)
+            })?;
+    if expected_shadow_blocks != compiled.shadow_blocks {
+        return Err(CoreError::InvalidFilesystem(
+            "compiled shadow block count does not match encoded extent footprints",
         ));
     }
 
