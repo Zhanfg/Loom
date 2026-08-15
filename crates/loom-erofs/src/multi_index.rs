@@ -46,8 +46,8 @@ pub fn compile_multi_pcluster_swap(
 }
 
 impl CompiledMultiSwap {
-    /// Self-encodes all recovered ordinary compact extents through the unified compact core.
-    /// Multi-extent big-pcluster self-encoding remains outside Stage 23.
+    /// Self-encodes every recovered compact extent through the unified compact core,
+    /// including Stage 24 multi-extent big-pcluster layouts.
     ///
     /// # Errors
     /// Returns [`MultiIndexError`] for malformed/unsupported topology, replacement-size
@@ -57,7 +57,7 @@ impl CompiledMultiSwap {
         target_path: &str,
         replacement_path: &Path,
     ) -> Result<Self, MultiIndexError> {
-        from_core(shared_core::compile_lz4(
+        from_core(shared_core::compile_multi_lz4(
             origin_path,
             target_path,
             replacement_path,
