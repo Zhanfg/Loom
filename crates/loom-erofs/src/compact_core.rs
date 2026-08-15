@@ -25,6 +25,7 @@ const DATA_FLAT_PLAIN: u8 = 0;
 const DATA_FLAT_INLINE: u8 = 2;
 const DATA_COMPRESSED_COMPACT: u8 = 3;
 const MAP_HEADER_SIZE: u64 = 8;
+const LCLUSTER_PLAIN: u16 = 0;
 const LCLUSTER_HEAD1: u16 = 1;
 const LCLUSTER_NONHEAD: u16 = 2;
 const LCLUSTER_TYPE_MASK: u16 = 3;
@@ -67,6 +68,7 @@ struct Topology {
     advise: u16,
     logical_lclusters: usize,
     compact_2b_entries: usize,
+    eof_plain_clusterofs: Option<usize>,
     heads: Vec<Head>,
 }
 
@@ -83,6 +85,7 @@ struct BigTopology {
     logical_size: u64,
     logical_lclusters: usize,
     compact_2b_entries: usize,
+    eof_plain_clusterofs: Option<usize>,
     extents: Vec<BigExtent>,
 }
 
@@ -221,22 +224,25 @@ pub(crate) fn compile_lz4(
     let mut encoded_blocks = Vec::with_capacity(topology.heads.len());
     let mut encoded_bytes = Vec::with_capacity(topology.heads.len());
     for (index, head) in topology.heads.iter().enumerate() {
-        let next_lcn = topology
-            .heads
-            .get(index + 1)
-            .map_or(topology.logical_lclusters, |next| next.lcn);
         let start = head
             .lcn
             .checked_mul(BLOCK_BYTES)
             .ok_or(CoreError::ArithmeticOverflow)?;
-        let end = next_lcn
-            .checked_mul(BLOCK_BYTES)
-            .ok_or(CoreError::ArithmeticOverflow)?;
+        let end = if let Some(next) = topology.heads.get(index + 1) {
+            next.lcn
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(CoreError::ArithmeticOverflow)?
+        } else {
+            replacement.len()
+        };
+        if start >= end || end > replacement.len() {
+            return Err(CoreError::InvalidFilesystem(
+                "recovered logical extent lies beyond replacement payload",
+            ));
+        }
         let extent = replacement
             .get(start..end)
-            .ok_or(CoreError::InvalidFilesystem(
-                "recovered logical extent lies beyond replacement payload",
-            ))?;
+            .ok_or(CoreError::UnexpectedEndOfStructure)?;
         let (block, encoded_len) = encode_extent(head.lcn, extent)?;
         encoded_blocks.push(block);
         encoded_bytes.push(encoded_len);
@@ -308,22 +314,25 @@ pub(crate) fn compile_big_lz4(
     let mut encoded_spans = Vec::with_capacity(topology.extents.len());
     let mut encoded_bytes = Vec::with_capacity(topology.extents.len());
     for (index, extent) in topology.extents.iter().enumerate() {
-        let next_lcn = topology
-            .extents
-            .get(index + 1)
-            .map_or(topology.logical_lclusters, |next| next.lcn);
         let start = extent
             .lcn
             .checked_mul(BLOCK_BYTES)
             .ok_or(CoreError::ArithmeticOverflow)?;
-        let end = next_lcn
-            .checked_mul(BLOCK_BYTES)
-            .ok_or(CoreError::ArithmeticOverflow)?;
+        let end = if let Some(next) = topology.extents.get(index + 1) {
+            next.lcn
+                .checked_mul(BLOCK_BYTES)
+                .ok_or(CoreError::ArithmeticOverflow)?
+        } else {
+            replacement.len()
+        };
+        if start >= end || end > replacement.len() {
+            return Err(CoreError::InvalidFilesystem(
+                "recovered big logical extent lies beyond replacement payload",
+            ));
+        }
         let logical_extent = replacement
             .get(start..end)
-            .ok_or(CoreError::InvalidFilesystem(
-                "recovered big logical extent lies beyond replacement payload",
-            ))?;
+            .ok_or(CoreError::UnexpectedEndOfStructure)?;
         let capacity = extent
             .physical_blocks
             .checked_mul(BLOCK_BYTES)
@@ -582,6 +591,11 @@ fn validate_compatible_topology(
             "logical compact-index lengths differ",
         ));
     }
+    if origin.eof_plain_clusterofs != replacement.eof_plain_clusterofs {
+        return Err(CoreError::IncompatibleReplacement(
+            "partial-EOF PLAIN sentinel offsets differ",
+        ));
+    }
     if origin.heads.len() != replacement.heads.len() {
         return Err(CoreError::IncompatibleReplacement(
             "physical pcluster counts differ",
@@ -606,10 +620,11 @@ fn validate_big_compatible_topology(
 ) -> Result<(), CoreError> {
     if origin.logical_size != replacement.logical_size
         || origin.logical_lclusters != replacement.logical_lclusters
+        || origin.eof_plain_clusterofs != replacement.eof_plain_clusterofs
         || origin.extents.len() != replacement.extents.len()
     {
         return Err(CoreError::IncompatibleReplacement(
-            "logical size/lcluster count or big-pcluster extent count differs",
+            "logical size/lcluster count/EOF sentinel or big-pcluster extent count differs",
         ));
     }
     for (origin_extent, replacement_extent) in origin.extents.iter().zip(&replacement.extents) {
@@ -758,13 +773,16 @@ impl Image {
         }
 
         let entries = self.read_all_entries(map.ebase, logical_lclusters)?;
-        let heads = self.recover_heads(map.ebase, logical_lclusters, &entries)?;
+        let eof_plain_clusterofs =
+            validate_eof_plain_sentinel(&entries, logical_lclusters, inode.size)?;
+        let heads =
+            self.recover_heads(map.ebase, logical_lclusters, &entries, eof_plain_clusterofs)?;
         if heads.len() != compressed_blocks {
             return Err(CoreError::InvalidFilesystem(
                 "compressed block count does not match recovered HEAD count",
             ));
         }
-        validate_nonheads(&entries, &heads, logical_lclusters)?;
+        validate_nonheads(&entries, &heads, logical_lclusters, eof_plain_clusterofs)?;
         validate_head_blocks(&heads, self.bytes)?;
 
         Ok(Topology {
@@ -774,6 +792,7 @@ impl Image {
             advise: map.advise,
             logical_lclusters,
             compact_2b_entries: map.regions.compact_2b,
+            eof_plain_clusterofs,
             heads,
         })
     }
@@ -807,7 +826,9 @@ impl Image {
         }
 
         let entries = self.read_all_entries(map.ebase, logical_lclusters)?;
-        let extents = recover_big_extents(&entries, logical_lclusters)?;
+        let eof_plain_clusterofs =
+            validate_eof_plain_sentinel(&entries, logical_lclusters, inode.size)?;
+        let extents = recover_big_extents(&entries, logical_lclusters, eof_plain_clusterofs)?;
         validate_big_total_physical_blocks(&extents, encoded_physical_blocks)?;
         validate_big_block_spans(&extents, self.bytes)?;
 
@@ -816,6 +837,7 @@ impl Image {
             logical_size: inode.size,
             logical_lclusters,
             compact_2b_entries: map.regions.compact_2b,
+            eof_plain_clusterofs,
             extents,
         })
     }
@@ -865,6 +887,7 @@ impl Image {
         ebase: u64,
         total: usize,
         entries: &[CompactEntry],
+        eof_plain_clusterofs: Option<usize>,
     ) -> Result<Vec<Head>, CoreError> {
         let mut heads = Vec::new();
         for (lcn, entry) in entries.iter().enumerate() {
@@ -878,12 +901,20 @@ impl Image {
                     let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;
                     heads.push(Head { lcn, pcluster });
                 }
-                LCLUSTER_NONHEAD => {}
-                _ => {
-                    return Err(CoreError::UnsupportedInode(
-                        "compact core supports only HEAD1 and NONHEAD entries",
-                    ))
+                LCLUSTER_PLAIN => {
+                    let expected = eof_plain_clusterofs.ok_or(CoreError::UnsupportedInode(
+                        "ordinary compact PLAIN is supported only as a partial-EOF sentinel",
+                    ))?;
+                    if lcn + 1 != total || usize::from(entry.low) != expected {
+                        return Err(CoreError::InvalidFilesystem(
+                            "ordinary compact PLAIN does not match the validated EOF sentinel",
+                        ));
+                    }
                 }
+                LCLUSTER_NONHEAD => {}
+                _ => return Err(CoreError::UnsupportedInode(
+                    "compact core supports only HEAD1, NONHEAD, and a partial-EOF PLAIN sentinel",
+                )),
             }
         }
         if heads.first().map(|head| head.lcn) != Some(0) {
@@ -1032,21 +1063,56 @@ fn validate_target_inode(inode: &Inode) -> Result<usize, CoreError> {
             "compact core requires EROFS_INODE_COMPRESSED_COMPACT",
         ));
     }
-    if inode.size < u64::from(BLOCK_SIZE) * 2 || inode.size % u64::from(BLOCK_SIZE) != 0 {
+    let logical_lclusters = div_ceil(inode.size, u64::from(BLOCK_SIZE))?;
+    if logical_lclusters < 2 {
         return Err(CoreError::UnsupportedInode(
-            "compact core requires a whole-block file of at least two lclusters",
+            "compact core requires at least two logical clusters",
         ));
     }
-    usize::try_from(inode.size / u64::from(BLOCK_SIZE)).map_err(|_| CoreError::ArithmeticOverflow)
+    usize::try_from(logical_lclusters).map_err(|_| CoreError::ArithmeticOverflow)
+}
+
+fn validate_eof_plain_sentinel(
+    entries: &[CompactEntry],
+    total: usize,
+    logical_size: u64,
+) -> Result<Option<usize>, CoreError> {
+    if entries.len() != total || total == 0 {
+        return Err(CoreError::InvalidFilesystem(
+            "compact index vector length differs from logical lcluster count",
+        ));
+    }
+    let remainder = usize::try_from(logical_size % u64::from(BLOCK_SIZE))
+        .map_err(|_| CoreError::ArithmeticOverflow)?;
+    if remainder == 0 {
+        return Ok(None);
+    }
+    let eof = entries.last().ok_or(CoreError::UnexpectedEndOfStructure)?;
+    if eof.kind != LCLUSTER_PLAIN || usize::from(eof.low) != remainder {
+        return Err(CoreError::InvalidFilesystem(
+            "partial compact file lacks the expected PLAIN EOF sentinel",
+        ));
+    }
+    Ok(Some(remainder))
 }
 
 fn validate_nonheads(
     entries: &[CompactEntry],
     heads: &[Head],
     total: usize,
+    eof_plain_clusterofs: Option<usize>,
 ) -> Result<(), CoreError> {
     for (head_index, head) in heads.iter().enumerate() {
-        let next_head = heads.get(head_index + 1).map_or(total, |next| next.lcn);
+        let next_head = heads.get(head_index + 1).map_or_else(
+            || {
+                if eof_plain_clusterofs.is_some() {
+                    total.saturating_sub(1)
+                } else {
+                    total
+                }
+            },
+            |next| next.lcn,
+        );
         if next_head <= head.lcn {
             return Err(CoreError::InvalidFilesystem(
                 "compressed HEAD lclusters are not strictly increasing",
@@ -1088,6 +1154,7 @@ fn validate_nonheads(
 fn recover_big_extents(
     entries: &[CompactEntry],
     total: usize,
+    eof_plain_clusterofs: Option<usize>,
 ) -> Result<Vec<BigExtent>, CoreError> {
     if entries.len() != total {
         return Err(CoreError::InvalidFilesystem(
@@ -1106,12 +1173,20 @@ fn recover_big_extents(
                 }
                 head_lcns.push(lcn);
             }
-            LCLUSTER_NONHEAD => {}
-            _ => {
-                return Err(CoreError::UnsupportedInode(
-                    "big-pcluster core supports only HEAD1 and NONHEAD entries",
-                ))
+            LCLUSTER_PLAIN => {
+                let expected = eof_plain_clusterofs.ok_or(CoreError::UnsupportedInode(
+                    "big-pcluster PLAIN is supported only as a partial-EOF sentinel",
+                ))?;
+                if lcn + 1 != total || usize::from(entry.low) != expected {
+                    return Err(CoreError::InvalidFilesystem(
+                        "big-pcluster PLAIN does not match the validated EOF sentinel",
+                    ));
+                }
             }
+            LCLUSTER_NONHEAD => {}
+            _ => return Err(CoreError::UnsupportedInode(
+                "big-pcluster core supports only HEAD1, NONHEAD, and a partial-EOF PLAIN sentinel",
+            )),
         }
     }
     if head_lcns.first().copied() != Some(0) {
@@ -1122,7 +1197,13 @@ fn recover_big_extents(
 
     let mut extents = Vec::with_capacity(head_lcns.len());
     for (index, &head_lcn) in head_lcns.iter().enumerate() {
-        let next_head = head_lcns.get(index + 1).copied().unwrap_or(total);
+        let next_head = head_lcns.get(index + 1).copied().unwrap_or_else(|| {
+            if eof_plain_clusterofs.is_some() {
+                total.saturating_sub(1)
+            } else {
+                total
+            }
+        });
         if next_head <= head_lcn {
             return Err(CoreError::InvalidFilesystem(
                 "big-pcluster HEAD lclusters are not strictly increasing",
@@ -1691,6 +1772,7 @@ mod tests {
             advise: ADVISE_COMPACTED_2B,
             logical_lclusters: 2,
             compact_2b_entries: 0,
+            eof_plain_clusterofs: None,
             heads: vec![Head {
                 lcn: 0,
                 pcluster: 10,
@@ -1701,6 +1783,36 @@ mod tests {
         assert!(validate_compatible_topology(&single, &relocated).is_ok());
     }
 
+    #[test]
+    fn partial_eof_plain_is_a_sentinel_not_a_data_head() {
+        let mut entries = vec![
+            CompactEntry {
+                kind: LCLUSTER_HEAD1,
+                low: 0,
+                slot: 0,
+                slots: 2,
+                base_pblk: 10,
+            },
+            CompactEntry {
+                kind: LCLUSTER_PLAIN,
+                low: 3973,
+                slot: 1,
+                slots: 2,
+                base_pblk: 10,
+            },
+        ];
+        assert_eq!(
+            validate_eof_plain_sentinel(&entries, 2, 4096 + 3973).unwrap(),
+            Some(3973)
+        );
+        entries[1].low = 3972;
+        assert!(matches!(
+            validate_eof_plain_sentinel(&entries, 2, 4096 + 3973),
+            Err(CoreError::InvalidFilesystem(
+                "partial compact file lacks the expected PLAIN EOF sentinel"
+            ))
+        ));
+    }
     #[test]
     fn later_extent_codec_failure_happens_before_view_construction() {
         let good = vec![b'Z'; 32768];
@@ -1754,7 +1866,7 @@ mod tests {
 
     #[test]
     fn one_head_two_block_extent_accepts_cblkcnt() {
-        let extents = recover_big_extents(&three_lcluster_big_entries(2), 3).unwrap();
+        let extents = recover_big_extents(&three_lcluster_big_entries(2), 3, None).unwrap();
         assert_eq!(
             extents,
             vec![BigExtent {
@@ -1769,14 +1881,14 @@ mod tests {
     fn variable_cblkcnt_accepts_three_and_four_physical_blocks() {
         for physical_blocks in [3_u16, 4_u16] {
             let extents =
-                recover_big_extents(&three_lcluster_big_entries(physical_blocks), 3).unwrap();
+                recover_big_extents(&three_lcluster_big_entries(physical_blocks), 3, None).unwrap();
             assert_eq!(extents[0].physical_blocks, usize::from(physical_blocks));
         }
     }
 
     #[test]
     fn cblkcnt_total_must_match_inode_physical_block_count() {
-        let extents = recover_big_extents(&three_lcluster_big_entries(3), 3).unwrap();
+        let extents = recover_big_extents(&three_lcluster_big_entries(3), 3, None).unwrap();
         assert!(matches!(
             validate_big_total_physical_blocks(&extents, 4),
             Err(CoreError::InvalidFilesystem(
@@ -1814,7 +1926,7 @@ mod tests {
             };
             entries.push(entry);
         }
-        let extents = recover_big_extents(&entries, entries.len()).unwrap();
+        let extents = recover_big_extents(&entries, entries.len(), None).unwrap();
         assert_eq!(
             extents,
             vec![
@@ -1832,6 +1944,20 @@ mod tests {
         );
     }
 
+    #[test]
+    fn big_partial_eof_plain_is_not_a_data_extent() {
+        let mut entries = three_lcluster_big_entries(2);
+        entries.push(CompactEntry {
+            kind: LCLUSTER_PLAIN,
+            low: 3973,
+            slot: 1,
+            slots: 2,
+            base_pblk: 102,
+        });
+        let extents = recover_big_extents(&entries, 4, Some(3973)).unwrap();
+        assert_eq!(extents.len(), 1);
+        assert_eq!(extents[0].physical_blocks, 2);
+    }
     #[test]
     fn eight_kib_0padding_span_round_trips() {
         let mut input = vec![b'P'; 32768];
