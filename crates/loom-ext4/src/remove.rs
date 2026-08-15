@@ -115,10 +115,7 @@ pub fn compile_remove_file(
 
 impl Ext4Image {
     #[allow(clippy::too_many_lines)] // one explicit immutable ext4 metadata transaction
-    fn compile_remove_file(
-        &mut self,
-        target_path: &str,
-    ) -> Result<CompiledRemoveFile, Ext4Error> {
+    fn compile_remove_file(&mut self, target_path: &str) -> Result<CompiledRemoveFile, Ext4Error> {
         let (parent_path, name) = split_parent(target_path)?;
         let inode_number = self.resolve_path(target_path)?;
         let target_inode = self.read_inode(inode_number)?;
@@ -163,8 +160,16 @@ impl Ext4Image {
             metadata.first_data_block,
             metadata.blocks_per_group,
         )?;
-        require_bitmap_set(&group.inode_bitmap, inode_bit, "target inode bit is already free")?;
-        require_bitmap_set(&group.block_bitmap, block_bit, "target data block is already free")?;
+        require_bitmap_set(
+            &group.inode_bitmap,
+            inode_bit,
+            "target inode bit is already free",
+        )?;
+        require_bitmap_set(
+            &group.block_bitmap,
+            block_bit,
+            "target data block is already free",
+        )?;
         bitmap_clear(&mut group.inode_bitmap, inode_bit)?;
         bitmap_clear(&mut group.block_bitmap, block_bit)?;
 
@@ -229,11 +234,9 @@ impl Ext4Image {
             &superblock_shadow,
         )?;
 
-        let map = LoomMap::from_replacements(
-            SectorCount(self.image_bytes / SECTOR_SIZE),
-            &replacements,
-        )
-        .map_err(Ext4Error::Map)?;
+        let map =
+            LoomMap::from_replacements(SectorCount(self.image_bytes / SECTOR_SIZE), &replacements)
+                .map_err(Ext4Error::Map)?;
         let block_size = usize::try_from(self.superblock.block_size)
             .map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let shadow_blocks = shadow.len() / block_size;
@@ -292,17 +295,20 @@ impl Ext4Image {
         metadata: &FsMetadata,
     ) -> Result<GroupState, Ext4Error> {
         let descriptor_size = usize::from(self.superblock.descriptor_size);
-        let descriptor_start_block: u64 = if self.superblock.block_size == 1024 { 2 } else { 1 };
+        let descriptor_start_block: u64 = if self.superblock.block_size == 1024 {
+            2
+        } else {
+            1
+        };
         let descriptor_byte_offset = u64::from(group)
             .checked_mul(u64::from(self.superblock.descriptor_size))
             .ok_or(Ext4Error::ArithmeticOverflow)?;
         let descriptor_block = descriptor_start_block
             .checked_add(descriptor_byte_offset / u64::from(self.superblock.block_size))
             .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let descriptor_offset = usize::try_from(
-            descriptor_byte_offset % u64::from(self.superblock.block_size),
-        )
-        .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let descriptor_offset =
+            usize::try_from(descriptor_byte_offset % u64::from(self.superblock.block_size))
+                .map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let descriptor_end = descriptor_offset
             .checked_add(descriptor_size)
             .ok_or(Ext4Error::ArithmeticOverflow)?;
@@ -369,16 +375,8 @@ impl Ext4Image {
             GD_INODE_BITMAP_CSUM_HI_END,
         )?;
 
-        let free_blocks = descriptor_u32_count(
-            &descriptor,
-            GD_FREE_BLOCKS_LO,
-            GD_FREE_BLOCKS_HI,
-        )?;
-        let free_inodes = descriptor_u32_count(
-            &descriptor,
-            GD_FREE_INODES_LO,
-            GD_FREE_INODES_HI,
-        )?;
+        let free_blocks = descriptor_u32_count(&descriptor, GD_FREE_BLOCKS_LO, GD_FREE_BLOCKS_HI)?;
+        let free_inodes = descriptor_u32_count(&descriptor, GD_FREE_INODES_LO, GD_FREE_INODES_HI)?;
         Ok(GroupState {
             group,
             descriptor_block,
@@ -431,8 +429,8 @@ impl Ext4Image {
         let table_block = table
             .checked_add(byte_offset / block_size)
             .ok_or(Ext4Error::ArithmeticOverflow)?;
-        let inode_offset = usize::try_from(byte_offset % block_size)
-            .map_err(|_| Ext4Error::ArithmeticOverflow)?;
+        let inode_offset =
+            usize::try_from(byte_offset % block_size).map_err(|_| Ext4Error::ArithmeticOverflow)?;
         let inode_size = usize::from(self.superblock.inode_size);
         let end = inode_offset
             .checked_add(inode_size)
@@ -583,13 +581,13 @@ fn block_group_for(
     first_data_block: u64,
     blocks_per_group: u32,
 ) -> Result<u32, Ext4Error> {
-    let relative = physical_block
-        .checked_sub(first_data_block)
-        .ok_or(Ext4Error::InvalidFilesystem(
-            "data block precedes first_data_block",
-        ))?;
-    u32::try_from(relative / u64::from(blocks_per_group))
-        .map_err(|_| Ext4Error::ArithmeticOverflow)
+    let relative =
+        physical_block
+            .checked_sub(first_data_block)
+            .ok_or(Ext4Error::InvalidFilesystem(
+                "data block precedes first_data_block",
+            ))?;
+    u32::try_from(relative / u64::from(blocks_per_group)).map_err(|_| Ext4Error::ArithmeticOverflow)
 }
 
 fn block_bit_in_group(
