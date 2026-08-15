@@ -2,7 +2,7 @@
 
 use loom_ext4::{
     compile_create_file, compile_grow_with_block_allocation, compile_remove_file,
-    compile_resize_within_allocation, compile_same_size_replacement,
+    compile_resize_within_allocation, compile_same_size_replacement, compile_selinux_xattr,
 };
 use loom_map::LoomMap;
 use loom_types::{Sector, SectorCount};
@@ -34,6 +34,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         "ext4-grow" => command_ext4_grow(&mut args)?,
         "ext4-create" => command_ext4_create(&mut args)?,
         "ext4-remove" => command_ext4_remove(&mut args)?,
+        "ext4-selinux" => command_ext4_selinux(&mut args)?,
         "help" | "--help" | "-h" => print_usage(),
         other => return Err(format!("unknown command {other:?}").into()),
     }
@@ -246,6 +247,38 @@ fn command_ext4_remove(args: &mut impl Iterator<Item = String>) -> Result<(), Bo
     Ok(())
 }
 
+fn command_ext4_selinux(args: &mut impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
+    let origin_image = required(args, "origin ext4 image")?;
+    let target_path = required(args, "target path")?;
+    let value_file = required(args, "SELinux context bytes file")?;
+    let shadow_output = required(args, "shadow pack output")?;
+    let origin_device = required(args, "origin block device")?;
+    let shadow_device = required(args, "shadow block device")?;
+    let table_output = required(args, "dm table output")?;
+    ensure_no_extra_args(args)?;
+
+    let compiled = compile_selinux_xattr(
+        Path::new(&origin_image),
+        &target_path,
+        Path::new(&value_file),
+    )?;
+    fs::write(&shadow_output, &compiled.shadow)?;
+    let table = compiled
+        .map
+        .to_dm_linear_table(&origin_device, &shadow_device)?;
+    fs::write(&table_output, table)?;
+
+    println!(
+        "ext4 selinux compiled: inode={} block_size={} value_bytes={} shadow_blocks={} shadow_bytes={}",
+        compiled.inode,
+        compiled.block_size,
+        compiled.value_bytes,
+        compiled.shadow_blocks,
+        compiled.shadow.len()
+    );
+    Ok(())
+}
+
 fn required(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, Box<dyn Error>> {
     args.next()
         .ok_or_else(|| format!("missing required argument: {name}").into())
@@ -272,7 +305,7 @@ fn parse_usize(value: &str, name: &str) -> Result<usize, Box<dyn Error>> {
 
 fn print_usage() {
     eprintln!(
-        "Loom Stage 5\n\n\
+        "Loom Stage 6\n\n\
          Usage:\n\
            loom pack-block <input> <output-pack> <block-size>\n\
            loom map-single <total-sectors> <start-sector> <sector-count> <shadow-start-sector> \\\n<origin-device> <shadow-device> <output-table>\n\
@@ -280,6 +313,7 @@ fn print_usage() {
            loom ext4-resize <origin-image> <target-path> <replacement> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
            loom ext4-grow <origin-image> <target-path> <replacement> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
            loom ext4-create <origin-image> <target-path> <payload> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
-           loom ext4-remove <origin-image> <target-path> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n"
+           loom ext4-remove <origin-image> <target-path> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n\
+           loom ext4-selinux <origin-image> <target-path> <context-bytes-file> <shadow-pack> \\\n<origin-device> <shadow-device> <output-table>\n"
     );
 }
