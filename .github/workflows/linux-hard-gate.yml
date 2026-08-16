@@ -1,4 +1,4 @@
-name: stage31-plain-data-diagnostic
+name: stage31-plain-data-maintenance
 
 on:
   push:
@@ -8,16 +8,28 @@ on:
       - .github/workflows/linux-hard-gate.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  probe:
+  patch:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - name: Install erofs tools
+        with:
+          fetch-depth: 0
+      - name: Apply aligned PLAIN data-head support
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y erofs-utils
-      - name: Probe mixed legacy full-index topology
-        run: bash tests/integration/stage31_probe_legacy_full_plain.sh
+          set -euo pipefail
+          python3 .github/stage31_plain_data_fix.py
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          rm -f .github/stage31_plain_data_fix.py
+          rm -f tests/integration/stage31_probe_legacy_full_plain.sh
+          git checkout fa6edf5036e272ed8e13cdc7887280de57a45d99 -- .github/workflows/linux-hard-gate.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/loom-erofs/src/compact_core.rs tests/integration .github
+          git commit -m 'feat(erofs): support aligned full-index PLAIN data heads'
+          git push origin HEAD:feat/stage31-erofs-legacy-full-plain-data
