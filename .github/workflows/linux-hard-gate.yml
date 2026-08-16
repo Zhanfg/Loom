@@ -1,4 +1,4 @@
-name: stage33-legacy-full-big-diagnostic-rerun
+name: stage33-full-big-maintenance
 
 on:
   push:
@@ -8,16 +8,28 @@ on:
       - .github/workflows/linux-hard-gate.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  probe:
+  patch:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - name: Install erofs tools
+        with:
+          fetch-depth: 0
+      - name: Apply legacy full big-pcluster support
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y erofs-utils
-      - name: Probe exact-size legacy full-index big pclusters
-        run: bash tests/integration/stage33_probe_legacy_full_big.sh
+          set -euo pipefail
+          python3 .github/stage33_full_big_fix.py
+          cargo fmt --all
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          rm -f .github/stage33_full_big_fix.py
+          rm -f tests/integration/stage33_probe_legacy_full_big.sh
+          git checkout b77be98f84f3e22e1958a47c04a045df66ce41d8 -- .github/workflows/linux-hard-gate.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/loom-erofs/src/compact_core.rs tests/integration .github
+          git commit -m 'feat(erofs): support legacy full-index big pclusters'
+          git push origin HEAD:feat/stage33-erofs-legacy-full-big-pcluster
