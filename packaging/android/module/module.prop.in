@@ -3,4 +3,4 @@ name=Loom
 version=@VERSION_NAME@
 versionCode=@VERSION_CODE@
 author=Loom Project
-description=Systemless effective-block-view runtime. Sidecar Alpha 1 mounts only below /data/adb/loom/mnt and never replaces existing system/module mounts. Source @SOURCE_SHA@.
+description=Systemless effective-block-view runtime. Alpha 2 supports direct block-device sparse-shadow sidecar composition while keeping system takeover disabled by default. Source @SOURCE_SHA@.

@@ -18,8 +18,10 @@ TEMPLATE="$ROOT/module"
 
 [[ -f "$BINARY" ]] || { echo "missing Loom binary: $BINARY" >&2; exit 1; }
 [[ -f "$TEMPLATE/module.prop.in" ]] || { echo "missing Android module template" >&2; exit 1; }
-[[ -f "$TEMPLATE/bin/loom-sidecar" ]] || { echo "missing sidecar runtime" >&2; exit 1; }
+[[ -f "$TEMPLATE/bin/loom-sidecar" ]] || { echo "missing identity sidecar runtime" >&2; exit 1; }
+[[ -f "$TEMPLATE/bin/loom-shadow" ]] || { echo "missing sparse-shadow runtime" >&2; exit 1; }
 [[ -f "$TEMPLATE/sidecar.conf" ]] || { echo "missing sidecar configuration" >&2; exit 1; }
+[[ -f "$TEMPLATE/shadow.conf" ]] || { echo "missing shadow configuration" >&2; exit 1; }
 [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] || { echo "version code must be numeric" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
@@ -47,13 +49,17 @@ source_sha=$SOURCE_SHA
 version=$VERSION_NAME
 versionCode=$VERSION_CODE
 architecture=arm64-v8a
-runtime_activation=sidecar-readonly-identity-alpha1
+runtime_activation=identity-plus-sparse-shadow-sidecar-alpha2
+shadow_origin=direct-block-device
+shadow_backing=readonly-loop
+shadow_composition=transactional-layered-dm-linear
 mount_scope=/data/adb/loom/mnt
 stock_mount_replacement=false
+system_takeover=false
 EOF
 
-chmod 0644 "$STAGE/module.prop" "$STAGE/build-info.txt" "$STAGE/skip_mount" "$STAGE/sidecar.conf"
-chmod 0755 "$STAGE/bin/loom" "$STAGE/bin/loom-sidecar"
+chmod 0644 "$STAGE/module.prop" "$STAGE/build-info.txt" "$STAGE/skip_mount" "$STAGE/sidecar.conf" "$STAGE/shadow.conf"
+chmod 0755 "$STAGE/bin/loom" "$STAGE/bin/loom-sidecar" "$STAGE/bin/loom-shadow"
 for script in customize.sh post-fs-data.sh service.sh action.sh uninstall.sh; do
   [[ -f "$STAGE/$script" ]] || { echo "missing module script: $script" >&2; exit 1; }
   chmod 0755 "$STAGE/$script"
