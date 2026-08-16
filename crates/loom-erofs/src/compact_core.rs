@@ -61,12 +61,19 @@ struct Head {
     pcluster: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lz4Placement {
+    LegacyStart,
+    ZeroPadding,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Topology {
     nid: u64,
     logical_size: u64,
     algorithm: u8,
     advise: u16,
+    placement: Lz4Placement,
     logical_lclusters: usize,
     compact_2b_entries: usize,
     eof_plain_clusterofs: Option<usize>,
@@ -196,12 +203,14 @@ pub(crate) fn compile_multi_oracle(
 ) -> Result<CompiledCore, CoreError> {
     let origin = Image::open(origin_path)?;
     match origin.sb.incompat {
-        FEATURE_LZ4_0PADDING => compile_oracle(origin_path, target_path, replacement_image_path),
+        0 | FEATURE_LZ4_0PADDING => {
+            compile_oracle(origin_path, target_path, replacement_image_path)
+        }
         BIG_REQUIRED_INCOMPAT => {
             compile_big_oracle(origin_path, target_path, replacement_image_path)
         }
         _ => Err(CoreError::UnsupportedFilesystem(
-            "multi compact oracle supports only ordinary LZ4_0PADDING or big-pcluster compact images",
+            "multi compressed oracle supports legacy full-index, ordinary LZ4_0PADDING, or big-pcluster compact images",
         )),
     }
 }
@@ -213,10 +222,10 @@ pub(crate) fn compile_multi_lz4(
 ) -> Result<CompiledCore, CoreError> {
     let origin = Image::open(origin_path)?;
     match origin.sb.incompat {
-        FEATURE_LZ4_0PADDING => compile_lz4(origin_path, target_path, replacement_path),
+        0 | FEATURE_LZ4_0PADDING => compile_lz4(origin_path, target_path, replacement_path),
         BIG_REQUIRED_INCOMPAT => compile_big_lz4(origin_path, target_path, replacement_path),
         _ => Err(CoreError::UnsupportedFilesystem(
-            "multi compact self-encode supports only ordinary LZ4_0PADDING or big-pcluster compact images",
+            "multi compressed self-encode supports legacy full-index, ordinary LZ4_0PADDING, or big-pcluster compact images",
         )),
     }
 }
@@ -261,7 +270,7 @@ pub(crate) fn compile_lz4(
         let extent = replacement
             .get(start..end)
             .ok_or(CoreError::UnexpectedEndOfStructure)?;
-        let (block, encoded_len) = encode_extent(head.lcn, extent)?;
+        let (block, encoded_len) = encode_extent(head.lcn, extent, topology.placement)?;
         encoded_blocks.push(block);
         encoded_bytes.push(encoded_len);
     }
@@ -399,7 +408,11 @@ pub(crate) fn compile_big_lz4(
     )
 }
 
-fn encode_extent(head_lcn: usize, extent: &[u8]) -> Result<(Vec<u8>, usize), CoreError> {
+fn encode_extent(
+    head_lcn: usize,
+    extent: &[u8],
+    placement: Lz4Placement,
+) -> Result<(Vec<u8>, usize), CoreError> {
     let compressed = lz4::encode(extent).map_err(|_| CoreError::CompressionValidationFailed)?;
     if compressed.len() > BLOCK_BYTES {
         return Err(CoreError::CompressionDoesNotFit {
@@ -418,15 +431,22 @@ fn encode_extent(head_lcn: usize, extent: &[u8]) -> Result<(Vec<u8>, usize), Cor
     }
 
     let mut pcluster = vec![0_u8; BLOCK_BYTES];
-    let start = BLOCK_BYTES
-        .checked_sub(compressed.len())
-        .ok_or(CoreError::ArithmeticOverflow)?;
-    pcluster[start..].copy_from_slice(&compressed);
-    if lz4::decode_0padding(&pcluster, extent.len())
-        .map_err(|_| CoreError::CompressionValidationFailed)?
-        != extent
-    {
-        return Err(CoreError::CompressionValidationFailed);
+    match placement {
+        Lz4Placement::LegacyStart => {
+            pcluster[..compressed.len()].copy_from_slice(&compressed);
+        }
+        Lz4Placement::ZeroPadding => {
+            let start = BLOCK_BYTES
+                .checked_sub(compressed.len())
+                .ok_or(CoreError::ArithmeticOverflow)?;
+            pcluster[start..].copy_from_slice(&compressed);
+            if lz4::decode_0padding(&pcluster, extent.len())
+                .map_err(|_| CoreError::CompressionValidationFailed)?
+                != extent
+            {
+                return Err(CoreError::CompressionValidationFailed);
+            }
+        }
     }
     Ok((pcluster, compressed.len()))
 }
@@ -601,7 +621,12 @@ fn validate_compatible_topology(
     }
     if origin.advise != replacement.advise {
         return Err(CoreError::IncompatibleReplacement(
-            "compact map advice differs",
+            "compressed map advice differs",
+        ));
+    }
+    if origin.placement != replacement.placement {
+        return Err(CoreError::IncompatibleReplacement(
+            "LZ4 physical placement mode differs",
         ));
     }
     if origin.logical_lclusters != replacement.logical_lclusters {
@@ -783,14 +808,19 @@ impl Image {
     }
 
     fn read_topology(&mut self, nid: u64) -> Result<Topology, CoreError> {
-        if self.sb.incompat != FEATURE_LZ4_0PADDING {
-            return Err(CoreError::UnsupportedFilesystem(
-                "normal compact mode does not accept big-pcluster incompatible features",
-            ));
-        }
         let inode = self.read_inode(nid)?;
         if inode.layout == DATA_COMPRESSED_FULL {
+            if self.sb.incompat != 0 {
+                return Err(CoreError::UnsupportedFilesystem(
+                    "Stage 29 legacy full-index requires non-0padding LZ4 placement",
+                ));
+            }
             return self.read_full_topology_from_inode(inode);
+        }
+        if self.sb.incompat != FEATURE_LZ4_0PADDING {
+            return Err(CoreError::UnsupportedFilesystem(
+                "normal compact mode requires LZ4_0PADDING without big-pcluster features",
+            ));
         }
         let logical_lclusters = validate_target_inode(&inode)?;
         let compressed_blocks =
@@ -836,6 +866,7 @@ impl Image {
             logical_size: inode.size,
             algorithm: map.algorithm,
             advise: map.advise,
+            placement: Lz4Placement::ZeroPadding,
             logical_lclusters,
             compact_2b_entries: map.regions.compact_2b,
             eof_plain_clusterofs,
@@ -930,6 +961,7 @@ impl Image {
             logical_size: inode.size,
             algorithm: map.algorithm,
             advise: map.advise,
+            placement: Lz4Placement::LegacyStart,
             logical_lclusters,
             compact_2b_entries: 0,
             eof_plain_clusterofs: None,
@@ -1760,11 +1792,6 @@ fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, CoreError>
             "compact image enables unsupported incompatible EROFS features",
         ));
     }
-    if incompat & FEATURE_LZ4_0PADDING == 0 {
-        return Err(CoreError::UnsupportedFilesystem(
-            "compact core expects LZ4_0PADDING layout",
-        ));
-    }
     if raw[0x5a] != 0 || read_u16(&raw, 0x56)? != 0 {
         return Err(CoreError::UnsupportedFilesystem(
             "compact core requires primary-device core directories",
@@ -2013,6 +2040,7 @@ mod tests {
             logical_size: 8192,
             algorithm: 0,
             advise: ADVISE_COMPACTED_2B,
+            placement: Lz4Placement::ZeroPadding,
             logical_lclusters: 2,
             compact_2b_entries: 0,
             eof_plain_clusterofs: None,
@@ -2059,7 +2087,7 @@ mod tests {
     #[test]
     fn later_extent_codec_failure_happens_before_view_construction() {
         let good = vec![b'Z'; 32768];
-        assert!(encode_extent(0, &good).is_ok());
+        assert!(encode_extent(0, &good, Lz4Placement::ZeroPadding).is_ok());
 
         let mut state = 0x5354_3137_u32;
         let mut bad = vec![0_u8; 32768];
@@ -2070,7 +2098,7 @@ mod tests {
             *byte = state.to_le_bytes()[0];
         }
         assert!(matches!(
-            encode_extent(8, &bad),
+            encode_extent(8, &bad, Lz4Placement::ZeroPadding),
             Err(CoreError::CompressionDoesNotFit { head_lcn: 8, .. })
         ));
     }

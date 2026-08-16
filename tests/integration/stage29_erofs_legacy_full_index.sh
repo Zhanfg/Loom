@@ -74,6 +74,8 @@ import sys
 raw = open(sys.argv[1], 'rb').read()
 sb = 1024
 assert struct.unpack_from('<I', raw, sb)[0] == 0xE0F5E1E2
+incompat = struct.unpack_from('<I', raw, sb + 0x50)[0]
+assert incompat == 0, incompat
 meta = struct.unpack_from('<I', raw, sb + 0x28)[0]
 inos = struct.unpack_from('<Q', raw, sb + 0x10)[0]
 target = None
@@ -124,7 +126,7 @@ for lcn in range(24):
         assert (d0, d1) == (lcn - start, end - lcn)
 assert heads == [(0, 1), (8, 2), (16, 3)], heads
 assert blocks == 3
-print(f'Stage 29 raw full-index topology PASS nid={nid} heads={heads} data_word={blocks} full_start={full_start}')
+print(f'Stage 29 raw full-index topology PASS nid={nid} heads={heads} data_word={blocks} full_start={full_start} incompat={incompat}')
 PY
 
 STOCK_HASH_BEFORE="$(sha256sum "$ORIGIN_IMG" | awk '{print $1}')"
@@ -232,6 +234,7 @@ echo "$BAD_OUTPUT" | grep -q 'forward/backward deltas disagree'
 printf '%s\n' \
   'Stage 29 legacy compressed-full index PASS' \
   '  inode layout: EROFS_INODE_COMPRESSED_FULL (1)' \
+  '  superblock incompat: 0 (legacy non-0padding LZ4)' \
   '  logical lclusters: 24' \
   '  recovered HEAD lclusters: [0, 8, 16]' \
   '  recovered physical pclusters: [1, 2, 3]' \
