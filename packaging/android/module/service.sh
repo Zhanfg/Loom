@@ -3,6 +3,7 @@
 MODDIR=${0%/*}
 STATE=/data/adb/loom
 LOG="$STATE/service.log"
+SHADOW_CONF="$STATE/shadow.conf"
 mkdir -p "$STATE"
 chmod 0700 "$STATE"
 exec >>"$LOG" 2>&1
@@ -16,18 +17,39 @@ fi
 
 if [ ! -x "$MODDIR/bin/loom-sidecar" ]; then
   printf '%s\n' 'SIDECAR_RUNTIME_MISSING' > "$STATE/status"
-  echo "[loom] sidecar runtime missing"
+  echo "[loom] identity sidecar runtime missing"
   exit 0
 fi
 
-# Alpha 1 is intentionally sidecar-only. The runtime creates a Loom-owned
-# read-only dm-linear identity view and mounts it below /data/adb/loom/mnt.
-# It never unmounts, remounts, bind-mounts, or overlays /system, /vendor,
-# /product, or any mount created by an existing module.
-if "$MODDIR/bin/loom-sidecar" activate; then
-  echo "[loom] sidecar activation PASS"
+shadow_enabled=0
+if [ -f "$SHADOW_CONF" ] && grep -Fxq 'LOOM_SHADOW_ENABLED=1' "$SHADOW_CONF"; then
+  shadow_enabled=1
+fi
+
+if [ "$shadow_enabled" = 1 ]; then
+  if [ ! -x "$MODDIR/bin/loom-shadow" ]; then
+    printf '%s\n' 'SHADOW_RUNTIME_MISSING' > "$STATE/status"
+    echo "[loom] sparse-shadow runtime missing"
+    exit 0
+  fi
+
+  # Mode switches only tear down Loom-owned resources. Existing system mounts
+  # and mounts owned by other modules are never targeted.
+  "$MODDIR/bin/loom-sidecar" cleanup >/dev/null 2>&1 || true
+  if "$MODDIR/bin/loom-shadow" activate; then
+    echo "[loom] sparse-shadow sidecar activation PASS"
+  else
+    echo "[loom] sparse-shadow sidecar activation FAIL; Loom resources rolled back"
+  fi
 else
-  echo "[loom] sidecar activation FAIL; Loom resources rolled back"
+  if [ -x "$MODDIR/bin/loom-shadow" ]; then
+    "$MODDIR/bin/loom-shadow" cleanup >/dev/null 2>&1 || true
+  fi
+  if "$MODDIR/bin/loom-sidecar" activate; then
+    echo "[loom] identity sidecar activation PASS"
+  else
+    echo "[loom] identity sidecar activation FAIL; Loom resources rolled back"
+  fi
 fi
 
 exit 0
