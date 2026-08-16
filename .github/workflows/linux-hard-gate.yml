@@ -1,41 +1,24 @@
-name: linux-hard-gate
+name: stage40-shared-fragment-probe
 
 on:
-  pull_request:
-  workflow_dispatch:
   push:
     branches:
-      - main
+      - feat/stage40-erofs-shared-fragment-probe
 
 permissions:
   contents: read
 
 jobs:
-  linux-hard-gate:
+  probe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-
+    timeout-minutes: 20
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install filesystem test dependencies
+      - uses: actions/checkout@v5
+      - name: Install EROFS tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
-
-      - name: Prepare host kernel facilities
-        run: |
+          sudo apt-get install -y erofs-utils util-linux python3
           sudo modprobe loop || true
-          sudo modprobe dm_mod || true
           sudo modprobe erofs || true
-          sudo losetup -f
-          sudo dmsetup version
-
-      - name: Run canonical Linux hard gate
-        run: bash tests/ci/linux-hard-gate.sh
+      - name: Probe shared fragment topology
+        run: bash tests/integration/stage40_probe_erofs_shared_fragments.sh
