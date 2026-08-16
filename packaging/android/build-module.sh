@@ -18,7 +18,7 @@ TEMPLATE="$ROOT/module"
 
 [[ -f "$BINARY" ]] || { echo "missing Loom binary: $BINARY" >&2; exit 1; }
 [[ -f "$TEMPLATE/module.prop.in" ]] || { echo "missing Android module template" >&2; exit 1; }
-[[ -x "$TEMPLATE/bin/loom-sidecar" ]] || { echo "missing sidecar runtime" >&2; exit 1; }
+[[ -f "$TEMPLATE/bin/loom-sidecar" ]] || { echo "missing sidecar runtime" >&2; exit 1; }
 [[ -f "$TEMPLATE/sidecar.conf" ]] || { echo "missing sidecar configuration" >&2; exit 1; }
 [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] || { echo "version code must be numeric" >&2; exit 1; }
 
