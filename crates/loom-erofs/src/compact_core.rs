@@ -56,9 +56,16 @@ pub(crate) struct CompiledCore {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeadKind {
+    Lz4,
+    Plain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Head {
     lcn: usize,
     pcluster: u64,
+    kind: HeadKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +277,10 @@ pub(crate) fn compile_lz4(
         let extent = replacement
             .get(start..end)
             .ok_or(CoreError::UnexpectedEndOfStructure)?;
-        let (block, encoded_len) = encode_extent(head.lcn, extent, topology.placement)?;
+        let (block, encoded_len) = match head.kind {
+            HeadKind::Lz4 => encode_extent(head.lcn, extent, topology.placement)?,
+            HeadKind::Plain => encode_plain_extent(head.lcn, extent)?,
+        };
         encoded_blocks.push(block);
         encoded_bytes.push(encoded_len);
     }
@@ -406,6 +416,16 @@ pub(crate) fn compile_big_lz4(
         encoded_spans,
         encoded_bytes,
     )
+}
+
+fn encode_plain_extent(head_lcn: usize, extent: &[u8]) -> Result<(Vec<u8>, usize), CoreError> {
+    if extent.len() != BLOCK_BYTES {
+        return Err(CoreError::UnsupportedInode(
+            "full-index PLAIN data head must cover exactly one aligned 4 KiB logical cluster",
+        ));
+    }
+    let _ = head_lcn;
+    Ok((extent.to_vec(), BLOCK_BYTES))
 }
 
 fn encode_extent(
@@ -647,11 +667,11 @@ fn validate_compatible_topology(
     if origin
         .heads
         .iter()
-        .map(|head| head.lcn)
-        .ne(replacement.heads.iter().map(|head| head.lcn))
+        .map(|head| (head.lcn, head.kind))
+        .ne(replacement.heads.iter().map(|head| (head.lcn, head.kind)))
     {
         return Err(CoreError::IncompatibleReplacement(
-            "compressed HEAD-lcluster topology differs",
+            "compressed HEAD type/lcluster topology differs",
         ));
     }
     Ok(())
@@ -914,46 +934,7 @@ impl Image {
         let entries = self.read_all_full_entries(map.ebase, logical_lclusters)?;
         let eof_plain_clusterofs =
             validate_full_eof_plain_sentinel(&entries, logical_lclusters, inode.size)?;
-        let mut heads = Vec::new();
-        for (lcn, entry) in entries.iter().enumerate() {
-            if entry.advise & !LCLUSTER_TYPE_MASK != 0 {
-                return Err(CoreError::UnsupportedInode(
-                    "full-index entries do not accept auxiliary advice bits",
-                ));
-            }
-            match entry.kind {
-                LCLUSTER_HEAD1 => {
-                    if entry.clusterofs != 0 {
-                        return Err(CoreError::UnsupportedInode(
-                            "full-index HEAD1 entries require zero cluster offsets",
-                        ));
-                    }
-                    heads.push(Head {
-                        lcn,
-                        pcluster: u64::from(entry.word),
-                    });
-                }
-                LCLUSTER_NONHEAD => {
-                    if entry.clusterofs != 0 {
-                        return Err(CoreError::UnsupportedInode(
-                            "full-index NONHEAD entries require zero cluster offsets",
-                        ));
-                    }
-                }
-                LCLUSTER_PLAIN => {
-                    if eof_plain_clusterofs.is_none() || lcn + 1 != logical_lclusters {
-                        return Err(CoreError::UnsupportedInode(
-                            "full-index PLAIN entries are supported only as the partial-EOF sentinel",
-                        ));
-                    }
-                }
-                _ => {
-                    return Err(CoreError::UnsupportedInode(
-                        "full-index supports only HEAD1, NONHEAD, and the verified partial-EOF PLAIN sentinel",
-                    ))
-                }
-            }
-        }
+        let heads = recover_full_data_heads(&entries, logical_lclusters, eof_plain_clusterofs)?;
         if heads.first().map(|head| head.lcn) != Some(0) {
             return Err(CoreError::InvalidFilesystem(
                 "first full-index compressed extent does not begin at lcluster zero",
@@ -961,10 +942,11 @@ impl Image {
         }
         if heads.len() != compressed_blocks {
             return Err(CoreError::InvalidFilesystem(
-                "full-index compressed block count does not match recovered HEAD count",
+                "full-index encoded physical-block count does not match recovered data HEAD count",
             ));
         }
 
+        validate_full_plain_data_heads(&heads, logical_lclusters, eof_plain_clusterofs)?;
         validate_full_nonheads(&entries, &heads, logical_lclusters, eof_plain_clusterofs)?;
         validate_head_blocks(&heads, self.bytes)?;
 
@@ -1147,7 +1129,11 @@ impl Image {
                         ));
                     }
                     let pcluster = self.reconstruct_head_pcluster(ebase, total, lcn, *entry)?;
-                    heads.push(Head { lcn, pcluster });
+                    heads.push(Head {
+                        lcn,
+                        pcluster,
+                        kind: HeadKind::Lz4,
+                    });
                 }
                 LCLUSTER_PLAIN => {
                     let expected = eof_plain_clusterofs.ok_or(CoreError::UnsupportedInode(
@@ -1302,6 +1288,64 @@ impl Image {
     }
 }
 
+fn recover_full_data_heads(
+    entries: &[FullEntry],
+    logical_lclusters: usize,
+    eof_plain_clusterofs: Option<usize>,
+) -> Result<Vec<Head>, CoreError> {
+    let mut heads = Vec::new();
+    for (lcn, entry) in entries.iter().enumerate() {
+        if entry.advise & !LCLUSTER_TYPE_MASK != 0 {
+            return Err(CoreError::UnsupportedInode(
+                "full-index entries do not accept auxiliary advice bits",
+            ));
+        }
+        match entry.kind {
+            LCLUSTER_HEAD1 => {
+                if entry.clusterofs != 0 {
+                    return Err(CoreError::UnsupportedInode(
+                        "full-index HEAD1 entries require zero cluster offsets",
+                    ));
+                }
+                heads.push(Head {
+                    lcn,
+                    pcluster: u64::from(entry.word),
+                    kind: HeadKind::Lz4,
+                });
+            }
+            LCLUSTER_NONHEAD => {
+                if entry.clusterofs != 0 {
+                    return Err(CoreError::UnsupportedInode(
+                        "full-index NONHEAD entries require zero cluster offsets",
+                    ));
+                }
+            }
+            LCLUSTER_PLAIN => {
+                let is_eof_sentinel =
+                    eof_plain_clusterofs.is_some() && lcn + 1 == logical_lclusters;
+                if !is_eof_sentinel {
+                    if entry.clusterofs != 0 {
+                        return Err(CoreError::UnsupportedInode(
+                            "full-index PLAIN data heads require zero cluster offsets",
+                        ));
+                    }
+                    heads.push(Head {
+                        lcn,
+                        pcluster: u64::from(entry.word),
+                        kind: HeadKind::Plain,
+                    });
+                }
+            }
+            _ => {
+                return Err(CoreError::UnsupportedInode(
+                    "full-index supports only HEAD1, NONHEAD, aligned PLAIN data, and the verified partial-EOF PLAIN sentinel",
+                ));
+            }
+        }
+    }
+    Ok(heads)
+}
+
 fn validate_full_eof_plain_sentinel(
     entries: &[FullEntry],
     total: usize,
@@ -1315,11 +1359,6 @@ fn validate_full_eof_plain_sentinel(
     let remainder = usize::try_from(logical_size % u64::from(BLOCK_SIZE))
         .map_err(|_| CoreError::ArithmeticOverflow)?;
     if remainder == 0 {
-        if entries.last().map(|entry| entry.kind) == Some(LCLUSTER_PLAIN) {
-            return Err(CoreError::InvalidFilesystem(
-                "block-aligned full-index file unexpectedly ends in PLAIN",
-            ));
-        }
         return Ok(None);
     }
     let eof = entries.last().ok_or(CoreError::UnexpectedEndOfStructure)?;
@@ -1333,6 +1372,34 @@ fn validate_full_eof_plain_sentinel(
         ));
     }
     Ok(Some(remainder))
+}
+
+fn validate_full_plain_data_heads(
+    heads: &[Head],
+    logical_lclusters: usize,
+    eof_plain_clusterofs: Option<usize>,
+) -> Result<(), CoreError> {
+    for (index, head) in heads.iter().enumerate() {
+        if head.kind != HeadKind::Plain {
+            continue;
+        }
+        let end = heads.get(index + 1).map_or_else(
+            || {
+                if eof_plain_clusterofs.is_some() {
+                    logical_lclusters.saturating_sub(1)
+                } else {
+                    logical_lclusters
+                }
+            },
+            |next| next.lcn,
+        );
+        if end != head.lcn.saturating_add(1) {
+            return Err(CoreError::UnsupportedInode(
+                "full-index PLAIN data head must cover exactly one aligned 4 KiB logical cluster",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_full_nonheads(
@@ -2100,6 +2167,7 @@ mod tests {
             heads: vec![Head {
                 lcn: 0,
                 pcluster: 10,
+                kind: HeadKind::Lz4,
             }],
         };
         let mut relocated = single.clone();
