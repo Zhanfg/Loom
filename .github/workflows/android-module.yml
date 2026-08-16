@@ -11,12 +11,12 @@ on:
       version_name:
         description: 'Module version name'
         required: true
-        default: '0.1.0-packaging-alpha'
+        default: '0.1.0-sidecar-alpha1'
         type: string
       version_code:
         description: 'Numeric module version code'
         required: true
-        default: '10001'
+        default: '10100'
         type: string
       run_host_tests:
         description: 'Run host workspace tests before packaging'
@@ -26,6 +26,11 @@ on:
   push:
     branches:
       - infra/android-module-pipeline
+      - 'feat/android-sidecar-*'
+  pull_request:
+    paths:
+      - '.github/workflows/android-module.yml'
+      - 'packaging/android/**'
 
 permissions:
   contents: read
@@ -41,6 +46,10 @@ jobs:
         uses: actions/checkout@v5
         with:
           path: pipeline
+
+      - name: Validate sidecar runtime safety
+        shell: bash
+        run: bash pipeline/packaging/android/tests/sidecar_runtime_test.sh
 
       - name: Resolve source and version
         id: meta
@@ -58,8 +67,8 @@ jobs:
             VERSION_CODE="$REQUESTED_CODE"
           else
             SOURCE_REF="$DEFAULT_SOURCE_REF"
-            VERSION_NAME="0.1.0-packaging-alpha+run${GITHUB_RUN_NUMBER}"
-            VERSION_CODE="$((10000 + GITHUB_RUN_NUMBER))"
+            VERSION_NAME="0.1.0-sidecar-alpha1+run${GITHUB_RUN_NUMBER}"
+            VERSION_CODE="$((10100 + GITHUB_RUN_NUMBER))"
           fi
           [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]
           SAFE_VERSION="$(printf '%s' "$VERSION_NAME" | tr -c 'A-Za-z0-9._+-' '-')"
@@ -154,7 +163,7 @@ jobs:
           set -euo pipefail
           ZIP='${{ steps.package.outputs.zip }}'
           unzip -t "$ZIP" >/dev/null
-          for entry in module.prop bin/loom customize.sh post-fs-data.sh service.sh action.sh uninstall.sh skip_mount build-info.txt; do
+          for entry in module.prop bin/loom bin/loom-sidecar sidecar.conf customize.sh post-fs-data.sh service.sh action.sh uninstall.sh skip_mount build-info.txt; do
             unzip -Z1 "$ZIP" | grep -Fxq "$entry" || { echo "Missing module entry: $entry" >&2; exit 1; }
           done
           unzip -p "$ZIP" module.prop
@@ -162,6 +171,8 @@ jobs:
           unzip -p "$ZIP" bin/loom > /tmp/loom-android
           chmod 0755 /tmp/loom-android
           file /tmp/loom-android | grep -q 'ARM aarch64\|ARM64\|aarch64'
+          unzip -p "$ZIP" service.sh | grep -q 'loom-sidecar.*activate'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'stock_mount_replacement=false'
           if unzip -Z1 "$ZIP" | grep -qE '^([^/]+/){2,}module\.prop$'; then
             echo 'module.prop is incorrectly nested inside wrapper directories' >&2
             exit 1
@@ -182,7 +193,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Loom Android module artifact'
+            echo '## Loom Android sidecar Alpha 1 artifact'
             echo
             echo "- Source ref: `${{ steps.meta.outputs.source_ref }}`"
             echo "- Source SHA: `${{ steps.source.outputs.sha }}`"
@@ -190,6 +201,9 @@ jobs:
             echo "- Architecture: `arm64-v8a`"
             echo "- NDK: `${{ steps.ndk.outputs.root }}`"
             echo "- Artifact: `${{ steps.package.outputs.artifact_name }}`"
+            echo "- Activation: `read-only identity sidecar`"
+            echo "- Mount scope: `/data/adb/loom/mnt/*`"
+            echo "- Existing system/module mount replacement: `false`"
             echo
-            echo '> Packaging alpha: installable module ZIP with fail-closed runtime hooks. Automatic effective-view mount activation is not enabled yet.'
+            echo '> Alpha 1 validates real Android device-mapper activation and read-only mounting without replacing the device current mount module. Sparse-shadow takeover remains a later opt-in gate.'
           } >> "$GITHUB_STEP_SUMMARY"

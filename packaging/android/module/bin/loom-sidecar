@@ -1,0 +1,309 @@
+#!/system/bin/sh
+
+umask 077
+
+SELF_DIR=${0%/*}
+MODDIR=${LOOM_MODDIR:-${SELF_DIR%/*}}
+STATE=${LOOM_STATE_DIR:-/data/adb/loom}
+DEFAULT_CONF="$MODDIR/sidecar.conf"
+CONF=${LOOM_CONFIG:-$STATE/sidecar.conf}
+PROC_MOUNTS=${LOOM_PROC_MOUNTS:-/proc/mounts}
+LOG=${LOOM_SIDECAR_LOG:-$STATE/sidecar.log}
+
+mkdir -p "$STATE" "$STATE/mnt"
+chmod 0700 "$STATE" "$STATE/mnt" 2>/dev/null || true
+
+log() {
+  printf '[loom-sidecar] %s\n' "$*" >>"$LOG"
+}
+
+set_status() {
+  printf '%s\n' "$1" >"$STATE/status"
+  log "status=$1"
+}
+
+fail() {
+  set_status "$1"
+  log "$2"
+  return 1
+}
+
+read_config_value() {
+  key=$1
+  file=$2
+  [ -f "$file" ] || return 1
+  sed -n "s/^${key}=//p" "$file" | tail -n 1
+}
+
+load_config() {
+  LOOM_SIDECAR_ENABLED=1
+  LOOM_TARGET=system
+  LOOM_ORIGIN=auto
+  LOOM_DM_NAME=loom-sidecar-system
+  LOOM_MOUNTPOINT="$STATE/mnt/system"
+  LOOM_FILESYSTEM=auto
+
+  if [ ! -f "$CONF" ] && [ -f "$DEFAULT_CONF" ]; then
+    cp "$DEFAULT_CONF" "$CONF" 2>/dev/null || true
+    chmod 0600 "$CONF" 2>/dev/null || true
+  fi
+
+  for key in LOOM_SIDECAR_ENABLED LOOM_TARGET LOOM_ORIGIN LOOM_DM_NAME LOOM_MOUNTPOINT LOOM_FILESYSTEM; do
+    value=$(read_config_value "$key" "$CONF" 2>/dev/null || true)
+    [ -n "$value" ] || continue
+    case "$key" in
+      LOOM_SIDECAR_ENABLED) LOOM_SIDECAR_ENABLED=$value ;;
+      LOOM_TARGET) LOOM_TARGET=$value ;;
+      LOOM_ORIGIN) LOOM_ORIGIN=$value ;;
+      LOOM_DM_NAME) LOOM_DM_NAME=$value ;;
+      LOOM_MOUNTPOINT) LOOM_MOUNTPOINT=$value ;;
+      LOOM_FILESYSTEM) LOOM_FILESYSTEM=$value ;;
+    esac
+  done
+
+  case "$LOOM_TARGET" in *[!A-Za-z0-9_.-]*|'') return 1 ;; esac
+  case "$LOOM_DM_NAME" in loom-sidecar-*) ;; *) return 1 ;; esac
+  case "$LOOM_MOUNTPOINT" in "$STATE"/mnt/*) ;; *) return 1 ;; esac
+  case "$LOOM_FILESYSTEM" in auto|erofs|ext4) ;; *) return 1 ;; esac
+  case "$LOOM_SIDECAR_ENABLED" in 0|1) ;; *) return 1 ;; esac
+  return 0
+}
+
+find_cmd() {
+  env_name=$1
+  fallback=$2
+  eval "override=\${$env_name:-}"
+  if [ -n "$override" ]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+  command -v "$fallback" 2>/dev/null || true
+}
+
+is_device() {
+  [ -b "$1" ] && return 0
+  [ "${LOOM_TEST_ALLOW_REGULAR:-0}" = 1 ] && [ -e "$1" ] && return 0
+  return 1
+}
+
+canonical_path() {
+  resolved=$(readlink -f "$1" 2>/dev/null || true)
+  [ -n "$resolved" ] && printf '%s\n' "$resolved" || printf '%s\n' "$1"
+}
+
+resolve_origin() {
+  if [ "$LOOM_ORIGIN" != auto ]; then
+    is_device "$LOOM_ORIGIN" || return 1
+    canonical_path "$LOOM_ORIGIN"
+    return 0
+  fi
+
+  GETPROP=$(find_cmd LOOM_GETPROP_BIN getprop)
+  slot=
+  if [ -n "$GETPROP" ]; then
+    slot=$($GETPROP ro.boot.slot_suffix 2>/dev/null || true)
+  fi
+
+  for candidate in \
+    "/dev/block/mapper/${LOOM_TARGET}${slot}" \
+    "/dev/block/mapper/${LOOM_TARGET}" \
+    "/dev/block/by-name/${LOOM_TARGET}${slot}" \
+    "/dev/block/by-name/${LOOM_TARGET}" \
+    "/dev/block/bootdevice/by-name/${LOOM_TARGET}${slot}" \
+    "/dev/block/bootdevice/by-name/${LOOM_TARGET}"; do
+    if is_device "$candidate"; then
+      canonical_path "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_mounted() {
+  [ -f "$PROC_MOUNTS" ] || return 1
+  grep -F " $LOOM_MOUNTPOINT " "$PROC_MOUNTS" >/dev/null 2>&1
+}
+
+resolve_tools() {
+  DMCTL=$(find_cmd LOOM_DMCTL_BIN dmctl)
+  DMSETUP=$(find_cmd LOOM_DMSETUP_BIN dmsetup)
+  BLOCKDEV=$(find_cmd LOOM_BLOCKDEV_BIN blockdev)
+  MOUNT_BIN=$(find_cmd LOOM_MOUNT_BIN mount)
+  UMOUNT_BIN=$(find_cmd LOOM_UMOUNT_BIN umount)
+  BLKID=$(find_cmd LOOM_BLKID_BIN blkid)
+
+  [ -n "$DMCTL" ] || [ -n "$DMSETUP" ] || return 1
+  [ -n "$BLOCKDEV" ] || return 1
+  [ -n "$MOUNT_BIN" ] || return 1
+  [ -n "$UMOUNT_BIN" ] || return 1
+  return 0
+}
+
+get_sector_count() {
+  sectors=$($BLOCKDEV --getsz "$ORIGIN" 2>/dev/null || true)
+  case "$sectors" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$sectors" -gt 0 ] || return 1
+  printf '%s\n' "$sectors"
+}
+
+dm_delete() {
+  if [ -n "${DMCTL:-}" ]; then
+    "$DMCTL" delete "$LOOM_DM_NAME" >/dev/null 2>&1 || true
+  elif [ -n "${DMSETUP:-}" ]; then
+    "$DMSETUP" remove "$LOOM_DM_NAME" >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup_runtime() {
+  if is_mounted; then
+    "$UMOUNT_BIN" "$LOOM_MOUNTPOINT" >/dev/null 2>&1 || "$UMOUNT_BIN" -l "$LOOM_MOUNTPOINT" >/dev/null 2>&1 || true
+  fi
+  dm_delete
+  rm -f "$STATE/runtime.env"
+}
+
+create_identity_dm() {
+  sectors=$1
+  if [ -n "$DMCTL" ]; then
+    "$DMCTL" create "$LOOM_DM_NAME" -ro linear 0 "$sectors" "$ORIGIN" 0 || return 1
+    DM_PATH=$($DMCTL getpath "$LOOM_DM_NAME" 2>/dev/null || true)
+  else
+    printf '0 %s linear %s 0\n' "$sectors" "$ORIGIN" | "$DMSETUP" create "$LOOM_DM_NAME" --readonly || return 1
+    if [ -e "/dev/mapper/$LOOM_DM_NAME" ]; then
+      DM_PATH="/dev/mapper/$LOOM_DM_NAME"
+    elif [ -e "/dev/block/mapper/$LOOM_DM_NAME" ]; then
+      DM_PATH="/dev/block/mapper/$LOOM_DM_NAME"
+    else
+      DM_PATH=
+    fi
+  fi
+  [ -n "$DM_PATH" ] || return 1
+  is_device "$DM_PATH" || return 1
+  return 0
+}
+
+detect_filesystem() {
+  if [ "$LOOM_FILESYSTEM" != auto ]; then
+    printf '%s\n' "$LOOM_FILESYSTEM"
+    return 0
+  fi
+  if [ -n "$BLKID" ]; then
+    fs=$($BLKID -s TYPE -o value "$ORIGIN" 2>/dev/null || true)
+    case "$fs" in erofs|ext4) printf '%s\n' "$fs"; return 0 ;; esac
+  fi
+  printf '%s\n' auto
+}
+
+mount_sidecar() {
+  fs=$(detect_filesystem)
+  mkdir -p "$LOOM_MOUNTPOINT"
+  chmod 0700 "$LOOM_MOUNTPOINT" 2>/dev/null || true
+
+  case "$fs" in
+    erofs)
+      "$MOUNT_BIN" -t erofs -o ro,nosuid,nodev,noexec "$DM_PATH" "$LOOM_MOUNTPOINT" || return 1
+      ;;
+    ext4)
+      "$MOUNT_BIN" -t ext4 -o ro,noload,nosuid,nodev,noexec "$DM_PATH" "$LOOM_MOUNTPOINT" || return 1
+      ;;
+    auto)
+      "$MOUNT_BIN" -t erofs -o ro,nosuid,nodev,noexec "$DM_PATH" "$LOOM_MOUNTPOINT" >/dev/null 2>&1 || \
+        "$MOUNT_BIN" -t ext4 -o ro,noload,nosuid,nodev,noexec "$DM_PATH" "$LOOM_MOUNTPOINT" || return 1
+      ;;
+  esac
+  return 0
+}
+
+preflight() {
+  load_config || return 1
+  [ "$LOOM_SIDECAR_ENABLED" = 1 ] || { set_status SIDECAR_DISABLED; return 0; }
+
+  uid=${LOOM_TEST_UID:-$(id -u 2>/dev/null || printf '1')}
+  [ "$uid" = 0 ] || fail SIDECAR_PREFLIGHT_FAILED "root privileges required" || return 1
+  resolve_tools || fail SIDECAR_PREFLIGHT_FAILED "dmctl/dmsetup, blockdev, mount, or umount missing" || return 1
+
+  if [ "${LOOM_TEST_SKIP_BINARY:-0}" != 1 ]; then
+    [ -x "$MODDIR/bin/loom" ] || fail SIDECAR_PREFLIGHT_FAILED "Loom binary missing" || return 1
+    "$MODDIR/bin/loom" --help >/dev/null 2>&1 || fail SIDECAR_PREFLIGHT_FAILED "Loom binary failed --help" || return 1
+  fi
+
+  ORIGIN=$(resolve_origin) || fail SIDECAR_PREFLIGHT_FAILED "cannot resolve origin block device for $LOOM_TARGET" || return 1
+  SECTORS=$(get_sector_count) || fail SIDECAR_PREFLIGHT_FAILED "cannot read sector count from $ORIGIN" || return 1
+
+  cat >"$STATE/preflight.env" <<EOF
+LOOM_TARGET=$LOOM_TARGET
+LOOM_ORIGIN=$ORIGIN
+LOOM_DM_NAME=$LOOM_DM_NAME
+LOOM_MOUNTPOINT=$LOOM_MOUNTPOINT
+LOOM_SECTORS=$SECTORS
+EOF
+  set_status SIDECAR_PREFLIGHT_OK
+  log "preflight PASS target=$LOOM_TARGET origin=$ORIGIN sectors=$SECTORS mountpoint=$LOOM_MOUNTPOINT"
+  return 0
+}
+
+activate() {
+  preflight || return 1
+  [ "$LOOM_SIDECAR_ENABLED" = 1 ] || return 0
+
+  cleanup_runtime
+  if ! create_identity_dm "$SECTORS"; then
+    cleanup_runtime
+    fail SIDECAR_ACTIVATION_FAILED "failed to create read-only identity dm target" || true
+    return 1
+  fi
+
+  if ! mount_sidecar; then
+    cleanup_runtime
+    fail SIDECAR_ACTIVATION_FAILED "failed to mount sidecar filesystem" || true
+    return 1
+  fi
+
+  if ! is_mounted; then
+    cleanup_runtime
+    fail SIDECAR_HEALTHCHECK_FAILED "mount command returned success but mountpoint is absent" || true
+    return 1
+  fi
+
+  cat >"$STATE/runtime.env" <<EOF
+LOOM_TARGET=$LOOM_TARGET
+LOOM_ORIGIN=$ORIGIN
+LOOM_DM_NAME=$LOOM_DM_NAME
+LOOM_DM_PATH=$DM_PATH
+LOOM_MOUNTPOINT=$LOOM_MOUNTPOINT
+LOOM_SECTORS=$SECTORS
+LOOM_MODE=identity-sidecar
+EOF
+  set_status SIDECAR_ACTIVE
+  log "activation PASS dm=$DM_PATH mountpoint=$LOOM_MOUNTPOINT mode=identity-sidecar"
+  return 0
+}
+
+cleanup_command() {
+  load_config || return 1
+  resolve_tools || return 1
+  cleanup_runtime
+  set_status SIDECAR_INACTIVE
+  log "cleanup PASS"
+}
+
+status_command() {
+  load_config || true
+  printf 'status='
+  cat "$STATE/status" 2>/dev/null || printf 'UNKNOWN\n'
+  [ -f "$STATE/preflight.env" ] && cat "$STATE/preflight.env"
+  [ -f "$STATE/runtime.env" ] && cat "$STATE/runtime.env"
+  if is_mounted; then
+    printf 'mounted=1\n'
+  else
+    printf 'mounted=0\n'
+  fi
+}
+
+case "${1:-status}" in
+  preflight) preflight ;;
+  activate) activate ;;
+  cleanup) cleanup_command ;;
+  status) status_command ;;
+  *) printf 'usage: %s {preflight|activate|cleanup|status}\n' "$0" >&2; exit 2 ;;
+esac

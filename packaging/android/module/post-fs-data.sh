@@ -15,16 +15,19 @@ if [ -f "$MODDIR/disable" ]; then
   exit 0
 fi
 
-if [ ! -x "$MODDIR/bin/loom" ]; then
-  echo "[loom] binary missing or not executable"
-  printf '%s\n' 'BINARY_MISSING' > "$STATE/status"
+if [ ! -x "$MODDIR/bin/loom-sidecar" ]; then
+  printf '%s\n' 'SIDECAR_RUNTIME_MISSING' > "$STATE/status"
+  echo "[loom] sidecar runtime missing"
   exit 0
 fi
 
-if "$MODDIR/bin/loom" --help >/dev/null 2>&1; then
-  printf '%s\n' 'PACKAGED_PRECHECK_OK' > "$STATE/status"
-  echo "[loom] arm64 binary precheck PASS"
+# post-fs-data is boot-critical. Keep this phase read-only and fast: it only
+# validates tools, the real origin device, and the packaged Loom binary.
+# No dm device or mount is created until service.sh.
+if "$MODDIR/bin/loom-sidecar" preflight; then
+  echo "[loom] sidecar preflight PASS"
 else
-  printf '%s\n' 'BINARY_PRECHECK_FAILED' > "$STATE/status"
-  echo "[loom] arm64 binary precheck FAIL"
+  echo "[loom] sidecar preflight FAIL; stock/current module mounts remain untouched"
 fi
+
+exit 0
