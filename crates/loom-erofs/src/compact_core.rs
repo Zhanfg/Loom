@@ -40,6 +40,7 @@ const LZ4_ALGORITHM: u8 = 0;
 const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
 const FEATURE_BIG_PCLUSTER: u32 = 0x0000_0002;
 const FEATURE_ZTAILPACKING: u32 = 0x0000_0010;
+const FEATURE_SB_CHKSUM: u32 = 0x0000_0001;
 const SUPPORTED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER | FEATURE_ZTAILPACKING;
 const BIG_REQUIRED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER;
 
@@ -122,6 +123,7 @@ struct BigTopology {
 struct Superblock {
     root_nid: u64,
     meta_block: u64,
+    feature_compat: u32,
     incompat: u32,
 }
 
@@ -221,6 +223,7 @@ pub(crate) fn compile_oracle(
         &replacement_topology.heads,
         encoded_blocks,
         vec![BLOCK_BYTES; replacement_topology.heads.len()],
+        origin.sb.feature_compat,
     )
 }
 
@@ -332,6 +335,7 @@ pub(crate) fn compile_lz4(
         &generated_heads,
         encoded_blocks,
         encoded_bytes,
+        origin.sb.feature_compat,
     )
 }
 
@@ -572,6 +576,7 @@ fn compile_blocks(
     replacement_heads: &[Head],
     encoded_blocks: Vec<Vec<u8>>,
     encoded_bytes: Vec<usize>,
+    feature_compat: u32,
 ) -> Result<CompiledCore, CoreError> {
     if replacement_heads.len() != topology.heads.len()
         || encoded_blocks.len() != topology.heads.len()
@@ -617,6 +622,9 @@ fn compile_blocks(
         head_lclusters.push(origin_head.lcn);
     }
 
+    if topology.inline_tail.is_some() && feature_compat & FEATURE_SB_CHKSUM != 0 {
+        refresh_erofs_superblock_checksum(&mut view)?;
+    }
     let compiled = view.finalize().map_err(CoreError::View)?;
     if compiled.shadow_blocks > topology.heads.len() {
         return Err(CoreError::InvalidFilesystem(
@@ -684,6 +692,48 @@ fn materialize_inline_tail(
         .ok_or(CoreError::UnexpectedEndOfStructure)?
         .copy_from_slice(&encoded_len_u16.to_le_bytes());
     Ok(())
+}
+
+fn refresh_erofs_superblock_checksum(view: &mut EffectiveBlockStore) -> Result<(), CoreError> {
+    const SUPER_CHECKSUM_OFFSET: usize = 1028;
+    const SUPER_CHECKSUM_END: usize = SUPER_CHECKSUM_OFFSET + 4;
+    const CRC32C_POLY: u32 = 0x82f6_3b78;
+
+    let superblock_offset =
+        usize::try_from(SUPERBLOCK_OFFSET).map_err(|_| CoreError::ArithmeticOverflow)?;
+    let block = view.block_mut(0).map_err(CoreError::View)?;
+    if block.len() != BLOCK_BYTES || superblock_offset >= block.len() {
+        return Err(CoreError::InvalidFilesystem(
+            "EROFS checksum refresh requires a complete 4 KiB block zero",
+        ));
+    }
+    block
+        .get_mut(SUPER_CHECKSUM_OFFSET..SUPER_CHECKSUM_END)
+        .ok_or(CoreError::UnexpectedEndOfStructure)?
+        .fill(0);
+    let crc = crc32c_raw(
+        u32::MAX,
+        block
+            .get(superblock_offset..)
+            .ok_or(CoreError::UnexpectedEndOfStructure)?,
+        CRC32C_POLY,
+    );
+    block
+        .get_mut(SUPER_CHECKSUM_OFFSET..SUPER_CHECKSUM_END)
+        .ok_or(CoreError::UnexpectedEndOfStructure)?
+        .copy_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
+
+fn crc32c_raw(mut crc: u32, bytes: &[u8], polynomial: u32) -> u32 {
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (polynomial & mask);
+        }
+    }
+    crc
 }
 
 fn compile_big_spans(
@@ -2409,6 +2459,7 @@ fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, CoreError>
     Ok(Superblock {
         root_nid: u64::from(read_u16(&raw, 0x0e)?),
         meta_block: u64::from(read_u32(&raw, 0x28)?),
+        feature_compat: read_u32(&raw, 0x08)?,
         incompat,
     })
 }
@@ -2891,6 +2942,11 @@ mod tests {
         assert_eq!(extents[1].physical_blocks, 1);
         assert_eq!(extents[2].kind, HeadKind::Lz4);
         assert_eq!(extents[2].physical_blocks, 1);
+    }
+
+    #[test]
+    fn erofs_crc32c_uses_raw_seeded_castagnoli_state() {
+        assert_eq!(crc32c_raw(u32::MAX, b"123456789", 0x82f6_3b78), 0x1cf9_6d7c);
     }
 
     #[test]
