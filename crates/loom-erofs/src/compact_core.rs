@@ -638,9 +638,9 @@ fn compile_big_spans(
     }
 
     let compiled = view.finalize().map_err(CoreError::View)?;
-    if compiled.shadow_blocks != expected_shadow_blocks {
+    if compiled.shadow_blocks > expected_shadow_blocks {
         return Err(CoreError::InvalidFilesystem(
-            "big-pcluster shadow block count differs from recovered CBLKCNT footprints",
+            "big-pcluster shadow block count exceeds recovered physical footprint",
         ));
     }
 
