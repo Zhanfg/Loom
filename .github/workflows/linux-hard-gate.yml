@@ -1,4 +1,4 @@
-name: stage38-checksum-maintenance
+name: stage38-checksum-maintenance-rerun
 
 on:
   push:
