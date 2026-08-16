@@ -23,12 +23,14 @@ jobs:
         run: |
           set -euo pipefail
           python3 tests/integration/apply_stage39_fragments.py
+          python3 tests/integration/refactor_stage39_fragments.py
           cargo fmt --all
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
 
           rm tests/integration/apply_stage39_fragments.py
+          rm tests/integration/refactor_stage39_fragments.py
           rm tests/integration/stage39_probe_erofs_fragments.sh
           cat > .github/workflows/linux-hard-gate.yml <<'YAML'
           name: linux-hard-gate
