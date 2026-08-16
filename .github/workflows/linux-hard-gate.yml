@@ -31,6 +31,18 @@ jobs:
           p.write_text(s.replace(old, new, 1))
           PY
           python3 tests/integration/apply_stage35_mixed_full_big.py
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('crates/loom-erofs/src/compact_core.rs')
+          s = p.read_text()
+          old = '''        let next_head = starts
+            .get(index + 1)
+            .map(|(lcn, _)| *lcn)
+            .unwrap_or(data_end);'''
+          new = '''        let next_head = starts.get(index + 1).map_or(data_end, |(lcn, _)| *lcn);'''
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
           cargo fmt --all
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets -- -D warnings
