@@ -11,7 +11,7 @@ trap cleanup EXIT
 
 STATE="$TMP/state"
 FAKE="$TMP/fake"
-PAYLOAD="$TMP/payload"
+PAYLOAD="$STATE/payload/system"
 mkdir -p "$STATE" "$FAKE" "$PAYLOAD/etc" "$PAYLOAD/bin"
 : > "$TMP/proc_mounts"
 printf 'origin-device\n' > "$TMP/origin.dev"
@@ -114,18 +114,6 @@ set -euo pipefail
 log=${FAKE_MOUNT_LOG:?}
 proc=${FAKE_PROC_MOUNTS:?}
 printf '%q ' "$@" >> "$log"; printf '\n' >> "$log"
-argc=$#
-device=${!((argc-1))}
-mountpoint=${!argc}
-printf '%s %s erofs ro 0 0\n' "$device" "$mountpoint" >> "$proc"
-SH
-# Bash indirect positional syntax above is awkward on old bash; replace with a portable array.
-cat > "$FAKE/mount" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-log=${FAKE_MOUNT_LOG:?}
-proc=${FAKE_PROC_MOUNTS:?}
-printf '%q ' "$@" >> "$log"; printf '\n' >> "$log"
 args=("$@")
 count=${#args[@]}
 device=${args[$((count-2))]}
@@ -188,18 +176,14 @@ grep -Fxq 'LOOM_LAYER_COUNT=2' "$STATE/shadow-runtime/runtime.env"
 grep -Fxq 'LOOM_TAKEOVER=0' "$STATE/shadow-runtime/runtime.env"
 grep -Fq " $STATE/mnt/system-shadow " "$TMP/proc_mounts"
 
-# The second compile must consume the first effective dm device, proving that
-# replacements are chained transactionally instead of all compiling from stock.
 first_dm="$TMP/dm/loom-shadow-test-1.dev"
 grep -Fq "origin=$first_dm target=/etc/alpha.conf" "$LOG_LOOM" || \
   grep -Fq "origin=$first_dm target=/bin/beta.bin" "$LOG_LOOM"
 
-# dmctl must receive read-only targets in dmctl order: linear start count device source.
 grep -Fq 'create loom-shadow-test-1 -ro linear 0 8' "$LOG_DM"
 grep -Fq ' linear 8 8 ' "$LOG_DM"
 grep -Fq 'create loom-shadow-test-2 -ro linear 0 8' "$LOG_DM"
 
-# Runtime code must never mount over Android system partitions in Alpha 2.
 if grep -Eq 'mount[^\n]*(/system|/vendor|/product)([[:space:]]|$)' "$RUNTIME"; then
   echo 'unsafe system mount target found in loom-shadow runtime' >&2
   exit 1
@@ -215,7 +199,6 @@ grep -Fq 'delete loom-shadow-test-2' "$LOG_DM"
 grep -Fq 'delete loom-shadow-test-1' "$LOG_DM"
 [[ "$(grep -c '^detach ' "$LOG_LOOP")" -ge 2 ]]
 
-# Failure on the second replacement must tear down the first dm/loop and leave no mount.
 : > "$LOG_LOOM"; : > "$LOG_DM"; : > "$LOG_LOOP"; : > "$TMP/proc_mounts"
 export FAKE_LOOM_FAIL_TARGET=/etc/alpha.conf
 if bash "$RUNTIME" activate; then
@@ -229,7 +212,6 @@ grep -q '^delete loom-shadow-test-' "$LOG_DM"
 grep -q '^detach ' "$LOG_LOOP"
 unset FAKE_LOOM_FAIL_TARGET
 
-# Takeover remains a hard-disabled safety gate.
 sed -i 's/^LOOM_TAKEOVER=0$/LOOM_TAKEOVER=1/' "$STATE/shadow.conf"
 if bash "$RUNTIME" preflight; then
   echo 'takeover=1 must be rejected in Alpha 2' >&2
@@ -238,7 +220,6 @@ fi
 [[ "$(cat "$STATE/status")" == SHADOW_CONFIG_INVALID ]]
 sed -i 's/^LOOM_TAKEOVER=1$/LOOM_TAKEOVER=0/' "$STATE/shadow.conf"
 
-# Symlink payloads are rejected rather than partially materialized.
 ln -s alpha.conf "$PAYLOAD/etc/link.conf"
 if bash "$RUNTIME" preflight; then
   echo 'symlink payload must be rejected in Alpha 2' >&2
