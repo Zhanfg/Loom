@@ -38,7 +38,6 @@ new = '''    Ok(Superblock {
 assert old in s
 s = s.replace(old, new, 1)
 
-# Pass origin compatible-feature state into the ordinary compiler materializer.
 old = '''    compile_blocks(
         origin_path,
         &origin_topology,
@@ -100,12 +99,10 @@ new = '''    if topology.inline_tail.is_some() && feature_compat & FEATURE_SB_CH
     }
     let compiled = view.finalize().map_err(CoreError::View)?;
 '''
-# Only replace the ordinary compile_blocks finalize; it is the first occurrence after compile_blocks.
 start = s.index('fn compile_blocks(')
 pos = s.index(old, start)
 s = s[:pos] + s[pos:].replace(old, new, 1)
 
-# Add checksum helpers before compile_big_spans.
 anchor = '\nfn compile_big_spans('
 assert anchor in s
 helpers = r'''
@@ -114,8 +111,10 @@ fn refresh_erofs_superblock_checksum(view: &mut EffectiveBlockStore) -> Result<(
     const SUPER_CHECKSUM_END: usize = SUPER_CHECKSUM_OFFSET + 4;
     const CRC32C_POLY: u32 = 0x82f6_3b78;
 
+    let superblock_offset =
+        usize::try_from(SUPERBLOCK_OFFSET).map_err(|_| CoreError::ArithmeticOverflow)?;
     let block = view.block_mut(0).map_err(CoreError::View)?;
-    if block.len() != BLOCK_BYTES || SUPERBLOCK_OFFSET as usize >= block.len() {
+    if block.len() != BLOCK_BYTES || superblock_offset >= block.len() {
         return Err(CoreError::InvalidFilesystem(
             "EROFS checksum refresh requires a complete 4 KiB block zero",
         ));
@@ -127,7 +126,7 @@ fn refresh_erofs_superblock_checksum(view: &mut EffectiveBlockStore) -> Result<(
     let crc = crc32c_raw(
         u32::MAX,
         block
-            .get(SUPERBLOCK_OFFSET as usize..)
+            .get(superblock_offset..)
             .ok_or(CoreError::UnexpectedEndOfStructure)?,
         CRC32C_POLY,
     );
@@ -152,7 +151,6 @@ fn crc32c_raw(mut crc: u32, bytes: &[u8], polynomial: u32) -> u32 {
 '''
 s = s.replace(anchor, '\n' + helpers + 'fn compile_big_spans(', 1)
 
-# Add focused CRC unit test before the existing 0padding round-trip test.
 anchor = '''    #[test]
     fn eight_kib_0padding_span_round_trips() {'''
 assert anchor in s
