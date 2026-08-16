@@ -118,19 +118,19 @@ sudo mount -t erofs -o ro "$ORIGIN_LOOP" "$MOUNT_DIR"
 sudo cmp "$MOUNT_DIR/000payload.bin" "$ORIGINAL"
 sudo umount "$MOUNT_DIR"
 
-# A legacy/full-index image must be rejected without output side effects. This
-# protects the compact reader from accidentally interpreting full-index bytes.
-# The unified compact core now rejects legacy images at the superblock feature
-# gate before it reaches the inode-layout gate, so either rejection layer is valid.
+# Stage 29 teaches the shared core to parse legacy/full-index images, but a
+# legacy non-0padding origin still must never consume a compact 0padding oracle.
+# The two layouts place the same raw LZ4 bytes at opposite ends of the physical
+# block. Reject this cross-placement pairing before any output side effects.
 rm -f "$WORK/legacy.shadow" "$WORK/legacy.table" "$WORK/legacy.err"
 if "$LOOM" erofs-compact-pcluster-swap \
   "$LEGACY_IMG" /000payload.bin "$REPL_IMG" \
   "$WORK/legacy.shadow" "$ORIGIN_LOOP" UNUSED "$WORK/legacy.table" \
   >"$WORK/legacy.out" 2>"$WORK/legacy.err"; then
-  echo 'Stage 12 expected full-index rejection' >&2
+  echo 'Stage 12 expected legacy/compact placement mismatch rejection' >&2
   exit 1
 fi
-grep -Eq 'LZ4_0PADDING|expects normal compact LZ4|requires EROFS_INODE_COMPRESSED_COMPACT' "$WORK/legacy.err"
+grep -q 'LZ4 physical placement mode differs' "$WORK/legacy.err"
 [[ ! -e "$WORK/legacy.shadow" ]]
 [[ ! -e "$WORK/legacy.table" ]]
 
@@ -140,5 +140,5 @@ printf '%s\n' \
   '  compact topology: HEAD1 + NONHEAD in one 8-byte pack' \
   '  encoded physical blocks: 1' \
   '  shadow blocks: 1' \
-  '  legacy/full-index rejection: PASS' \
+  '  legacy/full-index to compact/0padding oracle rejection: PASS' \
   "  origin sha256: $STOCK_HASH_AFTER"
