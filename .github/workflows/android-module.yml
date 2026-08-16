@@ -25,6 +25,7 @@ on:
         type: boolean
   push:
     branches:
+      - main
       - infra/android-module-pipeline
       - 'feat/android-sidecar-*'
   pull_request:
