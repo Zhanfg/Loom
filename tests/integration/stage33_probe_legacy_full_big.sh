@@ -7,7 +7,10 @@ python3 - "$ROOT/000payload.bin" <<'PY'
 import random,sys
 SIZE=98304; PERIOD=10000
 rng=random.Random(0x330001); p=bytes(rng.randrange(256) for _ in range(PERIOD))
-data=bytearray((p*((SIZE+PERIOD-1)//PERIOD))[:SIZE]); data[64:83]=b'LOOM-STAGE33-BIGFULL'
+data=bytearray((p*((SIZE+PERIOD-1)//PERIOD))[:SIZE])
+marker=b'LOOM-STAGE33-BIGFULL'
+data[64:64+len(marker)]=marker
+assert len(data)==SIZE
 open(sys.argv[1],'wb').write(data)
 PY
 for i in $(seq -w 0 499); do : > "$ROOT/z_dummy_${i}_for_directory_growth"; done
