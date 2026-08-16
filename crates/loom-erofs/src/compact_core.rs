@@ -1308,7 +1308,8 @@ impl Image {
                 "FRAGMENTS feature is enabled without a packed inode",
             ));
         }
-        let pcluster = if fragment_offset == 0 {
+        let packed_size = self.read_inode(packed_nid)?.size;
+        let pcluster = if fragment_offset == 0 && packed_size == fragment_size {
             self.recover_stage39_packed_pcluster(packed_nid, fragment_size)?
         } else {
             self.recover_stage40_shared_packed_pcluster(packed_nid, fragment_offset, fragment_size)?
@@ -1390,13 +1391,9 @@ impl Image {
         fragment_size: u64,
     ) -> Result<u64, CoreError> {
         let block = u64::from(BLOCK_SIZE);
-        if fragment_offset == 0
-            || fragment_offset % block != 0
-            || fragment_size == 0
-            || fragment_size % block != 0
-        {
+        if fragment_offset % block != 0 || fragment_size == 0 || fragment_size % block != 0 {
             return Err(CoreError::UnsupportedInode(
-                "Stage 40 requires a non-zero block-aligned shared fragment extent",
+                "shared fragment support requires a block-aligned non-empty extent",
             ));
         }
         let packed = self.read_inode(packed_nid)?;

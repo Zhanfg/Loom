@@ -10,11 +10,11 @@ WORK="$(mktemp -d)"
 ROOT="$WORK/root"; MNT="$WORK/mnt"
 IMG="$WORK/origin.erofs"; BAD_IMG="$WORK/bad-offset.erofs"
 ALPHA="$WORK/alpha.bin"; BETA="$WORK/beta.bin"
-BETA_REPLACEMENT="$WORK/beta-replacement.bin"; BETA_OVERFLOW="$WORK/beta-overflow.bin"
+REPLACEMENT="$WORK/alpha-replacement.bin"; OVERFLOW="$WORK/alpha-overflow.bin"
 SHADOW="$WORK/shadow.pack"; TABLE="$WORK/loom.table"
 BAD_SHADOW="$WORK/bad.shadow"; BAD_TABLE="$WORK/bad.table"
 OFFSET_SHADOW="$WORK/offset.shadow"; OFFSET_TABLE="$WORK/offset.table"
-ORIGIN_LOOP=""; SHADOW_LOOP=""; BAD_LOOP=""; MAPPER="loom-stage40-${RANDOM}-${RANDOM}"
+ORIGIN_LOOP=""; SHADOW_LOOP=""; BAD_LOOP=""; MAPPER="loom-stage41-${RANDOM}-${RANDOM}"
 cleanup() {
   set +e
   mountpoint -q "$MNT" 2>/dev/null && sudo umount "$MNT"
@@ -25,19 +25,19 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
-trap 'rc=$?; printf "Stage 40 FAIL line=%s status=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit "$rc"' ERR
+trap 'rc=$?; printf "Stage 41 FAIL line=%s status=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit "$rc"' ERR
 mkdir -p "$ROOT" "$MNT"
 
-python3 - "$ALPHA" "$BETA" "$BETA_REPLACEMENT" "$BETA_OVERFLOW" <<'PY'
+python3 - "$ALPHA" "$BETA" "$REPLACEMENT" "$OVERFLOW" <<'PY'
 import random,sys
 SIZE=98304; EXTENT=32768
 def fill(pat): return (pat*((SIZE//len(pat))+1))[:SIZE]
-alpha=fill(b'STAGE40-ALPHA-FRAGMENT-')
-beta=fill(b'STAGE40-BETA-FRAGMENT-')
-beta_replacement=b'A'*EXTENT + b'B'*EXTENT + b'Z'*EXTENT
-rng=random.Random(0x4000F10)
-beta_overflow=beta_replacement[:2*EXTENT] + bytes(rng.randrange(256) for _ in range(EXTENT))
-for path,data in zip(sys.argv[1:],(alpha,beta,beta_replacement,beta_overflow)):
+alpha=fill(b'STAGE41-ALPHA-FRAGMENT-')
+beta=fill(b'STAGE41-BETA-FRAGMENT-')
+replacement=b'Q'*EXTENT + b'R'*EXTENT + b'S'*EXTENT
+rng=random.Random(0x4100F10)
+overflow=replacement[:2*EXTENT] + bytes(rng.randrange(256) for _ in range(EXTENT))
+for path,data in zip(sys.argv[1:],(alpha,beta,replacement,overflow)):
     assert len(data)==SIZE
     open(path,'wb').write(data)
 PY
@@ -94,11 +94,11 @@ packed=inode(packed_nid); assert packed['size']==65536 and packed['layout']==1 a
 p,ph,plow,padv,pheads=full(packed_nid,16)
 assert plow==0 and padv==0x10 and [x[0] for x in pheads]==[0,8],pheads
 assert pheads[0][1] != pheads[1][1]
-print(nids[0],nids[1],packed_nid,aheads[0][1],aheads[1][1],bheads[0][1],bheads[1][1],pheads[0][1],pheads[1][1],bh)
+print(nids[0],nids[1],packed_nid,aheads[0][1],aheads[1][1],bheads[0][1],bheads[1][1],pheads[0][1],pheads[1][1],ah)
 PY
 )"
-read -r NID_ALPHA NID_BETA PACKED_NID A0 A1 B0 B1 P0 P1 BETA_HEADER <<< "$META"
-printf 'Stage 40 raw shared topology PASS alpha_nid=%s beta_nid=%s packed_nid=%s alpha=[%s,%s] beta=[%s,%s] packed=[%s,%s] beta_fragmentoff=32768\n' \
+read -r NID_ALPHA NID_BETA PACKED_NID A0 A1 B0 B1 P0 P1 ALPHA_HEADER <<< "$META"
+printf 'Stage 41 raw shared offset-zero topology PASS alpha_nid=%s beta_nid=%s packed_nid=%s alpha=[%s,%s] beta=[%s,%s] packed=[%s,%s]\n' \
   "$NID_ALPHA" "$NID_BETA" "$PACKED_NID" "$A0" "$A1" "$B0" "$B1" "$P0" "$P1"
 
 HASH_BEFORE="$(sha256sum "$IMG" | awk '{print $1}')"
@@ -109,10 +109,10 @@ sudo cmp "$MNT/001beta.bin" "$BETA"
 sudo umount "$MNT"
 
 OUTPUT="$("$LOOM" erofs-compact-pcluster-swap --multi-encode \
-  "$IMG" /001beta.bin "$BETA_REPLACEMENT" "$SHADOW" "$ORIGIN_LOOP" \
+  "$IMG" /000alpha.bin "$REPLACEMENT" "$SHADOW" "$ORIGIN_LOOP" \
   LOOM_SHADOW_PLACEHOLDER "$TABLE")"
 printf '%s\n' "$OUTPUT"
-python3 - "$OUTPUT" "$B0" "$B1" "$P1" <<'PY'
+python3 - "$OUTPUT" "$A0" "$A1" "$P0" <<'PY'
 import ast,re,sys
 out=sys.argv[1]; expected=[int(x) for x in sys.argv[2:5]]
 def vec(name):
@@ -123,7 +123,7 @@ assert vec('origin_pclusters')==expected,(vec('origin_pclusters'),expected)
 assert vec('replacement_pclusters')==expected,(vec('replacement_pclusters'),expected)
 encoded=vec('encoded_bytes'); assert len(encoded)==3 and all(0<x<=4096 for x in encoded),encoded
 assert 'shadow_blocks=3' in out,out
-print(f'Stage 40 isolated shared compiler routing PASS physical={expected} encoded={encoded}')
+print(f'Stage 41 shared offset-zero compiler routing PASS physical={expected} encoded={encoded}')
 PY
 [[ "$(stat -c %s "$SHADOW")" -eq 12288 ]]
 
@@ -131,32 +131,30 @@ SHADOW_LOOP="$(sudo losetup --find --show --read-only "$SHADOW")"
 sed -i "s|LOOM_SHADOW_PLACEHOLDER|$SHADOW_LOOP|g" "$TABLE"
 sudo dmsetup create "$MAPPER" < "$TABLE"
 sudo mount -t erofs -o ro "/dev/mapper/$MAPPER" "$MNT"
-sudo cmp "$MNT/000alpha.bin" "$ALPHA"
-sudo cmp "$MNT/001beta.bin" "$BETA_REPLACEMENT"
+sudo cmp "$MNT/000alpha.bin" "$REPLACEMENT"
+sudo cmp "$MNT/001beta.bin" "$BETA"
 sudo umount "$MNT"
 sudo fsck.erofs "/dev/mapper/$MAPPER" >/dev/null
 
 sudo python3 - "$IMG" "/dev/mapper/$MAPPER" "$A0" "$A1" "$B0" "$B1" "$P0" "$P1" <<'PY'
 import sys
 origin=open(sys.argv[1],'rb').read(); blocks=[int(x) for x in sys.argv[3:]]; BS=4096
-with open(sys.argv[2],'rb',buffering=0) as f:
-    effective=f.read()
+with open(sys.argv[2],'rb',buffering=0) as f: effective=f.read()
 assert effective[:BS]==origin[:BS]
-for p in (blocks[0],blocks[1],blocks[4]):
-    assert effective[p*BS:(p+1)*BS]==origin[p*BS:(p+1)*BS],p
 for p in (blocks[2],blocks[3],blocks[5]):
+    assert effective[p*BS:(p+1)*BS]==origin[p*BS:(p+1)*BS],p
+for p in (blocks[0],blocks[1],blocks[4]):
     assert effective[p*BS:(p+1)*BS]!=origin[p*BS:(p+1)*BS],p
-print('Stage 40 isolation PASS alpha data + packed extent0 unchanged; beta data + packed extent1 replaced')
+print('Stage 41 isolation PASS beta data + packed extent1 unchanged; alpha data + packed extent0 replaced')
 PY
 
 sudo dmsetup remove "$MAPPER"
 sudo losetup -d "$SHADOW_LOOP"; SHADOW_LOOP=""
 HASH_AFTER="$(sha256sum "$IMG" | awk '{print $1}')"; [[ "$HASH_BEFORE" == "$HASH_AFTER" ]]
 
-# Incompressible beta fragment must fail before materialization.
 rm -f "$BAD_SHADOW" "$BAD_TABLE"
 if BAD_OUTPUT="$("$LOOM" erofs-compact-pcluster-swap --multi-encode \
-  "$IMG" /001beta.bin "$BETA_OVERFLOW" "$BAD_SHADOW" "$ORIGIN_LOOP" UNUSED "$BAD_TABLE" 2>&1)"; then
+  "$IMG" /000alpha.bin "$OVERFLOW" "$BAD_SHADOW" "$ORIGIN_LOOP" UNUSED "$BAD_TABLE" 2>&1)"; then
   BAD_STATUS=0
 else
   BAD_STATUS=$?
@@ -167,9 +165,8 @@ echo "$BAD_OUTPUT" | grep -q 'HEAD lcluster 16 does not fit existing pcluster'
 echo "$BAD_OUTPUT" | grep -q 'capacity 4096'
 [[ ! -e "$BAD_SHADOW" && ! -e "$BAD_TABLE" ]]
 
-# A nonzero fragment offset that no longer starts on a packed HEAD boundary must be rejected.
 cp "$IMG" "$BAD_IMG"
-python3 - "$BAD_IMG" "$BETA_HEADER" <<'PY'
+python3 - "$BAD_IMG" "$ALPHA_HEADER" <<'PY'
 import struct,sys
 path=sys.argv[1]; off=int(sys.argv[2])
 with open(path,'r+b') as f:
@@ -178,7 +175,7 @@ PY
 BAD_LOOP="$(sudo losetup --find --show --read-only "$BAD_IMG")"
 rm -f "$OFFSET_SHADOW" "$OFFSET_TABLE"
 if OFFSET_OUTPUT="$("$LOOM" erofs-compact-pcluster-swap --multi-encode \
-  "$BAD_IMG" /001beta.bin "$BETA_REPLACEMENT" "$OFFSET_SHADOW" "$BAD_LOOP" UNUSED "$OFFSET_TABLE" 2>&1)"; then
+  "$BAD_IMG" /000alpha.bin "$REPLACEMENT" "$OFFSET_SHADOW" "$BAD_LOOP" UNUSED "$OFFSET_TABLE" 2>&1)"; then
   OFFSET_STATUS=0
 else
   OFFSET_STATUS=$?
@@ -190,19 +187,15 @@ echo "$OFFSET_OUTPUT" | grep -q 'shared fragment does not begin at a packed HEAD
 sudo losetup -d "$BAD_LOOP"; BAD_LOOP=""
 
 printf '%s\n' \
-  'Stage 40 isolated nonzero shared fragment PASS' \
-  '  two target files: 98304 bytes each' \
-  '  superblock incompat: 0x20 (FRAGMENTS)' \
+  'Stage 41 isolated shared offset-zero fragment PASS' \
   '  alpha fragment offset: 0; beta fragment offset: 32768' \
   '  packed inode: 65536 bytes / HEAD lclusters [0, 8] / two physical pclusters' \
   "  packed physical pclusters: [$P0, $P1]" \
-  '  beta maps exactly to packed HEAD extent 1' \
-  '  alpha ordinary data + packed extent 0 unchanged: PASS' \
-  '  beta ordinary data + packed extent 1 replaced: PASS' \
-  '  effective alpha preservation: PASS' \
-  '  effective beta replacement: PASS' \
+  '  alpha maps exactly to packed HEAD extent 0' \
+  '  alpha replacement + beta preservation: PASS' \
+  '  metadata block zero unchanged: PASS' \
   '  effective fsck.erofs: PASS' \
-  '  beta fragment overflow rejection before materialization: PASS' \
-  '  non-HEAD-boundary fragment offset rejection before materialization: PASS' \
+  '  alpha fragment overflow rejection before materialization: PASS' \
+  '  non-HEAD-boundary shared offset rejection before materialization: PASS' \
   '  authoritative origin: unchanged' \
   "  origin sha256: $HASH_AFTER"
