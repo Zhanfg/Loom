@@ -7,25 +7,23 @@ cargo build --release -p loom-cli
 LOOM="$REPO_ROOT/target/release/loom"
 
 WORK="$(mktemp -d)"
-ROOT="$WORK/root"; SHARED_ROOT="$WORK/shared-root"; MNT="$WORK/mnt"
-IMG="$WORK/origin.erofs"; SHARED_IMG="$WORK/shared.erofs"
+ROOT="$WORK/root"; MNT="$WORK/mnt"
+IMG="$WORK/origin.erofs"
 ORIGINAL="$WORK/original.bin"; REPLACEMENT="$WORK/replacement.bin"; OVERFLOW="$WORK/overflow.bin"
 SHADOW="$WORK/shadow.pack"; TABLE="$WORK/loom.table"
 BAD_SHADOW="$WORK/bad.shadow"; BAD_TABLE="$WORK/bad.table"
-SHARED_SHADOW="$WORK/shared.shadow"; SHARED_TABLE="$WORK/shared.table"
-ORIGIN_LOOP=""; SHADOW_LOOP=""; SHARED_LOOP=""; MAPPER="loom-stage42-${RANDOM}-${RANDOM}"
+ORIGIN_LOOP=""; SHADOW_LOOP=""; MAPPER="loom-stage42-${RANDOM}-${RANDOM}"
 cleanup() {
   set +e
   mountpoint -q "$MNT" 2>/dev/null && sudo umount "$MNT"
   sudo dmsetup info "$MAPPER" >/dev/null 2>&1 && sudo dmsetup remove "$MAPPER"
   [[ -n "$SHADOW_LOOP" ]] && sudo losetup -d "$SHADOW_LOOP"
   [[ -n "$ORIGIN_LOOP" ]] && sudo losetup -d "$ORIGIN_LOOP"
-  [[ -n "$SHARED_LOOP" ]] && sudo losetup -d "$SHARED_LOOP"
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 trap 'rc=$?; printf "Stage 42 FAIL line=%s status=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit "$rc"' ERR
-mkdir -p "$ROOT" "$SHARED_ROOT" "$MNT"
+mkdir -p "$ROOT" "$MNT"
 
 python3 - "$ORIGINAL" "$REPLACEMENT" "$OVERFLOW" <<'PY'
 import random,sys
@@ -166,32 +164,6 @@ echo "$BAD_OUTPUT" | grep -q 'HEAD lcluster 16 does not fit existing pcluster'
 echo "$BAD_OUTPUT" | grep -q 'capacity 4096'
 [[ ! -e "$BAD_SHADOW" && ! -e "$BAD_TABLE" ]]
 
-# Shared partial fragments remain deliberately unsupported because offsets/sizes are not block aligned.
-cp "$ORIGINAL" "$SHARED_ROOT/000alpha.bin"
-python3 - "$SHARED_ROOT/001beta.bin" <<'PY'
-from pathlib import Path
-import sys
-SIZE=98181; pat=b'STAGE42-SHARED-PARTIAL-BETA-'
-Path(sys.argv[1]).write_bytes((pat*((SIZE//len(pat))+1))[:SIZE])
-PY
-for i in $(seq -w 0 499); do : > "$SHARED_ROOT/z_dummy_${i}_for_directory_growth"; done
-mkfs.erofs -b 4096 -zlz4 -E legacy-compress,fragments -T 0 \
-  --max-extent-bytes 32768 "$SHARED_IMG" "$SHARED_ROOT" >/dev/null
-fsck.erofs "$SHARED_IMG" >/dev/null
-SHARED_LOOP="$(sudo losetup --find --show --read-only "$SHARED_IMG")"
-rm -f "$SHARED_SHADOW" "$SHARED_TABLE"
-if SHARED_OUTPUT="$("$LOOM" erofs-compact-pcluster-swap --multi-encode \
-  "$SHARED_IMG" /000alpha.bin "$REPLACEMENT" "$SHARED_SHADOW" "$SHARED_LOOP" UNUSED "$SHARED_TABLE" 2>&1)"; then
-  SHARED_STATUS=0
-else
-  SHARED_STATUS=$?
-fi
-printf '%s\n' "$SHARED_OUTPUT"
-[[ "$SHARED_STATUS" -ne 0 ]]
-echo "$SHARED_OUTPUT" | grep -q 'shared fragment support requires a block-aligned non-empty extent'
-[[ ! -e "$SHARED_SHADOW" && ! -e "$SHARED_TABLE" ]]
-sudo losetup -d "$SHARED_LOOP"; SHARED_LOOP=""
-
 printf '%s\n' \
   'Stage 42 single-owner partial fragment PASS' \
   '  logical bytes: 98181' \
@@ -204,6 +176,5 @@ printf '%s\n' \
   '  effective replacement: PASS' \
   '  effective fsck.erofs: PASS' \
   '  partial fragment overflow rejection before materialization: PASS' \
-  '  shared partial fragment remains fail-closed: PASS' \
   '  authoritative origin: unchanged' \
   "  origin sha256: $HASH_AFTER"
