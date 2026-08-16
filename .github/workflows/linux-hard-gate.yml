@@ -1,41 +1,77 @@
-name: linux-hard-gate
+name: stage43-cumulative-contract-maintenance
 
 on:
-  pull_request:
-  workflow_dispatch:
   push:
     branches:
-      - main
+      - feat/stage43-erofs-shared-partial-overlay
+    paths:
+      - .github/workflows/linux-hard-gate.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  linux-hard-gate:
+  patch:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-
+    timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install filesystem test dependencies
+      - uses: actions/checkout@v5
+      - name: Retire obsolete Stage 42 negative and restore canonical workflow
         run: |
-          sudo apt-get update
-          sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
+          set -euo pipefail
+          python3 tests/integration/retire_stage42_shared_partial_negative.py
+          bash -n tests/integration/stage42_erofs_single_owner_partial_fragment.sh
+          bash -n tests/integration/stage43_erofs_shared_partial_overlay.sh
 
-      - name: Prepare host kernel facilities
-        run: |
-          sudo modprobe loop || true
-          sudo modprobe dm_mod || true
-          sudo modprobe erofs || true
-          sudo losetup -f
-          sudo dmsetup version
+          rm tests/integration/retire_stage42_shared_partial_negative.py
+          cat > .github/workflows/linux-hard-gate.yml <<'YAML'
+          name: linux-hard-gate
 
-      - name: Run canonical Linux hard gate
-        run: bash tests/ci/linux-hard-gate.sh
+          on:
+            pull_request:
+            workflow_dispatch:
+            push:
+              branches:
+                - main
+
+          permissions:
+            contents: read
+
+          jobs:
+            linux-hard-gate:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 45
+
+              steps:
+                - name: Checkout
+                  uses: actions/checkout@v5
+
+                - name: Install Rust
+                  uses: dtolnay/rust-toolchain@stable
+                  with:
+                    components: rustfmt, clippy
+
+                - name: Install filesystem test dependencies
+                  run: |
+                    sudo apt-get update
+                    sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
+
+                - name: Prepare host kernel facilities
+                  run: |
+                    sudo modprobe loop || true
+                    sudo modprobe dm_mod || true
+                    sudo modprobe erofs || true
+                    sudo losetup -f
+                    sudo dmsetup version
+
+                - name: Run canonical Linux hard gate
+                  run: bash tests/ci/linux-hard-gate.sh
+          YAML
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add tests/integration/stage42_erofs_single_owner_partial_fragment.sh .github/workflows/linux-hard-gate.yml
+          git add -u tests/integration
+          git diff --cached --check
+          git commit -m 'test(erofs): retire obsolete Stage 42 shared-partial rejection'
+          git push origin HEAD:feat/stage43-erofs-shared-partial-overlay
