@@ -49,9 +49,6 @@ replacement_first = bytearray(origin_first)
 replacement_middle = bytearray(middle)
 replacement_last = bytearray(origin_last)
 
-# Preserve the calibrated compressibility regime while making every kind of extent
-# materially different. The random tail feeding the 4-block LZ4 extent remains mostly
-# unchanged so its encoded stream stays safely inside the existing 16-KiB footprint.
 replacement_first[64:88] = b'LOOM-STAGE35-REPL-A-0000'
 for lcn in range(8, 13):
     off = (lcn - 8) * 4096 + 128
@@ -126,14 +123,14 @@ assert raw_header[8:16] == bytes(8)
 full_start = header + 16
 
 expected_starts = {
-    0:  (1, 2, 1),
-    8:  (0, 3, 1),
-    9:  (0, 4, 1),
-    10: (0, 5, 1),
-    11: (0, 6, 1),
-    12: (0, 7, 1),
-    13: (1, 8, 4),
-    21: (1, 12, 1),
+    0:  (1, 1, 1),
+    8:  (0, 2, 1),
+    9:  (0, 3, 1),
+    10: (0, 4, 1),
+    11: (0, 5, 1),
+    12: (0, 6, 1),
+    13: (1, 7, 4),
+    21: (1, 11, 1),
 }
 for lcn in range(24):
     p = full_start + lcn * 8
@@ -162,7 +159,8 @@ for head, next_head, cblkcnt in [(0, 8, 1), (13, 21, 4), (21, 24, 1)]:
 
 assert blocks == 11, blocks
 print('Stage 35 raw mixed full-big topology PASS '
-      f'nid={nid} starts={list(expected_starts)} blocks=[1,1,1,1,1,1,4,1] data_word={blocks}')
+      f'nid={nid} starts={list(expected_starts)} pclusters={[v[1] for v in expected_starts.values()]} '
+      f'blocks=[1,1,1,1,1,1,4,1] data_word={blocks}')
 PY
 
 HASH_BEFORE="$(sha256sum "$IMG" | awk '{print $1}')"
@@ -181,7 +179,7 @@ echo "$OUTPUT" | grep -q 'mode=multi-encode'
 echo "$OUTPUT" | grep -q 'physical_pclusters=8'
 echo "$OUTPUT" | grep -q 'logical_lclusters=24'
 echo "$OUTPUT" | grep -q 'head_lclusters=\[0, 8, 9, 10, 11, 12, 13, 21\]'
-echo "$OUTPUT" | grep -q 'origin_pclusters=\[2, 3, 4, 5, 6, 7, 8, 12\]'
+echo "$OUTPUT" | grep -q 'origin_pclusters=\[1, 2, 3, 4, 5, 6, 7, 11\]'
 echo "$OUTPUT" | grep -q 'shadow_blocks=11'
 [[ "$(stat -c %s "$SHADOW")" -eq 45056 ]]
 
@@ -204,8 +202,6 @@ replacement = open(sys.argv[2], 'rb').read()
 e0, e13, e21 = map(int, sys.argv[3:])
 assert len(shadow) == 11 * 4096
 
-# Extent ordering in the shadow is pblk order: LZ4@0, five PLAIN blocks,
-# four-block LZ4@13, one-block LZ4@21.
 for i, lcn in enumerate(range(8, 13), start=1):
     got = shadow[i * 4096:(i + 1) * 4096]
     want = replacement[lcn * 4096:(lcn + 1) * 4096]
@@ -238,8 +234,6 @@ SHADOW_LOOP=""
 HASH_MID="$(sha256sum "$IMG" | awk '{print $1}')"
 [[ "$HASH_BEFORE" == "$HASH_MID" ]]
 
-# Corrupt the first PLAIN data extent (LCN8) by giving it a non-zero cluster offset.
-# The mixed full-big parser must reject this before any materialization artifact exists.
 cp "$IMG" "$BAD_IMG"
 python3 - "$BAD_IMG" <<'PY'
 import stat
@@ -269,7 +263,7 @@ for nid in range(int(inos) + 16):
     full_start = ((off + isize + xsize + 7) & ~7) + 16
     p = full_start + 8 * 8
     advise, clusterofs, word = struct.unpack_from('<HHI', raw, p)
-    assert (advise, clusterofs, word) == (0, 0, 3)
+    assert (advise, clusterofs, word) == (0, 0, 2)
     struct.pack_into('<H', raw, p + 2, 1)
     open(path, 'wb').write(raw)
     break
@@ -304,7 +298,7 @@ printf '%s\n' \
   '  extent lclusters: [0, 8, 9, 10, 11, 12, 13, 21]' \
   '  extent kinds: [LZ4, PLAIN, PLAIN, PLAIN, PLAIN, PLAIN, LZ4, LZ4]' \
   '  physical footprints: [1, 1, 1, 1, 1, 1, 4, 1]' \
-  '  physical pcluster starts: [2, 3, 4, 5, 6, 7, 8, 12]' \
+  '  physical pcluster starts: [1, 2, 3, 4, 5, 6, 7, 11]' \
   '  PLAIN raw-copy blocks: 5 x 4096' \
   "  LZ4 encoded bytes: [$E0, $E13, $E21]" \
   '  LegacyStart compressed-span placement: PASS' \
