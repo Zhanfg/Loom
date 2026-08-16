@@ -94,6 +94,9 @@ case "$1" in
     printf '%s\n' "$dev" > "$state/${name}.path"
     ;;
   getpath)
+    if [[ "${FAKE_DM_GETPATH_FAIL:-0}" == 1 ]]; then
+      exit 1
+    fi
     cat "$state/$2.path"
     ;;
   delete)
@@ -211,6 +214,21 @@ fi
 grep -q '^delete loom-shadow-test-' "$LOG_DM"
 grep -q '^detach ' "$LOG_LOOP"
 unset FAKE_LOOM_FAIL_TARGET
+
+# A dm object created successfully but lacking a usable getpath must be deleted
+# immediately; its loop must also be detached.
+: > "$LOG_DM"; : > "$LOG_LOOP"; : > "$TMP/proc_mounts"
+export FAKE_DM_GETPATH_FAIL=1
+if bash "$RUNTIME" activate; then
+  echo 'expected dm getpath failure to abort activation' >&2
+  exit 1
+fi
+[[ "$(cat "$STATE/status")" == SHADOW_COMPILE_FAILED ]]
+[[ ! -d "$STATE/shadow-runtime" ]]
+[[ ! -s "$TMP/proc_mounts" ]]
+grep -Fq 'delete loom-shadow-test-1' "$LOG_DM"
+grep -q '^detach ' "$LOG_LOOP"
+unset FAKE_DM_GETPATH_FAIL
 
 sed -i 's/^LOOM_TAKEOVER=0$/LOOM_TAKEOVER=1/' "$STATE/shadow.conf"
 if bash "$RUNTIME" preflight; then

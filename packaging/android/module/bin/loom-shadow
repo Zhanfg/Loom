@@ -310,6 +310,7 @@ compile_layer() {
   dm_name="${LOOM_DM_PREFIX}-${index}"
   dm_delete_name "$dm_name"
   if ! dm_create_from_table "$dm_name" "$table"; then
+    dm_delete_name "$dm_name"
     "$LOSETUP" -d "$loop" >/dev/null 2>&1 || true
     return 1
   fi
