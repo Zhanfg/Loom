@@ -1,4 +1,4 @@
-name: stage33-legacy-full-big-diagnostic
+name: stage33-legacy-full-big-diagnostic-rerun
 
 on:
   push:
@@ -19,5 +19,5 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y erofs-utils
-      - name: Probe legacy full-index big pclusters
+      - name: Probe exact-size legacy full-index big pclusters
         run: bash tests/integration/stage33_probe_legacy_full_big.sh
