@@ -1,0 +1,6 @@
+id=loom
+name=Loom
+version=@VERSION_NAME@
+versionCode=@VERSION_CODE@
+author=Loom Project
+description=Systemless effective-block-view runtime. Packaging alpha for arm64 Android; automatic mount activation remains fail-closed until the Android runtime bridge is enabled. Source @SOURCE_SHA@.
