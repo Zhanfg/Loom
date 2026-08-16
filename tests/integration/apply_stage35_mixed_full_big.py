@@ -123,10 +123,7 @@ replacement = r'''fn recover_full_big_extents(
 
     let mut extents = Vec::with_capacity(starts.len());
     for (index, &(head_lcn, kind)) in starts.iter().enumerate() {
-        let next_head = starts
-            .get(index + 1)
-            .map(|(lcn, _)| *lcn)
-            .unwrap_or(data_end);
+        let next_head = starts.get(index + 1).map_or(data_end, |(lcn, _)| *lcn);
         if next_head <= head_lcn {
             return Err(CoreError::InvalidFilesystem(
                 "full big-pcluster extent lclusters are not strictly increasing",
@@ -167,7 +164,7 @@ text = text[:start] + replacement + text[end:]
 pattern = re.compile(r'(?<!struct )BigExtent \{(?:(?!BigExtent \{).)*?\n(?P<indent>\s*)\}', re.S)
 def add_kind(match):
     block = match.group(0)
-    if 'kind:' in block:
+    if re.search(r'\n\s*kind(?:\s*:|,)', block):
         return block
     close_indent = match.group('indent')
     field_indent = close_indent + '    '
@@ -176,7 +173,6 @@ def add_kind(match):
     return block[:pos] + f'\n{field_indent}kind: HeadKind::Lz4,' + block[pos:]
 text = pattern.sub(add_kind, text)
 
-# Add a focused mixed full-big topology unit test before the final 0padding test.
 anchor = '''    #[test]\n    fn eight_kib_0padding_span_round_trips() {'''.replace('\\n', '\n')
 assert anchor in text
 unit = '''    #[test]
