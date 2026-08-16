@@ -4,8 +4,6 @@ use crate::compact_index::shared_core::{self, CompiledCore, CoreError};
 use loom_map::LoomMap;
 use std::path::Path;
 
-const BLOCK_BYTES: usize = 4096;
-
 pub type MultiIndexError = CoreError;
 
 #[derive(Debug)]
@@ -90,20 +88,11 @@ fn from_core(compiled: CompiledCore) -> Result<CompiledMultiSwap, MultiIndexErro
         ));
     }
 
-    let expected_shadow_blocks =
-        compiled
-            .encoded_bytes
-            .iter()
-            .try_fold(0_usize, |sum, bytes| {
-                sum.checked_add(bytes.div_ceil(BLOCK_BYTES))
-                    .ok_or(CoreError::ArithmeticOverflow)
-            })?;
-    if expected_shadow_blocks != compiled.shadow_blocks {
-        return Err(CoreError::InvalidFilesystem(
-            "compiled shadow block count does not match encoded extent footprints",
-        ));
-    }
-
+    // Shadow cardinality is a block-delta property, not an encoded-stream-length property.
+    // The shared core already validates that materialization stays within the recovered
+    // physical footprint. Re-deriving a shadow count from encoded byte lengths is invalid:
+    // unchanged capacity blocks may be elided, while shortened streams may need explicit
+    // zeroing of origin tail blocks.
     Ok(CompiledMultiSwap {
         map: compiled.map,
         shadow: compiled.shadow,
