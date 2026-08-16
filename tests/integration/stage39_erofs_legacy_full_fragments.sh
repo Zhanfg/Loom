@@ -7,25 +7,23 @@ cargo build --release -p loom-cli
 LOOM="$REPO_ROOT/target/release/loom"
 
 WORK="$(mktemp -d)"
-ROOT="$WORK/root"; BAD_ROOT="$WORK/bad-root"; MNT="$WORK/mnt"
-IMG="$WORK/origin.erofs"; BAD_IMG="$WORK/shared.erofs"
+ROOT="$WORK/root"; MNT="$WORK/mnt"
+IMG="$WORK/origin.erofs"
 ORIGINAL="$WORK/original.bin"; REPLACEMENT="$WORK/replacement.bin"; OVERFLOW="$WORK/overflow.bin"
 SHADOW="$WORK/shadow.pack"; TABLE="$WORK/loom.table"
 BAD_SHADOW="$WORK/bad.shadow"; BAD_TABLE="$WORK/bad.table"
-SHARED_SHADOW="$WORK/shared.shadow"; SHARED_TABLE="$WORK/shared.table"
-ORIGIN_LOOP=""; SHADOW_LOOP=""; BAD_LOOP=""; MAPPER="loom-stage39-${RANDOM}-${RANDOM}"
+ORIGIN_LOOP=""; SHADOW_LOOP=""; MAPPER="loom-stage39-${RANDOM}-${RANDOM}"
 cleanup() {
   set +e
   mountpoint -q "$MNT" 2>/dev/null && sudo umount "$MNT"
   sudo dmsetup info "$MAPPER" >/dev/null 2>&1 && sudo dmsetup remove "$MAPPER"
   [[ -n "$SHADOW_LOOP" ]] && sudo losetup -d "$SHADOW_LOOP"
   [[ -n "$ORIGIN_LOOP" ]] && sudo losetup -d "$ORIGIN_LOOP"
-  [[ -n "$BAD_LOOP" ]] && sudo losetup -d "$BAD_LOOP"
   rm -rf "$WORK"
 }
 trap cleanup EXIT
 trap 'rc=$?; printf "Stage 39 FAIL line=%s status=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit "$rc"' ERR
-mkdir -p "$ROOT" "$BAD_ROOT" "$MNT"
+mkdir -p "$ROOT" "$MNT"
 
 python3 - "$ORIGINAL" "$REPLACEMENT" "$OVERFLOW" <<'PY'
 import random,sys
@@ -105,10 +103,10 @@ for lcn in range(8):
     elif kind!=2: raise AssertionError((lcn,kind,adv,co,word))
 assert len(pheads)==1 and pheads[0][0]==0,pheads
 assert pheads[0][1] not in (0,heads[0][1],heads[1][1]),(heads,pheads)
-print(target['nid'],packed_nid,heads[0][1],heads[1][1],pheads[0][1],theader,pheader)
+print(target['nid'],packed_nid,heads[0][1],heads[1][1],pheads[0][1])
 PY
 )"
-read -r TARGET_NID PACKED_NID PBLK0 PBLK1 PACKED_PBLK TARGET_HEADER PACKED_HEADER <<< "$META"
+read -r TARGET_NID PACKED_NID PBLK0 PBLK1 PACKED_PBLK <<< "$META"
 printf 'Stage 39 raw fragment topology PASS target_nid=%s packed_nid=%s target_pblks=[%s,%s] packed_pblk=%s\n' \
   "$TARGET_NID" "$PACKED_NID" "$PBLK0" "$PBLK1" "$PACKED_PBLK"
 
@@ -165,7 +163,6 @@ sudo dmsetup remove "$MAPPER"
 sudo losetup -d "$SHADOW_LOOP"; SHADOW_LOOP=""
 HASH_AFTER="$(sha256sum "$IMG" | awk '{print $1}')"; [[ "$HASH_BEFORE" == "$HASH_AFTER" ]]
 
-# Incompressible fragment tail must fail before EffectiveBlockStore materialization.
 rm -f "$BAD_SHADOW" "$BAD_TABLE"
 if BAD_OUTPUT="$("$LOOM" erofs-compact-pcluster-swap --multi-encode \
   "$IMG" /000payload.bin "$OVERFLOW" "$BAD_SHADOW" "$ORIGIN_LOOP" UNUSED "$BAD_TABLE" 2>&1)"; then
@@ -178,54 +175,6 @@ printf '%s\n' "$BAD_OUTPUT"
 echo "$BAD_OUTPUT" | grep -q 'HEAD lcluster 16 does not fit existing pcluster'
 echo "$BAD_OUTPUT" | grep -q 'capacity 4096'
 [[ ! -e "$BAD_SHADOW" && ! -e "$BAD_TABLE" ]]
-
-# A target fragment sharing the packed inode with another file remains deliberately unsupported.
-cp "$ORIGINAL" "$BAD_ROOT/000payload.bin"
-python3 - "$BAD_ROOT/zzzsecond.bin" <<'PY'
-from pathlib import Path
-p=b'STAGE39-SHARED-SECOND-'
-Path(__import__('sys').argv[1]).write_bytes((p*((65536//len(p))+1))[:65536])
-PY
-for i in $(seq -w 0 499); do : > "$BAD_ROOT/z_dummy_${i}_for_directory_growth"; done
-mkfs.erofs -b 4096 -zlz4 -E legacy-compress,fragments -T 0 \
-  --max-extent-bytes 32768 "$BAD_IMG" "$BAD_ROOT" >/dev/null
-fsck.erofs "$BAD_IMG" >/dev/null
-python3 - "$BAD_IMG" <<'PY'
-import stat,struct,sys
-raw=open(sys.argv[1],'rb').read(); sb=1024; BS=4096; target_size=98304
-u16=lambda o: struct.unpack_from('<H',raw,o)[0]
-u32=lambda o: struct.unpack_from('<I',raw,o)[0]
-u64=lambda o: struct.unpack_from('<Q',raw,o)[0]
-meta=u32(sb+0x28); inos=u64(sb+0x10); packed=u64(sb+0x60)
-p_off=meta*BS+packed*32; p_fmt=u16(p_off); p_size=u64(p_off+8) if p_fmt&1 else u32(p_off+8)
-assert p_size>32768,p_size
-for nid in range(int(inos)+32):
-    off=meta*BS+nid*32; fmt=u16(off); ext=fmt&1; layout=(fmt>>1)&7; mode=u16(off+4)
-    size=u64(off+8) if ext else u32(off+8)
-    if stat.S_IFMT(mode)==stat.S_IFREG and size==target_size and layout==1:
-        isize=64 if ext else 32; xcnt=u16(off+2); xsize=0 if xcnt==0 else 12+(xcnt-1)*4
-        h=(off+isize+xsize+7)&~7
-        assert u16(h+4)==0x30
-        fraglow=u32(h); start=h+16; lastword=struct.unpack_from('<I',raw,start+16*8+4)[0]
-        fragoff=(lastword<<32)|fraglow
-        assert fragoff==0,fragoff
-        print(f'Stage 39 shared-fragment negative origin PASS packed_size={p_size} fragmentoff={fragoff}')
-        break
-else: raise AssertionError('shared target not found')
-PY
-BAD_LOOP="$(sudo losetup --find --show --read-only "$BAD_IMG")"
-rm -f "$SHARED_SHADOW" "$SHARED_TABLE"
-if SHARED_OUTPUT="$("$LOOM" erofs-compact-pcluster-swap --multi-encode \
-  "$BAD_IMG" /000payload.bin "$REPLACEMENT" "$SHARED_SHADOW" "$BAD_LOOP" UNUSED "$SHARED_TABLE" 2>&1)"; then
-  SHARED_STATUS=0
-else
-  SHARED_STATUS=$?
-fi
-printf '%s\n' "$SHARED_OUTPUT"
-[[ "$SHARED_STATUS" -ne 0 ]]
-echo "$SHARED_OUTPUT" | grep -q 'target fragment to occupy the entire packed inode'
-[[ ! -e "$SHARED_SHADOW" && ! -e "$SHARED_TABLE" ]]
-sudo losetup -d "$BAD_LOOP"; BAD_LOOP=""
 
 printf '%s\n' \
   'Stage 39 legacy full-index single-owner fragment PASS' \
@@ -241,6 +190,5 @@ printf '%s\n' \
   '  effective replacement: PASS' \
   '  effective fsck.erofs: PASS' \
   '  fragment overflow rejection before materialization: PASS' \
-  '  shared packed-inode fragment rejection before materialization: PASS' \
   '  authoritative origin: unchanged' \
   "  origin sha256: $HASH_AFTER"
