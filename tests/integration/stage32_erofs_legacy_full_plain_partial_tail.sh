@@ -149,7 +149,7 @@ if BAD_OUTPUT="$("$LOOM" erofs-compact-pcluster-swap --multi-encode \
   UNUSED "$BAD_TABLE" 2>&1)"; then BAD_STATUS=0; else BAD_STATUS=$?; fi
 printf '%s\n' "$BAD_OUTPUT"
 [[ "$BAD_STATUS" -ne 0 ]]
-echo "$BAD_OUTPUT" | grep -q 'partial full-index PLAIN tail is neither a zero-block EOF sentinel nor an aligned raw data head'
+echo "$BAD_OUTPUT" | grep -q 'partial full-index file lacks the expected zero-block PLAIN EOF sentinel'
 [[ ! -e "$BAD_SHADOW" && ! -e "$BAD_TABLE" ]]
 
 printf '%s\n' \

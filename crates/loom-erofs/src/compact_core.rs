@@ -1376,7 +1376,7 @@ fn validate_full_eof_plain_sentinel(
         return Ok(None);
     }
     Err(CoreError::InvalidFilesystem(
-        "partial full-index PLAIN tail is neither a zero-block EOF sentinel nor an aligned raw data head",
+        "partial full-index file lacks the expected zero-block PLAIN EOF sentinel",
     ))
 }
 
