@@ -1,4 +1,4 @@
-name: stage29-legacy-placement-maintenance
+name: stage29-legacy-placement-maintenance-retry
 
 on:
   push:
@@ -26,7 +26,7 @@ jobs:
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
           rm -f .github/stage29_legacy_placement_fix.py
-          git checkout HEAD^ -- .github/workflows/linux-hard-gate.yml
+          git checkout cd672de356b078d0ea1d2e39dcea3779903c0db1 -- .github/workflows/linux-hard-gate.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add crates/loom-erofs/src/compact_core.rs tests/integration/stage29_erofs_legacy_full_index.sh .github
