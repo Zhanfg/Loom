@@ -35,12 +35,14 @@ jobs:
           p.write_text(s.replace(old, new, 1))
           PY
           python3 tests/integration/apply_stage38_inline_pcluster.py
+          python3 tests/integration/refactor_stage38_inline_helpers.py
           cargo fmt --all
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
 
           rm tests/integration/apply_stage38_inline_pcluster.py
+          rm tests/integration/refactor_stage38_inline_helpers.py
           rm tests/integration/stage38_probe_legacy_full_inline_pcluster.sh
           cat > .github/workflows/linux-hard-gate.yml <<'YAML'
           name: linux-hard-gate
