@@ -1,97 +1,41 @@
-name: stage38-inline-pcluster-maintenance
+name: linux-hard-gate
 
 on:
+  pull_request:
+  workflow_dispatch:
   push:
     branches:
-      - feat/stage38-erofs-legacy-full-inline-pcluster
-    paths:
-      - .github/workflows/linux-hard-gate.yml
+      - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  patch:
+  linux-hard-gate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Apply and verify inline-pcluster support
+
+      - name: Install filesystem test dependencies
         run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('tests/integration/apply_stage38_inline_pcluster.py')
-          s = p.read_text()
-          old = "pattern = re.compile(r'(?<!struct )Topology \\{(?:(?!Topology \\{).)*?\\n(?P<indent>\\s*)\\}', re.S)"
-          new = "pattern = re.compile(r'(?<![A-Za-z0-9_])Topology \\{(?:(?!Topology \\{).)*?\\n(?P<indent>\\s*)\\}', re.S)"
-          assert old in s
-          s = s.replace(old, new, 1)
-          old = "    if 'inline_tail:' in block:\n        return block"
-          new = "    if re.search(r'\\n\\s*inline_tail(?:\\s*:|,)', block):\n        return block"
-          assert old in s
-          p.write_text(s.replace(old, new, 1))
-          PY
-          python3 tests/integration/apply_stage38_inline_pcluster.py
-          python3 tests/integration/refactor_stage38_inline_helpers.py
-          cargo fmt --all
-          cargo fmt --all -- --check
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
 
-          rm tests/integration/apply_stage38_inline_pcluster.py
-          rm tests/integration/refactor_stage38_inline_helpers.py
-          rm tests/integration/stage38_probe_legacy_full_inline_pcluster.sh
-          cat > .github/workflows/linux-hard-gate.yml <<'YAML'
-          name: linux-hard-gate
+      - name: Prepare host kernel facilities
+        run: |
+          sudo modprobe loop || true
+          sudo modprobe dm_mod || true
+          sudo modprobe erofs || true
+          sudo losetup -f
+          sudo dmsetup version
 
-          on:
-            pull_request:
-            workflow_dispatch:
-            push:
-              branches:
-                - main
-
-          permissions:
-            contents: read
-
-          jobs:
-            linux-hard-gate:
-              runs-on: ubuntu-24.04
-              timeout-minutes: 45
-
-              steps:
-                - name: Checkout
-                  uses: actions/checkout@v5
-
-                - name: Install Rust
-                  uses: dtolnay/rust-toolchain@stable
-                  with:
-                    components: rustfmt, clippy
-
-                - name: Install filesystem test dependencies
-                  run: |
-                    sudo apt-get update
-                    sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
-
-                - name: Prepare host kernel facilities
-                  run: |
-                    sudo modprobe loop || true
-                    sudo modprobe dm_mod || true
-                    sudo modprobe erofs || true
-                    sudo losetup -f
-                    sudo dmsetup version
-
-                - name: Run canonical Linux hard gate
-                  run: bash tests/ci/linux-hard-gate.sh
-          YAML
-
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add crates/loom-erofs/src/compact_core.rs .github/workflows/linux-hard-gate.yml
-          git add -u tests/integration
-          git diff --cached --check
-          git commit -m 'feat(erofs): support legacy full-index inline pclusters'
-          git push origin HEAD:feat/stage38-erofs-legacy-full-inline-pcluster
+      - name: Run canonical Linux hard gate
+        run: bash tests/ci/linux-hard-gate.sh
