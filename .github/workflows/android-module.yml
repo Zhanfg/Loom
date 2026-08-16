@@ -1,0 +1,199 @@
+name: Android flashable module
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Loom branch, tag, or commit SHA to package (empty = current workflow commit)'
+        required: false
+        default: ''
+        type: string
+      version_name:
+        description: 'Module version name'
+        required: true
+        default: '0.1.0-packaging-alpha'
+        type: string
+      version_code:
+        description: 'Numeric module version code'
+        required: true
+        default: '10001'
+        type: string
+      run_host_tests:
+        description: 'Run host workspace tests before packaging'
+        required: true
+        default: true
+        type: boolean
+  push:
+    branches:
+      - feat/android-alpha-module-pipeline
+    tags:
+      - 'android-v*'
+
+permissions:
+  contents: read
+
+jobs:
+  package-arm64:
+    name: Build arm64 module ZIP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout packaging pipeline
+        uses: actions/checkout@v5
+        with:
+          path: pipeline
+
+      - name: Resolve source and version
+        id: meta
+        shell: bash
+        env:
+          REQUESTED_REF: ${{ inputs.source_ref }}
+          REQUESTED_VERSION: ${{ inputs.version_name }}
+          REQUESTED_CODE: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${REQUESTED_REF:-}" ]]; then
+            SOURCE_REF="$REQUESTED_REF"
+          else
+            SOURCE_REF="$GITHUB_SHA"
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            VERSION_NAME="${REQUESTED_VERSION}"
+            VERSION_CODE="${REQUESTED_CODE}"
+          else
+            VERSION_NAME="0.1.0-packaging-alpha+${GITHUB_SHA::7}"
+            VERSION_CODE="$((10000 + GITHUB_RUN_NUMBER))"
+          fi
+          [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]
+          SAFE_VERSION="$(printf '%s' "$VERSION_NAME" | tr -c 'A-Za-z0-9._+-' '-')"
+          echo "source_ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "safe_version=$SAFE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Loom source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.meta.outputs.source_ref }}
+          path: source
+          fetch-depth: 1
+
+      - name: Resolve exact source SHA
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git -C source rev-parse HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust with Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: rustfmt, clippy
+
+      - name: Host format and lint checks
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Host workspace tests
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_host_tests }}
+        working-directory: source
+        run: cargo test --workspace
+
+      - name: Configure Android NDK toolchain
+        id: ndk
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          NDK_ROOT="$(find "$SDK_ROOT/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)"
+          [[ -n "$NDK_ROOT" && -d "$NDK_ROOT" ]] || { echo "No Android NDK found under $SDK_ROOT/ndk" >&2; exit 1; }
+          TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          LINKER="$TOOLCHAIN/aarch64-linux-android21-clang"
+          [[ -x "$LINKER" ]] || { echo "Missing Android arm64 linker: $LINKER" >&2; exit 1; }
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$LINKER" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$LINKER" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+          echo "STRIP=$TOOLCHAIN/llvm-strip" >> "$GITHUB_ENV"
+          echo "root=$NDK_ROOT" >> "$GITHUB_OUTPUT"
+          "$LINKER" --version | head -n 1
+
+      - name: Build Loom for Android arm64
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cargo build --release -p loom-cli --target aarch64-linux-android
+          "$STRIP" target/aarch64-linux-android/release/loom
+          file target/aarch64-linux-android/release/loom
+          readelf -h target/aarch64-linux-android/release/loom | grep -q 'Machine:.*AArch64'
+
+      - name: Package KernelSU module ZIP
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ZIP="dist/Loom-Android-${{ steps.meta.outputs.safe_version }}-${{ steps.source.outputs.short_sha }}-arm64.zip"
+          bash pipeline/packaging/android/build-module.sh \
+            source/target/aarch64-linux-android/release/loom \
+            "$ZIP" \
+            '${{ steps.meta.outputs.version_name }}' \
+            '${{ steps.meta.outputs.version_code }}' \
+            '${{ steps.meta.outputs.source_ref }}' \
+            '${{ steps.source.outputs.sha }}'
+          sha256sum "$ZIP" > "$ZIP.sha256"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "sha256=$ZIP.sha256" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=Loom-Android-${{ steps.meta.outputs.safe_version }}-${{ steps.source.outputs.short_sha }}-arm64" >> "$GITHUB_OUTPUT"
+
+      - name: Validate module archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP='${{ steps.package.outputs.zip }}'
+          unzip -t "$ZIP" >/dev/null
+          for entry in module.prop bin/loom customize.sh post-fs-data.sh service.sh action.sh uninstall.sh skip_mount build-info.txt; do
+            unzip -Z1 "$ZIP" | grep -Fxq "$entry" || { echo "Missing module entry: $entry" >&2; exit 1; }
+          done
+          unzip -p "$ZIP" module.prop
+          unzip -p "$ZIP" build-info.txt
+          unzip -p "$ZIP" bin/loom > /tmp/loom-android
+          chmod 0755 /tmp/loom-android
+          file /tmp/loom-android | grep -q 'ARM aarch64\|ARM64\|aarch64'
+          if unzip -Z1 "$ZIP" | grep -qE '^([^/]+/){2,}module\.prop$'; then
+            echo 'module.prop is incorrectly nested inside wrapper directories' >&2
+            exit 1
+          fi
+
+      - name: Upload module artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.sha256 }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Build summary
+        shell: bash
+        run: |
+          {
+            echo '## Loom Android module artifact'
+            echo
+            echo "- Source ref: `${{ steps.meta.outputs.source_ref }}`"
+            echo "- Source SHA: `${{ steps.source.outputs.sha }}`"
+            echo "- Version: `${{ steps.meta.outputs.version_name }}` (`${{ steps.meta.outputs.version_code }}`)"
+            echo "- Architecture: `arm64-v8a`"
+            echo "- NDK: `${{ steps.ndk.outputs.root }}`"
+            echo "- Artifact: `${{ steps.package.outputs.artifact_name }}`"
+            echo
+            echo '> Packaging alpha: installable module ZIP with fail-closed runtime hooks. Automatic effective-view mount activation is not enabled yet.'
+          } >> "$GITHUB_STEP_SUMMARY"
