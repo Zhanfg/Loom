@@ -119,6 +119,70 @@ pub(crate) fn decode(encoded: &[u8], expected: usize) -> Result<Vec<u8>, CodecEr
     Ok(output)
 }
 
+pub(crate) fn decode_partial(encoded: &[u8], expected: usize) -> Result<Vec<u8>, CodecError> {
+    let mut input_pos = 0_usize;
+    let mut output = Vec::with_capacity(expected);
+    while input_pos < encoded.len() && output.len() < expected {
+        let token = encoded[input_pos];
+        input_pos += 1;
+        let mut literal_len = usize::from(token >> 4);
+        if literal_len == 15 {
+            literal_len = literal_len
+                .checked_add(read_length(encoded, &mut input_pos)?)
+                .ok_or(CodecError::Overflow)?;
+        }
+        let literal_end = input_pos
+            .checked_add(literal_len)
+            .ok_or(CodecError::Overflow)?;
+        let literals = encoded
+            .get(input_pos..literal_end)
+            .ok_or(CodecError::InvalidBlock)?;
+        if output.len().saturating_add(literals.len()) > expected {
+            return Err(CodecError::InvalidBlock);
+        }
+        output.extend_from_slice(literals);
+        input_pos = literal_end;
+        if output.len() == expected {
+            return Ok(output);
+        }
+        if input_pos == encoded.len() {
+            break;
+        }
+        let offset_end = input_pos.checked_add(2).ok_or(CodecError::Overflow)?;
+        let raw_offset: [u8; 2] = encoded
+            .get(input_pos..offset_end)
+            .ok_or(CodecError::InvalidBlock)?
+            .try_into()
+            .map_err(|_| CodecError::InvalidBlock)?;
+        input_pos = offset_end;
+        let offset = usize::from(u16::from_le_bytes(raw_offset));
+        if offset == 0 || offset > output.len() {
+            return Err(CodecError::InvalidBlock);
+        }
+        let mut match_len = usize::from(token & 0x0f) + MIN_MATCH;
+        if token & 0x0f == 15 {
+            match_len = match_len
+                .checked_add(read_length(encoded, &mut input_pos)?)
+                .ok_or(CodecError::Overflow)?;
+        }
+        if output.len().saturating_add(match_len) > expected {
+            return Err(CodecError::InvalidBlock);
+        }
+        for _ in 0..match_len {
+            let source = output
+                .len()
+                .checked_sub(offset)
+                .ok_or(CodecError::InvalidBlock)?;
+            let byte = *output.get(source).ok_or(CodecError::InvalidBlock)?;
+            output.push(byte);
+        }
+        if output.len() == expected {
+            return Ok(output);
+        }
+    }
+    Err(CodecError::InvalidBlock)
+}
+
 pub(crate) fn decode_0padding(pcluster: &[u8], expected: usize) -> Result<Vec<u8>, CodecError> {
     let start = pcluster
         .iter()
@@ -228,6 +292,15 @@ mod tests {
         let start = block.len() - encoded.len();
         block[start..].copy_from_slice(&encoded);
         assert_eq!(decode_0padding(&block, input.len()).unwrap(), input);
+    }
+
+    #[test]
+    fn partial_decode_ignores_legacy_physical_padding() {
+        let input = vec![b'P'; 32768];
+        let encoded = encode(&input).unwrap();
+        let mut block = vec![0_u8; 4096];
+        block[..encoded.len()].copy_from_slice(&encoded);
+        assert_eq!(decode_partial(&block, input.len()).unwrap(), input);
     }
 
     #[test]
