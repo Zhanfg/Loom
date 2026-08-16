@@ -1164,11 +1164,6 @@ impl Image {
         let entries = self.read_all_full_entries(map.ebase, logical_lclusters)?;
         let eof_plain_clusterofs =
             validate_full_eof_plain_sentinel(&entries, logical_lclusters, inode.size)?;
-        if inode.size % u64::from(BLOCK_SIZE) != 0 && eof_plain_clusterofs.is_none() {
-            return Err(CoreError::UnsupportedInode(
-                "Stage 34 full big-pcluster partial EOF requires the verified zero-block PLAIN sentinel",
-            ));
-        }
         let extents = recover_full_big_extents(&entries, logical_lclusters, eof_plain_clusterofs)?;
         validate_big_total_physical_blocks(&extents, encoded_physical_blocks)?;
         validate_big_block_spans(&extents, self.bytes)?;
