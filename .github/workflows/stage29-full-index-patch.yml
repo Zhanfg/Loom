@@ -1,0 +1,278 @@
+name: stage29-full-index-patch
+
+on:
+  push:
+    branches:
+      - feat/stage29-erofs-legacy-full-index
+    paths:
+      - .github/workflows/stage29-full-index-patch.yml
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Apply Stage 29 parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          from pathlib import Path
+
+          path = Path('crates/loom-erofs/src/compact_core.rs')
+          s = path.read_text()
+
+          old = "const DATA_FLAT_PLAIN: u8 = 0;\nconst DATA_FLAT_INLINE: u8 = 2;"
+          new = "const DATA_FLAT_PLAIN: u8 = 0;\nconst DATA_COMPRESSED_FULL: u8 = 1;\nconst DATA_FLAT_INLINE: u8 = 2;"
+          assert s.count(old) == 1
+          s = s.replace(old, new)
+
+          anchor = "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\nstruct MapHeader {"
+          insert = """#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          struct FullEntry {
+              advise: u16,
+              kind: u16,
+              clusterofs: u16,
+              word: u32,
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          struct FullMapHeader {
+              ebase: u64,
+              advise: u16,
+              algorithm: u8,
+              secondary_algorithm: u8,
+              cluster_bits: u8,
+          }
+
+          #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+          struct MapHeader {"""
+          assert s.count(anchor) == 1
+          s = s.replace(anchor, insert)
+
+          fn_start = s.index("    fn read_topology(&mut self, nid: u64) -> Result<Topology, CoreError> {")
+          fn_end = s.index("    fn read_big_topology", fn_start)
+          chunk = s[fn_start:fn_end]
+          old = "        let inode = self.read_inode(nid)?;\n        let logical_lclusters = validate_target_inode(&inode)?;"
+          new = "        let inode = self.read_inode(nid)?;\n        if inode.layout == DATA_COMPRESSED_FULL {\n            return self.read_full_topology_from_inode(inode);\n        }\n        let logical_lclusters = validate_target_inode(&inode)?;"
+          assert chunk.count(old) == 1
+          chunk = chunk.replace(old, new)
+          s = s[:fn_start] + chunk + s[fn_end:]
+
+          marker = "    fn read_big_topology(&mut self, nid: u64) -> Result<BigTopology, CoreError> {"
+          methods = r'''    fn read_full_topology_from_inode(&mut self, inode: Inode) -> Result<Topology, CoreError> {
+              if inode.file_type() != MODE_REGULAR {
+                  return Err(CoreError::NotRegularFile(inode.nid));
+              }
+              if inode.layout != DATA_COMPRESSED_FULL {
+                  return Err(CoreError::UnsupportedInode(
+                      "full-index core requires EROFS_INODE_COMPRESSED_FULL",
+                  ));
+              }
+              let logical_lclusters_u64 = div_ceil(inode.size, u64::from(BLOCK_SIZE))?;
+              if logical_lclusters_u64 < 2 {
+                  return Err(CoreError::UnsupportedInode(
+                      "full-index core requires at least two logical clusters",
+                  ));
+              }
+              let logical_lclusters = usize::try_from(logical_lclusters_u64)
+                  .map_err(|_| CoreError::ArithmeticOverflow)?;
+              let compressed_blocks =
+                  usize::try_from(inode.data_word).map_err(|_| CoreError::ArithmeticOverflow)?;
+              if compressed_blocks == 0 {
+                  return Err(CoreError::InvalidFilesystem(
+                      "full-index inode reports zero encoded physical blocks",
+                  ));
+              }
+
+              let map = self.read_full_map_header(&inode)?;
+              if map.advise != 0 {
+                  return Err(CoreError::UnsupportedInode(
+                      "Stage 29 full-index core requires zero map advice",
+                  ));
+              }
+              if map.algorithm != LZ4_ALGORITHM
+                  || map.secondary_algorithm != 0
+                  || map.cluster_bits != 0
+              {
+                  return Err(CoreError::UnsupportedInode(
+                      "Stage 29 full-index core requires HEAD1 LZ4 with 4 KiB logical clusters",
+                  ));
+              }
+
+              let entries = self.read_all_full_entries(map.ebase, logical_lclusters)?;
+              let mut heads = Vec::new();
+              for (lcn, entry) in entries.iter().enumerate() {
+                  if entry.advise & !LCLUSTER_TYPE_MASK != 0 {
+                      return Err(CoreError::UnsupportedInode(
+                          "Stage 29 full-index entries do not accept auxiliary advice bits",
+                      ));
+                  }
+                  if entry.clusterofs != 0 {
+                      return Err(CoreError::UnsupportedInode(
+                          "Stage 29 full-index entries require zero cluster offsets",
+                      ));
+                  }
+                  match entry.kind {
+                      LCLUSTER_HEAD1 => heads.push(Head {
+                          lcn,
+                          pcluster: u64::from(entry.word),
+                      }),
+                      LCLUSTER_NONHEAD => {}
+                      LCLUSTER_PLAIN => {
+                          return Err(CoreError::UnsupportedInode(
+                              "Stage 29 full-index does not yet accept PLAIN lclusters",
+                          ))
+                      }
+                      _ => {
+                          return Err(CoreError::UnsupportedInode(
+                              "Stage 29 full-index supports only HEAD1 and NONHEAD entries",
+                          ))
+                      }
+                  }
+              }
+              if heads.first().map(|head| head.lcn) != Some(0) {
+                  return Err(CoreError::InvalidFilesystem(
+                      "first full-index compressed extent does not begin at lcluster zero",
+                  ));
+              }
+              if heads.len() != compressed_blocks {
+                  return Err(CoreError::InvalidFilesystem(
+                      "full-index compressed block count does not match recovered HEAD count",
+                  ));
+              }
+
+              for (index, head) in heads.iter().enumerate() {
+                  let end = heads
+                      .get(index + 1)
+                      .map(|next| next.lcn)
+                      .unwrap_or(logical_lclusters);
+                  if end <= head.lcn {
+                      return Err(CoreError::InvalidFilesystem(
+                          "full-index HEAD lclusters are not strictly increasing",
+                      ));
+                  }
+                  for lcn in head.lcn + 1..end {
+                      let entry = entries
+                          .get(lcn)
+                          .ok_or(CoreError::UnexpectedEndOfStructure)?;
+                      if entry.kind != LCLUSTER_NONHEAD {
+                          return Err(CoreError::InvalidFilesystem(
+                              "full-index logical extent contains a non-NONHEAD interior entry",
+                          ));
+                      }
+                      let delta0 = usize::from((entry.word & 0xffff) as u16);
+                      let delta1 = usize::from((entry.word >> 16) as u16);
+                      let expected0 = lcn
+                          .checked_sub(head.lcn)
+                          .ok_or(CoreError::ArithmeticOverflow)?;
+                      let expected1 = end
+                          .checked_sub(lcn)
+                          .ok_or(CoreError::ArithmeticOverflow)?;
+                      if delta0 != expected0 || delta1 != expected1 {
+                          return Err(CoreError::InvalidFilesystem(
+                              "full-index NONHEAD forward/backward deltas disagree with recovered HEAD topology",
+                          ));
+                      }
+                  }
+              }
+              validate_head_blocks(&heads, self.bytes)?;
+
+              Ok(Topology {
+                  nid: inode.nid,
+                  logical_size: inode.size,
+                  algorithm: map.algorithm,
+                  advise: map.advise,
+                  logical_lclusters,
+                  compact_2b_entries: 0,
+                  eof_plain_clusterofs: None,
+                  heads,
+              })
+          }
+
+          fn read_full_map_header(&mut self, inode: &Inode) -> Result<FullMapHeader, CoreError> {
+              let header_offset = align8(
+                  inode
+                      .offset
+                      .checked_add(inode.isize)
+                      .and_then(|value| value.checked_add(inode.xattr_size))
+                      .ok_or(CoreError::ArithmeticOverflow)?,
+              )?;
+              ensure_range(self.bytes, header_offset, 16)?;
+              let mut header = [0_u8; 8];
+              read_exact_at(&mut self.file, header_offset, &mut header)?;
+              let mut reserved = [0_u8; 8];
+              read_exact_at(
+                  &mut self.file,
+                  header_offset
+                      .checked_add(MAP_HEADER_SIZE)
+                      .ok_or(CoreError::ArithmeticOverflow)?,
+                  &mut reserved,
+              )?;
+              if reserved.iter().any(|byte| *byte != 0) {
+                  return Err(CoreError::UnsupportedInode(
+                      "Stage 29 full-index requires the post-header reserved bytes to be zero",
+                  ));
+              }
+              let ebase = header_offset
+                  .checked_add(16)
+                  .ok_or(CoreError::ArithmeticOverflow)?;
+              Ok(FullMapHeader {
+                  ebase,
+                  advise: read_u16(&header, 4)?,
+                  algorithm: header[6] & 0x0f,
+                  secondary_algorithm: header[6] >> 4,
+                  cluster_bits: header[7],
+              })
+          }
+
+          fn read_all_full_entries(
+              &mut self,
+              ebase: u64,
+              total: usize,
+          ) -> Result<Vec<FullEntry>, CoreError> {
+              let mut entries = Vec::with_capacity(total);
+              for lcn in 0..total {
+                  let byte_offset = u64::try_from(lcn)
+                      .map_err(|_| CoreError::ArithmeticOverflow)?
+                      .checked_mul(8)
+                      .ok_or(CoreError::ArithmeticOverflow)?;
+                  let offset = ebase
+                      .checked_add(byte_offset)
+                      .ok_or(CoreError::ArithmeticOverflow)?;
+                  ensure_range(self.bytes, offset, 8)?;
+                  let mut raw = [0_u8; 8];
+                  read_exact_at(&mut self.file, offset, &mut raw)?;
+                  let advise = read_u16(&raw, 0)?;
+                  entries.push(FullEntry {
+                      advise,
+                      kind: advise & LCLUSTER_TYPE_MASK,
+                      clusterofs: read_u16(&raw, 2)?,
+                      word: read_u32(&raw, 4)?,
+                  });
+              }
+              Ok(entries)
+          }
+
+'''
+          assert s.count(marker) == 1
+          s = s.replace(marker, methods + marker)
+
+          path.write_text(s)
+          PY
+
+          cargo fmt --all
+          cargo check --workspace
+
+          rm -f .github/workflows/stage29-full-index-diagnostic.yml
+          rm -f .github/workflows/stage29-full-index-patch.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/loom-erofs/src/compact_core.rs .github/workflows
+          git commit -m 'feat(erofs): parse ordinary legacy full indexes'
+          git push origin HEAD:feat/stage29-erofs-legacy-full-index
