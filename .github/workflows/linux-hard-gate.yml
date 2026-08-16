@@ -21,6 +21,15 @@ jobs:
       - name: Apply and verify mixed full-big support
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/integration/apply_stage35_mixed_full_big.py')
+          s = p.read_text()
+          old = "    if 'kind:' in block:\n        return block"
+          new = "    if re.search(r'\\n\\s*kind(?:\\s*:|,)', block):\n        return block"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
           python3 tests/integration/apply_stage35_mixed_full_big.py
           cargo fmt --all
           cargo fmt --all -- --check
