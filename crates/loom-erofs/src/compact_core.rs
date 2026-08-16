@@ -619,14 +619,14 @@ fn validate_compatible_topology(
             "compression algorithms differ",
         ));
     }
-    if origin.advise != replacement.advise {
-        return Err(CoreError::IncompatibleReplacement(
-            "compressed map advice differs",
-        ));
-    }
     if origin.placement != replacement.placement {
         return Err(CoreError::IncompatibleReplacement(
             "LZ4 physical placement mode differs",
+        ));
+    }
+    if origin.advise != replacement.advise {
+        return Err(CoreError::IncompatibleReplacement(
+            "compressed map advice differs",
         ));
     }
     if origin.logical_lclusters != replacement.logical_lclusters {
