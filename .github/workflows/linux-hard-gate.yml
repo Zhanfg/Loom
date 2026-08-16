@@ -23,45 +23,5 @@ jobs:
           sudo modprobe loop || true
           sudo modprobe dm_mod || true
           sudo modprobe erofs || true
-      - name: Add effective-image diagnostics locally
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('tests/integration/stage38_erofs_legacy_full_inline_pcluster.sh')
-          s = p.read_text()
-          old = '''sudo dmsetup create "$MAPPER" < "$TABLE"
-sudo mount -t erofs -o ro "/dev/mapper/$MAPPER" "$MNT"
-sudo cmp "$MNT/000payload.bin" "$REPLACEMENT"
-sudo umount "$MNT"
-sudo fsck.erofs "/dev/mapper/$MAPPER" >/dev/null
-'''
-          new = '''sudo dmsetup create "$MAPPER" < "$TABLE"
-printf '%s\\n' '--- Stage 38 dm table ---'
-cat "$TABLE"
-printf '%s\\n' '--- Stage 38 effective fsck ---'
-set +e
-EFFECTIVE_FSCK="$(sudo fsck.erofs "/dev/mapper/$MAPPER" 2>&1)"
-EFFECTIVE_FSCK_STATUS=$?
-printf '%s\\n' "$EFFECTIVE_FSCK"
-printf 'effective fsck status=%s\\n' "$EFFECTIVE_FSCK_STATUS"
-printf '%s\\n' '--- Stage 38 effective dump ---'
-EFFECTIVE_DUMP="$(sudo dump.erofs -e --path=/000payload.bin "/dev/mapper/$MAPPER" 2>&1)"
-EFFECTIVE_DUMP_STATUS=$?
-printf '%s\\n' "$EFFECTIVE_DUMP"
-printf 'effective dump status=%s\\n' "$EFFECTIVE_DUMP_STATUS"
-set -e
-if ! sudo mount -t erofs -o ro "/dev/mapper/$MAPPER" "$MNT"; then
-  printf '%s\\n' '--- Stage 38 dmesg tail after mount failure ---'
-  sudo dmesg | tail -n 160 || true
-  exit 32
-fi
-sudo cmp "$MNT/000payload.bin" "$REPLACEMENT"
-sudo umount "$MNT"
-[[ "$EFFECTIVE_FSCK_STATUS" -eq 0 ]]
-[[ "$EFFECTIVE_DUMP_STATUS" -eq 0 ]]
-'''
-          assert old in s
-          p.write_text(s.replace(old, new, 1))
-          PY
-      - name: Run Stage 38 diagnostic only
-        run: bash tests/integration/stage38_erofs_legacy_full_inline_pcluster.sh
+      - name: Run Stage 38 effective-image inspector
+        run: bash tests/integration/stage38_debug_effective_inline.sh
