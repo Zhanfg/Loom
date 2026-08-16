@@ -1,4 +1,4 @@
-name: stage29-legacy-placement-maintenance-retry
+name: stage29-legacy-placement-maintenance-final
 
 on:
   push:
@@ -17,15 +17,16 @@ jobs:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
-      - name: Apply legacy LZ4 placement support
+      - name: Apply legacy LZ4 placement support and tests
         shell: bash
         run: |
           set -euo pipefail
           python3 .github/stage29_legacy_placement_fix.py
+          python3 .github/stage29_placement_tests_fix.py
           cargo fmt --all
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
-          rm -f .github/stage29_legacy_placement_fix.py
+          rm -f .github/stage29_legacy_placement_fix.py .github/stage29_placement_tests_fix.py
           git checkout cd672de356b078d0ea1d2e39dcea3779903c0db1 -- .github/workflows/linux-hard-gate.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
