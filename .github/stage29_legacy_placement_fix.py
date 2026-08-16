@@ -156,17 +156,25 @@ new = '''    fn read_topology(&mut self, nid: u64) -> Result<Topology, CoreError
 assert s.count(old) == 1
 s = s.replace(old, new)
 
+start = s.index('    fn read_topology(&mut self, nid: u64) -> Result<Topology, CoreError> {')
+end = s.index('    fn read_full_topology_from_inode', start)
+chunk = s[start:end]
 old = '''            algorithm: map.algorithm,
             advise: map.advise,
-            logical_lclusters,'''
+            logical_lclusters,
+            compact_2b_entries: map.regions.compact_2b,'''
 new = '''            algorithm: map.algorithm,
             advise: map.advise,
             placement: Lz4Placement::ZeroPadding,
-            logical_lclusters,'''
-assert s.count(old) == 1
-s = s.replace(old, new, 1)
+            logical_lclusters,
+            compact_2b_entries: map.regions.compact_2b,'''
+assert chunk.count(old) == 1
+chunk = chunk.replace(old, new)
+s = s[:start] + chunk + s[end:]
 
-# The remaining constructor with the same algorithm/advise shape is the full-index topology.
+start = s.index('    fn read_full_topology_from_inode')
+end = s.index('    fn read_full_map_header', start)
+chunk = s[start:end]
 old = '''            algorithm: map.algorithm,
             advise: map.advise,
             logical_lclusters,
@@ -176,8 +184,9 @@ new = '''            algorithm: map.algorithm,
             placement: Lz4Placement::LegacyStart,
             logical_lclusters,
             compact_2b_entries: 0,'''
-assert s.count(old) == 1
-s = s.replace(old, new)
+assert chunk.count(old) == 1
+chunk = chunk.replace(old, new)
+s = s[:start] + chunk + s[end:]
 
 old = '''    if origin.advise != replacement.advise {
         return Err(CoreError::IncompatibleReplacement(
