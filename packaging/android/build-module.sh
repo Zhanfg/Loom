@@ -18,6 +18,8 @@ TEMPLATE="$ROOT/module"
 
 [[ -f "$BINARY" ]] || { echo "missing Loom binary: $BINARY" >&2; exit 1; }
 [[ -f "$TEMPLATE/module.prop.in" ]] || { echo "missing Android module template" >&2; exit 1; }
+[[ -x "$TEMPLATE/bin/loom-sidecar" ]] || { echo "missing sidecar runtime" >&2; exit 1; }
+[[ -f "$TEMPLATE/sidecar.conf" ]] || { echo "missing sidecar configuration" >&2; exit 1; }
 [[ "$VERSION_CODE" =~ ^[0-9]+$ ]] || { echo "version code must be numeric" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
@@ -45,10 +47,13 @@ source_sha=$SOURCE_SHA
 version=$VERSION_NAME
 versionCode=$VERSION_CODE
 architecture=arm64-v8a
-runtime_activation=fail-closed-packaging-alpha
+runtime_activation=sidecar-readonly-identity-alpha1
+mount_scope=/data/adb/loom/mnt
+stock_mount_replacement=false
 EOF
 
-chmod 0644 "$STAGE/module.prop" "$STAGE/build-info.txt" "$STAGE/skip_mount"
+chmod 0644 "$STAGE/module.prop" "$STAGE/build-info.txt" "$STAGE/skip_mount" "$STAGE/sidecar.conf"
+chmod 0755 "$STAGE/bin/loom" "$STAGE/bin/loom-sidecar"
 for script in customize.sh post-fs-data.sh service.sh action.sh uninstall.sh; do
   [[ -f "$STAGE/$script" ]] || { echo "missing module script: $script" >&2; exit 1; }
   chmod 0755 "$STAGE/$script"
