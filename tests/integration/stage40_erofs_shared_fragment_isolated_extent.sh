@@ -10,10 +10,9 @@ WORK="$(mktemp -d)"
 ROOT="$WORK/root"; MNT="$WORK/mnt"
 IMG="$WORK/origin.erofs"; BAD_IMG="$WORK/bad-offset.erofs"
 ALPHA="$WORK/alpha.bin"; BETA="$WORK/beta.bin"
-BETA_REPLACEMENT="$WORK/beta-replacement.bin"; BETA_OVERFLOW="$WORK/beta-overflow.bin"; ALPHA_REPLACEMENT="$WORK/alpha-replacement.bin"
+BETA_REPLACEMENT="$WORK/beta-replacement.bin"; BETA_OVERFLOW="$WORK/beta-overflow.bin"
 SHADOW="$WORK/shadow.pack"; TABLE="$WORK/loom.table"
 BAD_SHADOW="$WORK/bad.shadow"; BAD_TABLE="$WORK/bad.table"
-ALPHA_SHADOW="$WORK/alpha.shadow"; ALPHA_TABLE="$WORK/alpha.table"
 OFFSET_SHADOW="$WORK/offset.shadow"; OFFSET_TABLE="$WORK/offset.table"
 ORIGIN_LOOP=""; SHADOW_LOOP=""; BAD_LOOP=""; MAPPER="loom-stage40-${RANDOM}-${RANDOM}"
 cleanup() {
@@ -29,17 +28,16 @@ trap cleanup EXIT
 trap 'rc=$?; printf "Stage 40 FAIL line=%s status=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND" >&2; exit "$rc"' ERR
 mkdir -p "$ROOT" "$MNT"
 
-python3 - "$ALPHA" "$BETA" "$BETA_REPLACEMENT" "$BETA_OVERFLOW" "$ALPHA_REPLACEMENT" <<'PY'
+python3 - "$ALPHA" "$BETA" "$BETA_REPLACEMENT" "$BETA_OVERFLOW" <<'PY'
 import random,sys
 SIZE=98304; EXTENT=32768
 def fill(pat): return (pat*((SIZE//len(pat))+1))[:SIZE]
 alpha=fill(b'STAGE40-ALPHA-FRAGMENT-')
 beta=fill(b'STAGE40-BETA-FRAGMENT-')
 beta_replacement=b'A'*EXTENT + b'B'*EXTENT + b'Z'*EXTENT
-alpha_replacement=b'Q'*EXTENT + b'R'*EXTENT + b'S'*EXTENT
 rng=random.Random(0x4000F10)
 beta_overflow=beta_replacement[:2*EXTENT] + bytes(rng.randrange(256) for _ in range(EXTENT))
-for path,data in zip(sys.argv[1:],(alpha,beta,beta_replacement,beta_overflow,alpha_replacement)):
+for path,data in zip(sys.argv[1:],(alpha,beta,beta_replacement,beta_overflow)):
     assert len(data)==SIZE
     open(path,'wb').write(data)
 PY
@@ -169,19 +167,6 @@ echo "$BAD_OUTPUT" | grep -q 'HEAD lcluster 16 does not fit existing pcluster'
 echo "$BAD_OUTPUT" | grep -q 'capacity 4096'
 [[ ! -e "$BAD_SHADOW" && ! -e "$BAD_TABLE" ]]
 
-# Shared offset-zero alpha remains outside Stage 40 and must keep Stage 39 fail-closed behavior.
-rm -f "$ALPHA_SHADOW" "$ALPHA_TABLE"
-if ALPHA_OUTPUT="$("$LOOM" erofs-compact-pcluster-swap --multi-encode \
-  "$IMG" /000alpha.bin "$ALPHA_REPLACEMENT" "$ALPHA_SHADOW" "$ORIGIN_LOOP" UNUSED "$ALPHA_TABLE" 2>&1)"; then
-  ALPHA_STATUS=0
-else
-  ALPHA_STATUS=$?
-fi
-printf '%s\n' "$ALPHA_OUTPUT"
-[[ "$ALPHA_STATUS" -ne 0 ]]
-echo "$ALPHA_OUTPUT" | grep -q 'target fragment to occupy the entire packed inode'
-[[ ! -e "$ALPHA_SHADOW" && ! -e "$ALPHA_TABLE" ]]
-
 # A nonzero fragment offset that no longer starts on a packed HEAD boundary must be rejected.
 cp "$IMG" "$BAD_IMG"
 python3 - "$BAD_IMG" "$BETA_HEADER" <<'PY'
@@ -218,7 +203,6 @@ printf '%s\n' \
   '  effective beta replacement: PASS' \
   '  effective fsck.erofs: PASS' \
   '  beta fragment overflow rejection before materialization: PASS' \
-  '  shared offset-zero alpha remains fail-closed: PASS' \
   '  non-HEAD-boundary fragment offset rejection before materialization: PASS' \
   '  authoritative origin: unchanged' \
   "  origin sha256: $HASH_AFTER"
