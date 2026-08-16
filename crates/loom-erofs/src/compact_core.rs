@@ -1295,9 +1295,9 @@ impl Image {
         let fragment_size = logical_size
             .checked_sub(fragment_start)
             .ok_or(CoreError::ArithmeticOverflow)?;
-        if fragment_size == 0 || fragment_size % u64::from(BLOCK_SIZE) != 0 {
+        if fragment_size == 0 {
             return Err(CoreError::UnsupportedInode(
-                "Stage 39 requires an aligned non-empty fragment tail",
+                "fragment tail must be non-empty",
             ));
         }
         validate_head_blocks(&heads[..heads.len() - 1], self.bytes)?;
@@ -1365,12 +1365,7 @@ impl Image {
         let packed_entries = self.read_all_full_entries(packed_map.ebase, packed_lclusters)?;
         let packed_eof =
             validate_full_eof_plain_sentinel(&packed_entries, packed_lclusters, packed.size)?;
-        if packed_eof.is_some() {
-            return Err(CoreError::UnsupportedInode(
-                "Stage 39 packed inode must be logical-cluster aligned",
-            ));
-        }
-        let packed_heads = recover_full_data_heads(&packed_entries, packed_lclusters, None)?;
+        let packed_heads = recover_full_data_heads(&packed_entries, packed_lclusters, packed_eof)?;
         if packed_heads.len() != 1
             || packed_heads[0].lcn != 0
             || packed_heads[0].kind != HeadKind::Lz4
@@ -1379,7 +1374,7 @@ impl Image {
                 "Stage 39 packed inode must contain exactly one LZ4 HEAD at lcluster zero",
             ));
         }
-        validate_full_nonheads(&packed_entries, &packed_heads, packed_lclusters, None)?;
+        validate_full_nonheads(&packed_entries, &packed_heads, packed_lclusters, packed_eof)?;
         validate_head_blocks(&packed_heads, self.bytes)?;
         Ok(packed_heads[0].pcluster)
     }

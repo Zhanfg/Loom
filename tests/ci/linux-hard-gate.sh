@@ -56,5 +56,6 @@ bash tests/integration/stage38_erofs_legacy_full_inline_pcluster.sh
 bash tests/integration/stage39_erofs_legacy_full_fragments.sh
 bash tests/integration/stage40_erofs_shared_fragment_isolated_extent.sh
 bash tests/integration/stage41_erofs_shared_fragment_offset_zero.sh
+bash tests/integration/stage42_erofs_single_owner_partial_fragment.sh
 
 printf '%s\n' 'Loom Linux filesystem hard gate PASS'
