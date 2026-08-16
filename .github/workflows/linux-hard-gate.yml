@@ -1,23 +1,41 @@
-name: stage37-legacy-full-big-multiblock-plain-partial-diagnostic
+name: linux-hard-gate
 
 on:
+  pull_request:
+  workflow_dispatch:
   push:
     branches:
-      - feat/stage37-erofs-legacy-full-big-multiblock-plain-partial
-    paths:
-      - .github/workflows/linux-hard-gate.yml
+      - main
 
 permissions:
   contents: read
 
 jobs:
-  probe:
+  linux-hard-gate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
     steps:
-      - uses: actions/checkout@v5
-      - name: Install erofs tools
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install filesystem test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y erofs-utils
-      - name: Probe multiblock LZ4 plus partial PLAIN tail
-        run: bash tests/integration/stage37_probe_legacy_full_big_multiblock_plain_partial.sh
+          sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
+
+      - name: Prepare host kernel facilities
+        run: |
+          sudo modprobe loop || true
+          sudo modprobe dm_mod || true
+          sudo modprobe erofs || true
+          sudo losetup -f
+          sudo dmsetup version
+
+      - name: Run canonical Linux hard gate
+        run: bash tests/ci/linux-hard-gate.sh
