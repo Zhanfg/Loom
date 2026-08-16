@@ -1,23 +1,83 @@
-name: stage42-partial-fragment-probe
+name: stage42-partial-fragment-maintenance
 
 on:
   push:
     branches:
       - feat/stage42-erofs-partial-fragment-probe
+    paths:
+      - .github/workflows/linux-hard-gate.yml
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  probe:
+  patch:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - name: Install EROFS tooling
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Apply and verify Stage 42 partial-fragment core
         run: |
-          sudo apt-get update
-          sudo apt-get install -y erofs-utils util-linux python3
-          sudo modprobe erofs || true
-      - name: Probe real partial fragment topology
-        run: bash tests/integration/stage42_probe_erofs_partial_fragment.sh
+          set -euo pipefail
+          python3 tests/integration/apply_stage42_partial_fragment.py
+          cargo fmt --all
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+          rm tests/integration/apply_stage42_partial_fragment.py
+          rm tests/integration/stage42_probe_erofs_partial_fragment.sh
+          cat > .github/workflows/linux-hard-gate.yml <<'YAML'
+          name: linux-hard-gate
+
+          on:
+            pull_request:
+            workflow_dispatch:
+            push:
+              branches:
+                - main
+
+          permissions:
+            contents: read
+
+          jobs:
+            linux-hard-gate:
+              runs-on: ubuntu-24.04
+              timeout-minutes: 45
+
+              steps:
+                - name: Checkout
+                  uses: actions/checkout@v5
+
+                - name: Install Rust
+                  uses: dtolnay/rust-toolchain@stable
+                  with:
+                    components: rustfmt, clippy
+
+                - name: Install filesystem test dependencies
+                  run: |
+                    sudo apt-get update
+                    sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
+
+                - name: Prepare host kernel facilities
+                  run: |
+                    sudo modprobe loop || true
+                    sudo modprobe dm_mod || true
+                    sudo modprobe erofs || true
+                    sudo losetup -f
+                    sudo dmsetup version
+
+                - name: Run canonical Linux hard gate
+                  run: bash tests/ci/linux-hard-gate.sh
+          YAML
+
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/loom-erofs/src/compact_core.rs .github/workflows/linux-hard-gate.yml
+          git add -u tests/integration
+          git diff --cached --check
+          git commit -m 'feat(erofs): support single-owner partial fragments'
+          git push origin HEAD:feat/stage42-erofs-partial-fragment-probe
