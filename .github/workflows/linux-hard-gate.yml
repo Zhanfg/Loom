@@ -1,34 +1,41 @@
-name: stage30-full-eof-sentinel-maintenance
+name: linux-hard-gate
 
 on:
+  pull_request:
+  workflow_dispatch:
   push:
     branches:
-      - feat/stage30-erofs-legacy-full-partial-tail
-    paths:
-      - .github/workflows/linux-hard-gate.yml
+      - main
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  patch:
+  linux-hard-gate:
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
     steps:
-      - uses: actions/checkout@v5
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
         with:
-          fetch-depth: 0
-      - name: Apply full-index EOF sentinel support
-        shell: bash
+          components: rustfmt, clippy
+
+      - name: Install filesystem test dependencies
         run: |
-          set -euo pipefail
-          python3 .github/stage30_full_eof_sentinel_fix.py
-          cargo fmt --all
-          cargo clippy --workspace --all-targets -- -D warnings
-          cargo test --workspace
-          rm -f .github/stage30_full_eof_sentinel_fix.py
-          git checkout 234766057c4e8b585b20f7290780276efcc613dc -- .github/workflows/linux-hard-gate.yml
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add crates/loom-erofs/src/compact_core.rs .github
-          git commit -m 'feat(erofs): accept legacy full-index EOF sentinel'
-          git push origin HEAD:feat/stage30-erofs-legacy-full-partial-tail
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
+
+      - name: Prepare host kernel facilities
+        run: |
+          sudo modprobe loop || true
+          sudo modprobe dm_mod || true
+          sudo modprobe erofs || true
+          sudo losetup -f
+          sudo dmsetup version
+
+      - name: Run canonical Linux hard gate
+        run: bash tests/ci/linux-hard-gate.sh
