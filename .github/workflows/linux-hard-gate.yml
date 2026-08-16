@@ -1,4 +1,4 @@
-name: stage33-full-big-maintenance
+name: stage33-full-big-maintenance-retry
 
 on:
   push:
@@ -22,10 +22,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/stage33_full_big_fix.py
+          python3 .github/stage33_insert_full_big_reader.py
           cargo fmt --all
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
-          rm -f .github/stage33_full_big_fix.py
+          rm -f .github/stage33_full_big_fix.py .github/stage33_insert_full_big_reader.py
           rm -f tests/integration/stage33_probe_legacy_full_big.sh
           git checkout b77be98f84f3e22e1958a47c04a045df66ce41d8 -- .github/workflows/linux-hard-gate.yml
           git config user.name 'github-actions[bot]'
