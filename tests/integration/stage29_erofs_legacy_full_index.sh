@@ -217,14 +217,15 @@ else:
     raise AssertionError('full-index target inode not found')
 PY
 rm -f "$BAD_SHADOW" "$BAD_TABLE"
-set +e
-BAD_OUTPUT="$(
+if BAD_OUTPUT="$(
   "$LOOM" erofs-compact-pcluster-swap --multi-encode \
     "$CORRUPT_IMG" /000payload.bin "$REPLACEMENT" \
     "$BAD_SHADOW" "$ORIGIN_LOOP" LOOM_SHADOW_PLACEHOLDER "$BAD_TABLE" 2>&1
-)"
-BAD_STATUS=$?
-set -e
+)"; then
+  BAD_STATUS=0
+else
+  BAD_STATUS=$?
+fi
 printf '%s\n' "$BAD_OUTPUT"
 [[ "$BAD_STATUS" -ne 0 ]]
 echo "$BAD_OUTPUT" | grep -q 'forward/backward deltas disagree'
