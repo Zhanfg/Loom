@@ -93,6 +93,7 @@ struct BigExtent {
     lcn: usize,
     pcluster: u64,
     physical_blocks: usize,
+    kind: HeadKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -378,8 +379,19 @@ pub(crate) fn compile_big_lz4(
             .physical_blocks
             .checked_mul(BLOCK_BYTES)
             .ok_or(CoreError::ArithmeticOverflow)?;
-        let (span, encoded_len) =
-            encode_big_extent(extent.lcn, logical_extent, capacity, topology.placement)?;
+        let (span, encoded_len) = match extent.kind {
+            HeadKind::Lz4 => {
+                encode_big_extent(extent.lcn, logical_extent, capacity, topology.placement)?
+            }
+            HeadKind::Plain => {
+                if extent.physical_blocks != 1 {
+                    return Err(CoreError::InvalidFilesystem(
+                        "full big-pcluster PLAIN data extent must occupy one physical block",
+                    ));
+                }
+                encode_plain_extent(extent.lcn, logical_extent)?
+            }
+        };
         encoded_bytes.push(encoded_len);
         encoded_spans.push(span);
     }
@@ -720,9 +732,10 @@ fn validate_big_compatible_topology(
     for (origin_extent, replacement_extent) in origin.extents.iter().zip(&replacement.extents) {
         if origin_extent.lcn != replacement_extent.lcn
             || origin_extent.physical_blocks != replacement_extent.physical_blocks
+            || origin_extent.kind != replacement_extent.kind
         {
             return Err(CoreError::IncompatibleReplacement(
-                "big-pcluster HEAD/physical-block footprint differs",
+                "big-pcluster extent type/HEAD/physical-block footprint differs",
             ));
         }
     }
@@ -1659,7 +1672,13 @@ fn recover_full_big_extents(
             "full big-pcluster index vector length differs from logical lcluster count",
         ));
     }
-    let mut head_lcns = Vec::new();
+
+    let data_end = if eof_plain_clusterofs.is_some() {
+        total.saturating_sub(1)
+    } else {
+        total
+    };
+    let mut starts = Vec::new();
     for (lcn, entry) in entries.iter().enumerate() {
         if entry.advise & !LCLUSTER_TYPE_MASK != 0 {
             return Err(CoreError::UnsupportedInode(
@@ -1681,47 +1700,61 @@ fn recover_full_big_extents(
             ));
         }
         match entry.kind {
-            LCLUSTER_HEAD1 => head_lcns.push(lcn),
+            LCLUSTER_HEAD1 => starts.push((lcn, HeadKind::Lz4)),
+            LCLUSTER_PLAIN => {
+                if entry.word == 0 {
+                    return Err(CoreError::InvalidFilesystem(
+                        "full big-pcluster PLAIN data extent records zero physical block",
+                    ));
+                }
+                starts.push((lcn, HeadKind::Plain));
+            }
             LCLUSTER_NONHEAD => {}
             _ => {
                 return Err(CoreError::UnsupportedInode(
-                    "full big-pcluster supports only HEAD1/NONHEAD data plus the verified EOF PLAIN sentinel",
+                    "full big-pcluster supports HEAD1/NONHEAD, aligned one-block PLAIN data, and the verified EOF PLAIN sentinel",
                 ));
             }
         }
     }
-    if head_lcns.first().copied() != Some(0) {
+    if starts.first().map(|(lcn, _)| *lcn) != Some(0) {
         return Err(CoreError::InvalidFilesystem(
             "first full big-pcluster extent does not begin at lcluster zero",
         ));
     }
 
-    let data_end = if eof_plain_clusterofs.is_some() {
-        total.saturating_sub(1)
-    } else {
-        total
-    };
-    let mut extents = Vec::with_capacity(head_lcns.len());
-    for (index, &head_lcn) in head_lcns.iter().enumerate() {
-        let next_head = head_lcns.get(index + 1).copied().unwrap_or(data_end);
+    let mut extents = Vec::with_capacity(starts.len());
+    for (index, &(head_lcn, kind)) in starts.iter().enumerate() {
+        let next_head = starts.get(index + 1).map_or(data_end, |(lcn, _)| *lcn);
         if next_head <= head_lcn {
             return Err(CoreError::InvalidFilesystem(
-                "full big-pcluster HEAD lclusters are not strictly increasing",
+                "full big-pcluster extent lclusters are not strictly increasing",
             ));
         }
         let head = entries
             .get(head_lcn)
             .ok_or(CoreError::UnexpectedEndOfStructure)?;
-        let physical_blocks = validate_full_big_extent(entries, head_lcn, next_head)?;
+        let physical_blocks = match kind {
+            HeadKind::Lz4 => validate_full_big_extent(entries, head_lcn, next_head)?,
+            HeadKind::Plain => {
+                if next_head != head_lcn.saturating_add(1) {
+                    return Err(CoreError::UnsupportedInode(
+                        "full big-pcluster PLAIN data extent must occupy exactly one logical lcluster",
+                    ));
+                }
+                1
+            }
+        };
         extents.push(BigExtent {
             lcn: head_lcn,
             pcluster: u64::from(head.word),
             physical_blocks,
+            kind,
         });
     }
     if extents.is_empty() {
         return Err(CoreError::InvalidFilesystem(
-            "full big-pcluster topology contains no HEAD",
+            "full big-pcluster topology contains no data extent",
         ));
     }
     Ok(extents)
@@ -1858,6 +1891,7 @@ fn recover_big_extents(
             lcn: head_lcn,
             pcluster,
             physical_blocks,
+            kind: HeadKind::Lz4,
         });
     }
     if extents.is_empty() {
@@ -2510,6 +2544,7 @@ mod tests {
                 lcn: 0,
                 pcluster: 100,
                 physical_blocks: 2,
+                kind: HeadKind::Lz4,
             }]
         );
     }
@@ -2571,11 +2606,13 @@ mod tests {
                     lcn: 0,
                     pcluster: 100,
                     physical_blocks: 3,
+                    kind: HeadKind::Lz4,
                 },
                 BigExtent {
                     lcn: 8,
                     pcluster: 103,
                     physical_blocks: 1,
+                    kind: HeadKind::Lz4,
                 },
             ]
         );
@@ -2595,6 +2632,56 @@ mod tests {
         assert_eq!(extents.len(), 1);
         assert_eq!(extents[0].physical_blocks, 2);
     }
+    #[test]
+    fn full_big_mixed_plain_data_extents_preserve_extent_kind() {
+        let entries = vec![
+            FullEntry {
+                advise: LCLUSTER_HEAD1,
+                kind: LCLUSTER_HEAD1,
+                clusterofs: 0,
+                word: 10,
+            },
+            FullEntry {
+                advise: LCLUSTER_NONHEAD,
+                kind: LCLUSTER_NONHEAD,
+                clusterofs: 0,
+                word: (2_u32 << 16) | u32::from(D0_CBLKCNT | 1),
+            },
+            FullEntry {
+                advise: LCLUSTER_NONHEAD,
+                kind: LCLUSTER_NONHEAD,
+                clusterofs: 0,
+                word: (1_u32 << 16) | 2,
+            },
+            FullEntry {
+                advise: LCLUSTER_PLAIN,
+                kind: LCLUSTER_PLAIN,
+                clusterofs: 0,
+                word: 11,
+            },
+            FullEntry {
+                advise: LCLUSTER_HEAD1,
+                kind: LCLUSTER_HEAD1,
+                clusterofs: 0,
+                word: 12,
+            },
+            FullEntry {
+                advise: LCLUSTER_NONHEAD,
+                kind: LCLUSTER_NONHEAD,
+                clusterofs: 0,
+                word: (1_u32 << 16) | u32::from(D0_CBLKCNT | 1),
+            },
+        ];
+        let extents = recover_full_big_extents(&entries, entries.len(), None).unwrap();
+        assert_eq!(extents.len(), 3);
+        assert_eq!(extents[0].kind, HeadKind::Lz4);
+        assert_eq!(extents[0].physical_blocks, 1);
+        assert_eq!(extents[1].kind, HeadKind::Plain);
+        assert_eq!(extents[1].physical_blocks, 1);
+        assert_eq!(extents[2].kind, HeadKind::Lz4);
+        assert_eq!(extents[2].physical_blocks, 1);
+    }
+
     #[test]
     fn eight_kib_0padding_span_round_trips() {
         let mut input = vec![b'P'; 32768];
