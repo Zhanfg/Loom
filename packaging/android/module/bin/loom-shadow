@@ -1,0 +1,431 @@
+#!/system/bin/sh
+
+umask 077
+
+SELF_DIR=${0%/*}
+MODDIR=${LOOM_MODDIR:-${SELF_DIR%/*}}
+STATE=${LOOM_STATE_DIR:-/data/adb/loom}
+CONF=${LOOM_SHADOW_CONFIG:-$STATE/shadow.conf}
+DEFAULT_CONF="$MODDIR/shadow.conf"
+RUNTIME="$STATE/shadow-runtime"
+PROC_MOUNTS=${LOOM_PROC_MOUNTS:-/proc/mounts}
+LOG=${LOOM_SHADOW_LOG:-$STATE/shadow.log}
+SHADOW_TOKEN=__LOOM_SHADOW_DEVICE__
+
+mkdir -p "$STATE" "$STATE/mnt" "$STATE/payload/system"
+chmod 0700 "$STATE" "$STATE/mnt" "$STATE/payload" "$STATE/payload/system" 2>/dev/null || true
+
+log() {
+  printf '[loom-shadow] %s\n' "$*" >>"$LOG"
+}
+
+set_status() {
+  printf '%s\n' "$1" >"$STATE/status"
+  log "status=$1"
+}
+
+fail() {
+  set_status "$1"
+  log "$2"
+  return 1
+}
+
+read_config_value() {
+  key=$1
+  file=$2
+  [ -f "$file" ] || return 1
+  sed -n "s/^${key}=//p" "$file" | tail -n 1
+}
+
+load_config() {
+  LOOM_SHADOW_ENABLED=0
+  LOOM_SOURCE_MODULE_ID=
+  LOOM_PAYLOAD_ROOT="$STATE/payload/system"
+  LOOM_TARGET=system
+  LOOM_ORIGIN=auto
+  LOOM_DM_PREFIX=loom-shadow-system
+  LOOM_MOUNTPOINT="$STATE/mnt/system-shadow"
+  LOOM_MAX_LAYERS=32
+  LOOM_TAKEOVER=0
+
+  if [ ! -f "$CONF" ] && [ -f "$DEFAULT_CONF" ]; then
+    cp "$DEFAULT_CONF" "$CONF" 2>/dev/null || true
+    chmod 0600 "$CONF" 2>/dev/null || true
+  fi
+
+  for key in LOOM_SHADOW_ENABLED LOOM_SOURCE_MODULE_ID LOOM_PAYLOAD_ROOT LOOM_TARGET LOOM_ORIGIN LOOM_DM_PREFIX LOOM_MOUNTPOINT LOOM_MAX_LAYERS LOOM_TAKEOVER; do
+    value=$(read_config_value "$key" "$CONF" 2>/dev/null || true)
+    [ -n "$value" ] || continue
+    case "$key" in
+      LOOM_SHADOW_ENABLED) LOOM_SHADOW_ENABLED=$value ;;
+      LOOM_SOURCE_MODULE_ID) LOOM_SOURCE_MODULE_ID=$value ;;
+      LOOM_PAYLOAD_ROOT) LOOM_PAYLOAD_ROOT=$value ;;
+      LOOM_TARGET) LOOM_TARGET=$value ;;
+      LOOM_ORIGIN) LOOM_ORIGIN=$value ;;
+      LOOM_DM_PREFIX) LOOM_DM_PREFIX=$value ;;
+      LOOM_MOUNTPOINT) LOOM_MOUNTPOINT=$value ;;
+      LOOM_MAX_LAYERS) LOOM_MAX_LAYERS=$value ;;
+      LOOM_TAKEOVER) LOOM_TAKEOVER=$value ;;
+    esac
+  done
+
+  case "$LOOM_SHADOW_ENABLED" in 0|1) ;; *) return 1 ;; esac
+  case "$LOOM_TAKEOVER" in 0) ;; *) return 1 ;; esac
+  case "$LOOM_TARGET" in *[!A-Za-z0-9_.-]*|'') return 1 ;; esac
+  case "$LOOM_DM_PREFIX" in loom-shadow-*) ;; *) return 1 ;; esac
+  case "$LOOM_MOUNTPOINT" in "$STATE"/mnt/*) ;; *) return 1 ;; esac
+  case "$LOOM_MAX_LAYERS" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$LOOM_MAX_LAYERS" -ge 1 ] && [ "$LOOM_MAX_LAYERS" -le 128 ] || return 1
+  if [ -n "$LOOM_SOURCE_MODULE_ID" ]; then
+    case "$LOOM_SOURCE_MODULE_ID" in *[!A-Za-z0-9_.-]*) return 1 ;; esac
+    LOOM_PAYLOAD_ROOT="/data/adb/modules/$LOOM_SOURCE_MODULE_ID/system"
+  fi
+  return 0
+}
+
+find_cmd() {
+  env_name=$1
+  fallback=$2
+  eval "override=\${$env_name:-}"
+  if [ -n "$override" ]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+  command -v "$fallback" 2>/dev/null || true
+}
+
+is_device() {
+  [ -b "$1" ] && return 0
+  [ "${LOOM_TEST_ALLOW_REGULAR:-0}" = 1 ] && [ -e "$1" ] && return 0
+  return 1
+}
+
+canonical_path() {
+  resolved=$(readlink -f "$1" 2>/dev/null || true)
+  [ -n "$resolved" ] && printf '%s\n' "$resolved" || printf '%s\n' "$1"
+}
+
+resolve_origin() {
+  if [ "$LOOM_ORIGIN" != auto ]; then
+    is_device "$LOOM_ORIGIN" || return 1
+    canonical_path "$LOOM_ORIGIN"
+    return 0
+  fi
+
+  GETPROP=$(find_cmd LOOM_GETPROP_BIN getprop)
+  slot=
+  if [ -n "$GETPROP" ]; then
+    slot=$($GETPROP ro.boot.slot_suffix 2>/dev/null || true)
+  fi
+
+  for candidate in \
+    "/dev/block/mapper/${LOOM_TARGET}${slot}" \
+    "/dev/block/mapper/${LOOM_TARGET}" \
+    "/dev/block/by-name/${LOOM_TARGET}${slot}" \
+    "/dev/block/by-name/${LOOM_TARGET}" \
+    "/dev/block/bootdevice/by-name/${LOOM_TARGET}${slot}" \
+    "/dev/block/bootdevice/by-name/${LOOM_TARGET}"; do
+    if is_device "$candidate"; then
+      canonical_path "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+resolve_tools() {
+  LOOM_BIN=${LOOM_BIN_OVERRIDE:-$MODDIR/bin/loom}
+  [ -x "$LOOM_BIN" ] || return 1
+  LOSETUP=$(find_cmd LOOM_LOSETUP_BIN losetup)
+  DMCTL=$(find_cmd LOOM_DMCTL_BIN dmctl)
+  DMSETUP=$(find_cmd LOOM_DMSETUP_BIN dmsetup)
+  MOUNT_BIN=$(find_cmd LOOM_MOUNT_BIN mount)
+  UMOUNT_BIN=$(find_cmd LOOM_UMOUNT_BIN umount)
+  FIND_BIN=$(find_cmd LOOM_FIND_BIN find)
+  SORT_BIN=$(find_cmd LOOM_SORT_BIN sort)
+
+  [ -n "$LOSETUP" ] || return 1
+  [ -n "$DMCTL" ] || [ -n "$DMSETUP" ] || return 1
+  [ -n "$MOUNT_BIN" ] || return 1
+  [ -n "$UMOUNT_BIN" ] || return 1
+  [ -n "$FIND_BIN" ] || return 1
+  [ -n "$SORT_BIN" ] || return 1
+  return 0
+}
+
+is_mounted() {
+  [ -f "$PROC_MOUNTS" ] || return 1
+  grep -F " $LOOM_MOUNTPOINT " "$PROC_MOUNTS" >/dev/null 2>&1
+}
+
+dm_delete_name() {
+  name=$1
+  if [ -n "${DMCTL:-}" ]; then
+    "$DMCTL" delete "$name" >/dev/null 2>&1 || true
+  elif [ -n "${DMSETUP:-}" ]; then
+    "$DMSETUP" remove "$name" >/dev/null 2>&1 || true
+  fi
+}
+
+cleanup_runtime() {
+  if is_mounted; then
+    "$UMOUNT_BIN" "$LOOM_MOUNTPOINT" >/dev/null 2>&1 || "$UMOUNT_BIN" -l "$LOOM_MOUNTPOINT" >/dev/null 2>&1 || true
+  fi
+
+  count=$(cat "$RUNTIME/layer_count" 2>/dev/null || printf '0')
+  case "$count" in ''|*[!0-9]*) count=0 ;; esac
+  i=$count
+  while [ "$i" -gt 0 ]; do
+    layer="$RUNTIME/layers/$i"
+    [ -f "$layer/dm_name" ] && dm_delete_name "$(cat "$layer/dm_name")"
+    if [ -f "$layer/loop" ]; then
+      loop=$(cat "$layer/loop")
+      "$LOSETUP" -d "$loop" >/dev/null 2>&1 || true
+    fi
+    i=$((i - 1))
+  done
+  rm -rf "$RUNTIME"
+}
+
+validate_payload_root() {
+  [ -d "$LOOM_PAYLOAD_ROOT" ] || return 1
+  root=$(canonical_path "$LOOM_PAYLOAD_ROOT")
+  [ -d "$root" ] || return 1
+  if [ -z "$LOOM_SOURCE_MODULE_ID" ]; then
+    allowed=$(canonical_path "$STATE/payload/system")
+    case "$root" in "$allowed"|"$allowed"/*) ;; *) return 1 ;; esac
+  fi
+  LOOM_PAYLOAD_ROOT=$root
+  return 0
+}
+
+payload_list() {
+  "$FIND_BIN" "$LOOM_PAYLOAD_ROOT" -type f -print | "$SORT_BIN"
+}
+
+validate_payload_tree() {
+  if "$FIND_BIN" "$LOOM_PAYLOAD_ROOT" -type l -print | grep -q .; then
+    fail SHADOW_UNSUPPORTED_PAYLOAD "symbolic links are not supported in Alpha 2 payload trees" || true
+    return 1
+  fi
+  count=$(payload_list | wc -l | tr -d ' ')
+  case "$count" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$count" -gt 0 ] || { fail SHADOW_PAYLOAD_EMPTY "payload tree contains no regular files" || true; return 1; }
+  [ "$count" -le "$LOOM_MAX_LAYERS" ] || {
+    fail SHADOW_LAYER_LIMIT "payload has $count files but Alpha 2 limit is $LOOM_MAX_LAYERS" || true
+    return 1
+  }
+  PAYLOAD_COUNT=$count
+  return 0
+}
+
+target_for_payload() {
+  payload=$1
+  case "$payload" in "$LOOM_PAYLOAD_ROOT"/*) ;; *) return 1 ;; esac
+  rel=${payload#"$LOOM_PAYLOAD_ROOT"/}
+  case "$rel" in ''|/*|../*|*/../*|*/..) return 1 ;; esac
+  printf '/%s\n' "$rel"
+}
+
+attach_shadow_loop() {
+  shadow=$1
+  loop=$($LOSETUP -f -r --show "$shadow" 2>/dev/null || true)
+  [ -n "$loop" ] || return 1
+  is_device "$loop" || { "$LOSETUP" -d "$loop" >/dev/null 2>&1 || true; return 1; }
+  printf '%s\n' "$loop"
+}
+
+rewrite_shadow_device() {
+  input=$1
+  output=$2
+  loop=$3
+  sed "s|$SHADOW_TOKEN|$loop|g" "$input" >"$output"
+  grep -q "$SHADOW_TOKEN" "$output" && return 1
+  return 0
+}
+
+dm_create_from_table() {
+  name=$1
+  table=$2
+  if [ -n "$DMCTL" ]; then
+    set -- create "$name" -ro
+    while read -r start count kind device source_start extra; do
+      [ -n "$start" ] || continue
+      [ "$kind" = linear ] || return 1
+      [ -z "$extra" ] || return 1
+      case "$start$count$source_start" in *[!0-9]*) return 1 ;; esac
+      set -- "$@" linear "$start" "$count" "$device" "$source_start"
+    done <"$table"
+    "$DMCTL" "$@" >/dev/null || return 1
+    DM_PATH=$($DMCTL getpath "$name" 2>/dev/null || true)
+  else
+    "$DMSETUP" create "$name" --readonly --table "$(cat "$table")" >/dev/null || return 1
+    if [ -e "/dev/block/mapper/$name" ]; then
+      DM_PATH="/dev/block/mapper/$name"
+    elif [ -e "/dev/mapper/$name" ]; then
+      DM_PATH="/dev/mapper/$name"
+    else
+      DM_PATH=
+    fi
+  fi
+  [ -n "$DM_PATH" ] || return 1
+  is_device "$DM_PATH" || return 1
+  return 0
+}
+
+compile_layer() {
+  index=$1
+  origin=$2
+  payload=$3
+  target=$4
+  layer="$RUNTIME/layers/$index"
+  mkdir -p "$layer"
+  shadow="$layer/shadow.pack"
+  raw_table="$layer/table.raw"
+  table="$layer/table"
+  compile_log="$layer/compile.log"
+
+  if ! "$LOOM_BIN" erofs-compact-pcluster-swap --multi-encode \
+      "$origin" "$target" "$payload" "$shadow" "$origin" "$SHADOW_TOKEN" "$raw_table" \
+      >"$compile_log" 2>&1; then
+    log "compile failed target=$target payload=$payload"
+    return 1
+  fi
+
+  if [ ! -s "$shadow" ]; then
+    log "no changed blocks target=$target; layer elided"
+    rm -rf "$layer"
+    NEXT_ORIGIN=$origin
+    LAYER_MATERIALIZED=0
+    return 0
+  fi
+
+  loop=$(attach_shadow_loop "$shadow") || return 1
+  printf '%s\n' "$loop" >"$layer/loop"
+  rewrite_shadow_device "$raw_table" "$table" "$loop" || {
+    "$LOSETUP" -d "$loop" >/dev/null 2>&1 || true
+    return 1
+  }
+
+  dm_name="${LOOM_DM_PREFIX}-${index}"
+  dm_delete_name "$dm_name"
+  if ! dm_create_from_table "$dm_name" "$table"; then
+    "$LOSETUP" -d "$loop" >/dev/null 2>&1 || true
+    return 1
+  fi
+  printf '%s\n' "$dm_name" >"$layer/dm_name"
+  printf '%s\n' "$DM_PATH" >"$layer/dm_path"
+  printf '%s\n' "$target" >"$layer/target"
+  printf '%s\n' "$payload" >"$layer/payload"
+  NEXT_ORIGIN=$DM_PATH
+  LAYER_MATERIALIZED=1
+  return 0
+}
+
+mount_effective() {
+  device=$1
+  mkdir -p "$LOOM_MOUNTPOINT"
+  chmod 0700 "$LOOM_MOUNTPOINT" 2>/dev/null || true
+  "$MOUNT_BIN" -t erofs -o ro,nosuid,nodev,noexec "$device" "$LOOM_MOUNTPOINT" || return 1
+  is_mounted
+}
+
+preflight() {
+  load_config || { fail SHADOW_CONFIG_INVALID "invalid shadow.conf" || true; return 1; }
+  [ "$LOOM_SHADOW_ENABLED" = 1 ] || { set_status SHADOW_DISABLED; return 0; }
+  uid=${LOOM_TEST_UID:-$(id -u 2>/dev/null || printf '1')}
+  [ "$uid" = 0 ] || { fail SHADOW_PREFLIGHT_FAILED "root privileges required" || true; return 1; }
+  resolve_tools || { fail SHADOW_PREFLIGHT_FAILED "loom/losetup/dmctl-or-dmsetup/mount/umount/find/sort missing" || true; return 1; }
+  ORIGIN=$(resolve_origin) || { fail SHADOW_PREFLIGHT_FAILED "cannot resolve origin block device for $LOOM_TARGET" || true; return 1; }
+  validate_payload_root || { fail SHADOW_PREFLIGHT_FAILED "invalid or unavailable payload root $LOOM_PAYLOAD_ROOT" || true; return 1; }
+  validate_payload_tree || return 1
+  set_status SHADOW_PREFLIGHT_OK
+  log "preflight PASS origin=$ORIGIN payload_root=$LOOM_PAYLOAD_ROOT files=$PAYLOAD_COUNT source_module=${LOOM_SOURCE_MODULE_ID:-none}"
+  return 0
+}
+
+activate() {
+  preflight || return 1
+  [ "$LOOM_SHADOW_ENABLED" = 1 ] || return 0
+
+  cleanup_runtime
+  mkdir -p "$RUNTIME/layers"
+  current=$ORIGIN
+  index=0
+  materialized=0
+  payload_list >"$RUNTIME/payload.list"
+  while IFS= read -r payload; do
+    [ -n "$payload" ] || continue
+    target=$(target_for_payload "$payload") || {
+      cleanup_runtime
+      fail SHADOW_TARGET_INVALID "invalid payload path $payload" || true
+      return 1
+    }
+    index=$((index + 1))
+    if ! compile_layer "$index" "$current" "$payload" "$target"; then
+      printf '%s\n' "$materialized" >"$RUNTIME/layer_count" 2>/dev/null || true
+      cleanup_runtime
+      fail SHADOW_COMPILE_FAILED "failed to compile or materialize target $target" || true
+      return 1
+    fi
+    current=$NEXT_ORIGIN
+    if [ "$LAYER_MATERIALIZED" = 1 ]; then
+      materialized=$index
+      printf '%s\n' "$materialized" >"$RUNTIME/layer_count"
+    fi
+  done <"$RUNTIME/payload.list"
+
+  [ "$materialized" -gt 0 ] || {
+    cleanup_runtime
+    fail SHADOW_NO_CHANGES "all payload files produced zero changed blocks" || true
+    return 1
+  }
+
+  if ! mount_effective "$current"; then
+    cleanup_runtime
+    fail SHADOW_MOUNT_FAILED "final effective EROFS view failed to mount" || true
+    return 1
+  fi
+
+  cat >"$RUNTIME/runtime.env" <<EOF
+LOOM_MODE=sparse-shadow-sidecar
+LOOM_ORIGIN=$ORIGIN
+LOOM_EFFECTIVE_DEVICE=$current
+LOOM_MOUNTPOINT=$LOOM_MOUNTPOINT
+LOOM_PAYLOAD_ROOT=$LOOM_PAYLOAD_ROOT
+LOOM_SOURCE_MODULE_ID=$LOOM_SOURCE_MODULE_ID
+LOOM_LAYER_COUNT=$materialized
+LOOM_TAKEOVER=0
+EOF
+  set_status SHADOW_ACTIVE
+  log "activation PASS effective=$current mountpoint=$LOOM_MOUNTPOINT layers=$materialized takeover=0"
+  return 0
+}
+
+cleanup_command() {
+  load_config || return 1
+  resolve_tools || return 1
+  cleanup_runtime
+  set_status SHADOW_INACTIVE
+  log "cleanup PASS"
+}
+
+status_command() {
+  load_config || true
+  printf 'status='
+  cat "$STATE/status" 2>/dev/null || printf 'UNKNOWN\n'
+  [ -f "$RUNTIME/runtime.env" ] && cat "$RUNTIME/runtime.env"
+  if is_mounted; then
+    printf 'mounted=1\n'
+  else
+    printf 'mounted=0\n'
+  fi
+}
+
+case "${1:-status}" in
+  preflight) preflight ;;
+  activate) activate ;;
+  cleanup) cleanup_command ;;
+  status) status_command ;;
+  *) printf 'usage: %s {preflight|activate|cleanup|status}\n' "$0" >&2; exit 2 ;;
+esac
