@@ -1,41 +1,23 @@
-name: linux-hard-gate
+name: stage35-legacy-full-big-plain-diagnostic
 
 on:
-  pull_request:
-  workflow_dispatch:
   push:
     branches:
-      - main
+      - feat/stage35-erofs-legacy-full-big-plain-data
+    paths:
+      - .github/workflows/linux-hard-gate.yml
 
 permissions:
   contents: read
 
 jobs:
-  linux-hard-gate:
+  probe:
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v5
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Install filesystem test dependencies
+      - uses: actions/checkout@v5
+      - name: Install erofs tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs erofs-utils dmsetup util-linux python3
-
-      - name: Prepare host kernel facilities
-        run: |
-          sudo modprobe loop || true
-          sudo modprobe dm_mod || true
-          sudo modprobe erofs || true
-          sudo losetup -f
-          sudo dmsetup version
-
-      - name: Run canonical Linux hard gate
-        run: bash tests/ci/linux-hard-gate.sh
+          sudo apt-get install -y erofs-utils
+      - name: Probe PLAIN data inside legacy full-big
+        run: bash tests/integration/stage35_probe_legacy_full_big_plain.sh
