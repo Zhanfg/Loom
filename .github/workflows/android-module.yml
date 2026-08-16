@@ -6,17 +6,17 @@ on:
       source_ref:
         description: 'Loom branch, tag, or commit SHA to package'
         required: true
-        default: 'feat/stage38-erofs-legacy-full-inline-pcluster'
+        default: 'feat/android-block-origin-alpha2'
         type: string
       version_name:
         description: 'Module version name'
         required: true
-        default: '0.1.0-sidecar-alpha1'
+        default: '0.2.0-shadow-alpha2'
         type: string
       version_code:
         description: 'Numeric module version code'
         required: true
-        default: '10100'
+        default: '10200'
         type: string
       run_host_tests:
         description: 'Run host workspace tests before packaging'
@@ -28,6 +28,7 @@ on:
       - main
       - infra/android-module-pipeline
       - 'feat/android-sidecar-*'
+      - 'feat/android-shadow-sidecar-*'
   pull_request:
     paths:
       - '.github/workflows/android-module.yml'
@@ -48,9 +49,12 @@ jobs:
         with:
           path: pipeline
 
-      - name: Validate sidecar runtime safety
+      - name: Validate Android runtime safety
         shell: bash
-        run: bash pipeline/packaging/android/tests/sidecar_runtime_test.sh
+        run: |
+          set -euo pipefail
+          bash pipeline/packaging/android/tests/sidecar_runtime_test.sh
+          bash pipeline/packaging/android/tests/shadow_runtime_test.sh
 
       - name: Resolve source and version
         id: meta
@@ -61,15 +65,15 @@ jobs:
           REQUESTED_CODE: ${{ inputs.version_code }}
         run: |
           set -euo pipefail
-          DEFAULT_SOURCE_REF='feat/stage38-erofs-legacy-full-inline-pcluster'
+          DEFAULT_SOURCE_REF='feat/android-block-origin-alpha2'
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             SOURCE_REF="${REQUESTED_REF:-$DEFAULT_SOURCE_REF}"
             VERSION_NAME="$REQUESTED_VERSION"
             VERSION_CODE="$REQUESTED_CODE"
           else
             SOURCE_REF="$DEFAULT_SOURCE_REF"
-            VERSION_NAME="0.1.0-sidecar-alpha1+run${GITHUB_RUN_NUMBER}"
-            VERSION_CODE="$((10100 + GITHUB_RUN_NUMBER))"
+            VERSION_NAME="0.2.0-shadow-alpha2+run${GITHUB_RUN_NUMBER}"
+            VERSION_CODE="$((10200 + GITHUB_RUN_NUMBER))"
           fi
           [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]
           SAFE_VERSION="$(printf '%s' "$VERSION_NAME" | tr -c 'A-Za-z0-9._+-' '-')"
@@ -164,7 +168,7 @@ jobs:
           set -euo pipefail
           ZIP='${{ steps.package.outputs.zip }}'
           unzip -t "$ZIP" >/dev/null
-          for entry in module.prop bin/loom bin/loom-sidecar sidecar.conf customize.sh post-fs-data.sh service.sh action.sh uninstall.sh skip_mount build-info.txt; do
+          for entry in module.prop bin/loom bin/loom-sidecar bin/loom-shadow sidecar.conf shadow.conf customize.sh post-fs-data.sh service.sh action.sh uninstall.sh skip_mount build-info.txt; do
             unzip -Z1 "$ZIP" | grep -Fxq "$entry" || { echo "Missing module entry: $entry" >&2; exit 1; }
           done
           unzip -p "$ZIP" module.prop
@@ -172,8 +176,12 @@ jobs:
           unzip -p "$ZIP" bin/loom > /tmp/loom-android
           chmod 0755 /tmp/loom-android
           file /tmp/loom-android | grep -q 'ARM aarch64\|ARM64\|aarch64'
-          unzip -p "$ZIP" service.sh | grep -q 'loom-sidecar.*activate'
+          unzip -p "$ZIP" service.sh | grep -q 'loom-shadow.*activate'
+          unzip -p "$ZIP" shadow.conf | grep -Fxq 'LOOM_SHADOW_ENABLED=0'
+          unzip -p "$ZIP" shadow.conf | grep -Fxq 'LOOM_TAKEOVER=0'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'shadow_origin=direct-block-device'
           unzip -p "$ZIP" build-info.txt | grep -Fxq 'stock_mount_replacement=false'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'system_takeover=false'
           if unzip -Z1 "$ZIP" | grep -qE '^([^/]+/){2,}module\.prop$'; then
             echo 'module.prop is incorrectly nested inside wrapper directories' >&2
             exit 1
@@ -194,7 +202,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Loom Android sidecar Alpha 1 artifact'
+            echo '## Loom Android sparse-shadow Alpha 2 artifact'
             echo
             echo "- Source ref: `${{ steps.meta.outputs.source_ref }}`"
             echo "- Source SHA: `${{ steps.source.outputs.sha }}`"
@@ -202,9 +210,12 @@ jobs:
             echo "- Architecture: `arm64-v8a`"
             echo "- NDK: `${{ steps.ndk.outputs.root }}`"
             echo "- Artifact: `${{ steps.package.outputs.artifact_name }}`"
-            echo "- Activation: `read-only identity sidecar`"
-            echo "- Mount scope: `/data/adb/loom/mnt/*`"
+            echo "- Default activation: `read-only identity sidecar`"
+            echo "- Opt-in validation activation: `direct-block sparse-shadow sidecar`"
+            echo "- Shadow backing: `read-only loop devices`"
+            echo "- Shadow composition: `transactional layered dm-linear`"
             echo "- Existing system/module mount replacement: `false`"
+            echo "- System takeover: `false`"
             echo
-            echo '> Alpha 1 validates real Android device-mapper activation and read-only mounting without replacing the device current mount module. Sparse-shadow takeover remains a later opt-in gate.'
+            echo '> Alpha 2 can materialize real Loom sparse shadows from a local payload tree or an existing module system/ tree while leaving the current module active. It still mounts only below /data/adb/loom/mnt.'
           } >> "$GITHUB_STEP_SUMMARY"
