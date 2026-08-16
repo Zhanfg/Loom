@@ -919,7 +919,20 @@ fn validate_big_compatible_topology(
 impl Image {
     fn open(path: &Path) -> Result<Self, CoreError> {
         let mut file = File::open(path).map_err(CoreError::Io)?;
-        let bytes = file.metadata().map_err(CoreError::Io)?.len();
+        let metadata_bytes = file.metadata().map_err(CoreError::Io)?.len();
+        let bytes = if metadata_bytes != 0 {
+            metadata_bytes
+        } else {
+            let current = file.stream_position().map_err(CoreError::Io)?;
+            let end = file.seek(SeekFrom::End(0)).map_err(CoreError::Io)?;
+            file.seek(SeekFrom::Start(current)).map_err(CoreError::Io)?;
+            end
+        };
+        if bytes == 0 {
+            return Err(CoreError::InvalidFilesystem(
+                "origin image or block device reports zero bytes",
+            ));
+        }
         let sb = read_superblock(&mut file, bytes)?;
         Ok(Self { file, bytes, sb })
     }
