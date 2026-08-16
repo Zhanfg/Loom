@@ -1,4 +1,4 @@
-name: stage31-plain-data-maintenance
+name: stage31-plain-data-maintenance-retry
 
 on:
   push:
@@ -22,10 +22,11 @@ jobs:
         run: |
           set -euo pipefail
           python3 .github/stage31_plain_data_fix.py
+          python3 .github/stage31_clippy_refactor.py
           cargo fmt --all
           cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
-          rm -f .github/stage31_plain_data_fix.py
+          rm -f .github/stage31_plain_data_fix.py .github/stage31_clippy_refactor.py
           rm -f tests/integration/stage31_probe_legacy_full_plain.sh
           git checkout fa6edf5036e272ed8e13cdc7887280de57a45d99 -- .github/workflows/linux-hard-gate.yml
           git config user.name 'github-actions[bot]'
