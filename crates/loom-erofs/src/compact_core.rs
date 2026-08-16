@@ -33,12 +33,15 @@ const LCLUSTER_TYPE_MASK: u16 = 3;
 const ADVISE_COMPACTED_2B: u16 = 0x0001;
 const ADVISE_BIG_PCLUSTER_1: u16 = 0x0002;
 const ADVISE_BIG_PCLUSTER_2: u16 = 0x0004;
+const ADVISE_INLINE_PCLUSTER: u16 = 0x0008;
 const BIG_ADVISE: u16 = ADVISE_COMPACTED_2B | ADVISE_BIG_PCLUSTER_1 | ADVISE_BIG_PCLUSTER_2;
 const FULL_BIG_ADVISE: u16 = ADVISE_BIG_PCLUSTER_1;
 const LZ4_ALGORITHM: u8 = 0;
 const FEATURE_LZ4_0PADDING: u32 = 0x0000_0001;
 const FEATURE_BIG_PCLUSTER: u32 = 0x0000_0002;
-const SUPPORTED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER;
+const FEATURE_ZTAILPACKING: u32 = 0x0000_0010;
+const FEATURE_SB_CHKSUM: u32 = 0x0000_0001;
+const SUPPORTED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER | FEATURE_ZTAILPACKING;
 const BIG_REQUIRED_INCOMPAT: u32 = FEATURE_LZ4_0PADDING | FEATURE_BIG_PCLUSTER;
 
 #[derive(Debug)]
@@ -75,6 +78,14 @@ enum Lz4Placement {
     ZeroPadding,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InlineTail {
+    head_lcn: usize,
+    header_offset: u64,
+    data_offset: u64,
+    capacity: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Topology {
     nid: u64,
@@ -85,6 +96,7 @@ struct Topology {
     logical_lclusters: usize,
     compact_2b_entries: usize,
     eof_plain_clusterofs: Option<usize>,
+    inline_tail: Option<InlineTail>,
     heads: Vec<Head>,
 }
 
@@ -111,6 +123,7 @@ struct BigTopology {
 struct Superblock {
     root_nid: u64,
     meta_block: u64,
+    feature_compat: u32,
     incompat: u32,
 }
 
@@ -157,7 +170,9 @@ struct FullEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FullMapHeader {
+    header_offset: u64,
     ebase: u64,
+    idata_size: u16,
     advise: u16,
     algorithm: u8,
     secondary_algorithm: u8,
@@ -191,6 +206,11 @@ pub(crate) fn compile_oracle(
     let replacement_nid = replacement.resolve_path(target_path)?;
     let origin_topology = origin.read_topology(origin_nid)?;
     let replacement_topology = replacement.read_topology(replacement_nid)?;
+    if origin_topology.inline_tail.is_some() || replacement_topology.inline_tail.is_some() {
+        return Err(CoreError::UnsupportedInode(
+            "inline pcluster oracle mode is not enabled; use Loom self-encode",
+        ));
+    }
     validate_compatible_topology(&origin_topology, &replacement_topology)?;
 
     let mut encoded_blocks = Vec::with_capacity(replacement_topology.heads.len());
@@ -203,6 +223,7 @@ pub(crate) fn compile_oracle(
         &replacement_topology.heads,
         encoded_blocks,
         vec![BLOCK_BYTES; replacement_topology.heads.len()],
+        origin.sb.feature_compat,
     )
 }
 
@@ -232,7 +253,9 @@ pub(crate) fn compile_multi_lz4(
 ) -> Result<CompiledCore, CoreError> {
     let origin = Image::open(origin_path)?;
     match origin.sb.incompat {
-        0 | FEATURE_LZ4_0PADDING => compile_lz4(origin_path, target_path, replacement_path),
+        0 | FEATURE_LZ4_0PADDING | FEATURE_ZTAILPACKING => {
+            compile_lz4(origin_path, target_path, replacement_path)
+        }
         FEATURE_BIG_PCLUSTER | BIG_REQUIRED_INCOMPAT => {
             compile_big_lz4(origin_path, target_path, replacement_path)
         }
@@ -282,9 +305,24 @@ pub(crate) fn compile_lz4(
         let extent = replacement
             .get(start..end)
             .ok_or(CoreError::UnexpectedEndOfStructure)?;
-        let (block, encoded_len) = match head.kind {
-            HeadKind::Lz4 => encode_extent(head.lcn, extent, topology.placement)?,
-            HeadKind::Plain => encode_plain_extent(head.lcn, extent)?,
+        let (block, encoded_len) = if topology
+            .inline_tail
+            .is_some_and(|inline| inline.head_lcn == head.lcn)
+        {
+            let inline = topology.inline_tail.ok_or(CoreError::InvalidFilesystem(
+                "inline tail topology disappeared during encoding",
+            ))?;
+            if head.kind != HeadKind::Lz4 {
+                return Err(CoreError::UnsupportedInode(
+                    "inline pcluster support requires an LZ4 HEAD1 tail",
+                ));
+            }
+            encode_inline_extent(head.lcn, extent, inline.capacity)?
+        } else {
+            match head.kind {
+                HeadKind::Lz4 => encode_extent(head.lcn, extent, topology.placement)?,
+                HeadKind::Plain => encode_plain_extent(head.lcn, extent)?,
+            }
         };
         encoded_blocks.push(block);
         encoded_bytes.push(encoded_len);
@@ -297,6 +335,7 @@ pub(crate) fn compile_lz4(
         &generated_heads,
         encoded_blocks,
         encoded_bytes,
+        origin.sb.feature_compat,
     )
 }
 
@@ -450,6 +489,32 @@ fn encode_big_extent(
     Ok((span, compressed.len()))
 }
 
+fn encode_inline_extent(
+    head_lcn: usize,
+    extent: &[u8],
+    capacity: usize,
+) -> Result<(Vec<u8>, usize), CoreError> {
+    let compressed = lz4::encode(extent).map_err(|_| CoreError::CompressionValidationFailed)?;
+    if compressed.len() > capacity {
+        return Err(CoreError::CompressionDoesNotFit {
+            head_lcn,
+            encoded: compressed.len(),
+            capacity,
+        });
+    }
+    if compressed.first().copied().unwrap_or(0) == 0 {
+        return Err(CoreError::CompressionValidationFailed);
+    }
+    if lz4::decode(&compressed, extent.len()).map_err(|_| CoreError::CompressionValidationFailed)?
+        != extent
+    {
+        return Err(CoreError::CompressionValidationFailed);
+    }
+    let mut span = vec![0_u8; capacity];
+    span[..compressed.len()].copy_from_slice(&compressed);
+    Ok((span, compressed.len()))
+}
+
 fn encode_plain_extent(head_lcn: usize, extent: &[u8]) -> Result<(Vec<u8>, usize), CoreError> {
     if extent.is_empty() || extent.len() > BLOCK_BYTES {
         return Err(CoreError::UnsupportedInode(
@@ -511,6 +576,7 @@ fn compile_blocks(
     replacement_heads: &[Head],
     encoded_blocks: Vec<Vec<u8>>,
     encoded_bytes: Vec<usize>,
+    feature_compat: u32,
 ) -> Result<CompiledCore, CoreError> {
     if replacement_heads.len() != topology.heads.len()
         || encoded_blocks.len() != topology.heads.len()
@@ -526,29 +592,43 @@ fn compile_blocks(
     let mut replacement_pclusters = Vec::with_capacity(topology.heads.len());
     let mut head_lclusters = Vec::with_capacity(topology.heads.len());
 
-    for ((origin_head, replacement_head), encoded) in topology
+    for (index, ((origin_head, replacement_head), encoded)) in topology
         .heads
         .iter()
         .zip(replacement_heads)
         .zip(encoded_blocks)
+        .enumerate()
     {
-        if encoded.len() != BLOCK_BYTES {
-            return Err(CoreError::InvalidFilesystem(
-                "encoded extent does not occupy exactly one physical block",
-            ));
+        if let Some(inline) = topology
+            .inline_tail
+            .filter(|inline| inline.head_lcn == origin_head.lcn)
+        {
+            let encoded_len = *encoded_bytes
+                .get(index)
+                .ok_or(CoreError::UnexpectedEndOfStructure)?;
+            materialize_inline_tail(&mut view, inline, &encoded, encoded_len)?;
+        } else {
+            if encoded.len() != BLOCK_BYTES {
+                return Err(CoreError::InvalidFilesystem(
+                    "encoded extent does not occupy exactly one physical block",
+                ));
+            }
+            view.block_mut(origin_head.pcluster)
+                .map_err(CoreError::View)?
+                .copy_from_slice(&encoded);
         }
-        view.block_mut(origin_head.pcluster)
-            .map_err(CoreError::View)?
-            .copy_from_slice(&encoded);
         origin_pclusters.push(origin_head.pcluster);
         replacement_pclusters.push(replacement_head.pcluster);
         head_lclusters.push(origin_head.lcn);
     }
 
+    if topology.inline_tail.is_some() && feature_compat & FEATURE_SB_CHKSUM != 0 {
+        refresh_erofs_superblock_checksum(&mut view)?;
+    }
     let compiled = view.finalize().map_err(CoreError::View)?;
-    if compiled.shadow_blocks != topology.heads.len() {
+    if compiled.shadow_blocks > topology.heads.len() {
         return Err(CoreError::InvalidFilesystem(
-            "compact shadow block count does not match recovered HEAD count",
+            "compact shadow block count exceeds recovered extent footprint",
         ));
     }
 
@@ -565,6 +645,95 @@ fn compile_blocks(
         compact_2b_entries: topology.compact_2b_entries,
         shadow_blocks: compiled.shadow_blocks,
     })
+}
+
+fn materialize_inline_tail(
+    view: &mut EffectiveBlockStore,
+    inline: InlineTail,
+    encoded: &[u8],
+    encoded_len: usize,
+) -> Result<(), CoreError> {
+    if encoded.len() != inline.capacity || encoded_len == 0 || encoded_len > inline.capacity {
+        return Err(CoreError::InvalidFilesystem(
+            "inline pcluster encoded bytes disagree with fixed metadata capacity",
+        ));
+    }
+    let encoded_len_u16 = u16::try_from(encoded_len).map_err(|_| CoreError::ArithmeticOverflow)?;
+    let metadata_block = inline.data_offset / u64::from(BLOCK_SIZE);
+    let header_block = inline.header_offset / u64::from(BLOCK_SIZE);
+    if header_block != metadata_block {
+        return Err(CoreError::InvalidFilesystem(
+            "inline pcluster header and payload moved into different metadata blocks",
+        ));
+    }
+    let block_offset = usize::try_from(inline.data_offset % u64::from(BLOCK_SIZE))
+        .map_err(|_| CoreError::ArithmeticOverflow)?;
+    let end = block_offset
+        .checked_add(inline.capacity)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    let size_offset = usize::try_from(
+        inline
+            .header_offset
+            .checked_add(2)
+            .ok_or(CoreError::ArithmeticOverflow)?
+            % u64::from(BLOCK_SIZE),
+    )
+    .map_err(|_| CoreError::ArithmeticOverflow)?;
+    let size_end = size_offset
+        .checked_add(2)
+        .ok_or(CoreError::ArithmeticOverflow)?;
+    let block = view.block_mut(metadata_block).map_err(CoreError::View)?;
+    block
+        .get_mut(block_offset..end)
+        .ok_or(CoreError::UnexpectedEndOfStructure)?
+        .copy_from_slice(encoded);
+    block
+        .get_mut(size_offset..size_end)
+        .ok_or(CoreError::UnexpectedEndOfStructure)?
+        .copy_from_slice(&encoded_len_u16.to_le_bytes());
+    Ok(())
+}
+
+fn refresh_erofs_superblock_checksum(view: &mut EffectiveBlockStore) -> Result<(), CoreError> {
+    const SUPER_CHECKSUM_OFFSET: usize = 1028;
+    const SUPER_CHECKSUM_END: usize = SUPER_CHECKSUM_OFFSET + 4;
+    const CRC32C_POLY: u32 = 0x82f6_3b78;
+
+    let superblock_offset =
+        usize::try_from(SUPERBLOCK_OFFSET).map_err(|_| CoreError::ArithmeticOverflow)?;
+    let block = view.block_mut(0).map_err(CoreError::View)?;
+    if block.len() != BLOCK_BYTES || superblock_offset >= block.len() {
+        return Err(CoreError::InvalidFilesystem(
+            "EROFS checksum refresh requires a complete 4 KiB block zero",
+        ));
+    }
+    block
+        .get_mut(SUPER_CHECKSUM_OFFSET..SUPER_CHECKSUM_END)
+        .ok_or(CoreError::UnexpectedEndOfStructure)?
+        .fill(0);
+    let crc = crc32c_raw(
+        u32::MAX,
+        block
+            .get(superblock_offset..)
+            .ok_or(CoreError::UnexpectedEndOfStructure)?,
+        CRC32C_POLY,
+    );
+    block
+        .get_mut(SUPER_CHECKSUM_OFFSET..SUPER_CHECKSUM_END)
+        .ok_or(CoreError::UnexpectedEndOfStructure)?
+        .copy_from_slice(&crc.to_le_bytes());
+    Ok(())
+}
+
+fn crc32c_raw(mut crc: u32, bytes: &[u8], polynomial: u32) -> u32 {
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (polynomial & mask);
+        }
+    }
+    crc
 }
 
 fn compile_big_spans(
@@ -691,6 +860,11 @@ fn validate_compatible_topology(
     if origin.eof_plain_clusterofs != replacement.eof_plain_clusterofs {
         return Err(CoreError::IncompatibleReplacement(
             "partial-EOF PLAIN sentinel offsets differ",
+        ));
+    }
+    if origin.inline_tail != replacement.inline_tail {
+        return Err(CoreError::IncompatibleReplacement(
+            "inline pcluster metadata footprint differs",
         ));
     }
     if origin.heads.len() != replacement.heads.len() {
@@ -870,9 +1044,9 @@ impl Image {
     fn read_topology(&mut self, nid: u64) -> Result<Topology, CoreError> {
         let inode = self.read_inode(nid)?;
         if inode.layout == DATA_COMPRESSED_FULL {
-            if self.sb.incompat != 0 {
+            if self.sb.incompat != 0 && self.sb.incompat != FEATURE_ZTAILPACKING {
                 return Err(CoreError::UnsupportedFilesystem(
-                    "Stage 29 legacy full-index requires non-0padding LZ4 placement",
+                    "legacy full-index ordinary mode requires no incompat feature; inline mode requires only ZTAILPACKING",
                 ));
             }
             return self.read_full_topology_from_inode(inode);
@@ -930,6 +1104,7 @@ impl Image {
             logical_lclusters,
             compact_2b_entries: map.regions.compact_2b,
             eof_plain_clusterofs,
+            inline_tail: None,
             heads,
         })
     }
@@ -960,14 +1135,25 @@ impl Image {
         }
 
         let map = self.read_full_map_header(&inode)?;
-        if map.advise != 0 {
+        let inline_mode = map.advise == ADVISE_INLINE_PCLUSTER;
+        if map.advise != 0 && !inline_mode {
             return Err(CoreError::UnsupportedInode(
-                "Stage 29 full-index core requires zero map advice",
+                "full-index core accepts only ordinary or verified INLINE_PCLUSTER map advice",
+            ));
+        }
+        if inline_mode != (self.sb.incompat == FEATURE_ZTAILPACKING) {
+            return Err(CoreError::UnsupportedFilesystem(
+                "full-index inline map advice and ZTAILPACKING superblock feature disagree",
+            ));
+        }
+        if !inline_mode && map.idata_size != 0 {
+            return Err(CoreError::InvalidFilesystem(
+                "ordinary full-index map header unexpectedly reports inline data size",
             ));
         }
         if map.algorithm != LZ4_ALGORITHM || map.secondary_algorithm != 0 || map.cluster_bits != 0 {
             return Err(CoreError::UnsupportedInode(
-                "Stage 29 full-index core requires HEAD1 LZ4 with 4 KiB logical clusters",
+                "full-index core requires HEAD1 LZ4 with 4 KiB logical clusters",
             ));
         }
 
@@ -980,15 +1166,17 @@ impl Image {
                 "first full-index compressed extent does not begin at lcluster zero",
             ));
         }
-        if heads.len() != compressed_blocks {
-            return Err(CoreError::InvalidFilesystem(
-                "full-index encoded physical-block count does not match recovered data HEAD count",
-            ));
-        }
+
+        let inline_tail = self.recover_full_inline_tail(
+            &map,
+            &heads,
+            compressed_blocks,
+            logical_lclusters,
+            inline_mode,
+        )?;
 
         validate_full_plain_data_heads(&heads, logical_lclusters, eof_plain_clusterofs)?;
         validate_full_nonheads(&entries, &heads, logical_lclusters, eof_plain_clusterofs)?;
-        validate_head_blocks(&heads, self.bytes)?;
 
         Ok(Topology {
             nid: inode.nid,
@@ -999,8 +1187,83 @@ impl Image {
             logical_lclusters,
             compact_2b_entries: 0,
             eof_plain_clusterofs,
+            inline_tail,
             heads,
         })
+    }
+
+    fn recover_full_inline_tail(
+        &self,
+        map: &FullMapHeader,
+        heads: &[Head],
+        compressed_blocks: usize,
+        logical_lclusters: usize,
+        inline_mode: bool,
+    ) -> Result<Option<InlineTail>, CoreError> {
+        if !inline_mode {
+            if heads.len() != compressed_blocks {
+                return Err(CoreError::InvalidFilesystem(
+                    "full-index encoded physical-block count does not match recovered data HEAD count",
+                ));
+            }
+            validate_head_blocks(heads, self.bytes)?;
+            return Ok(None);
+        }
+        if map.idata_size == 0 {
+            return Err(CoreError::InvalidFilesystem(
+                "inline pcluster map header reports zero encoded tail size",
+            ));
+        }
+        let tail = *heads.last().ok_or(CoreError::InvalidFilesystem(
+            "inline pcluster topology contains no tail HEAD",
+        ))?;
+        if tail.kind != HeadKind::Lz4 {
+            return Err(CoreError::UnsupportedInode(
+                "inline pcluster support requires a final LZ4 HEAD1",
+            ));
+        }
+        if heads.len() != compressed_blocks.saturating_add(1) {
+            return Err(CoreError::InvalidFilesystem(
+                "inline full-index inode data_word does not match non-inline HEAD count",
+            ));
+        }
+        let index_bytes = u64::try_from(
+            logical_lclusters
+                .checked_mul(8)
+                .ok_or(CoreError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| CoreError::ArithmeticOverflow)?;
+        let data_offset = map
+            .ebase
+            .checked_add(index_bytes)
+            .ok_or(CoreError::ArithmeticOverflow)?;
+        let capacity = usize::from(map.idata_size);
+        ensure_range(
+            self.bytes,
+            data_offset,
+            u64::try_from(capacity).map_err(|_| CoreError::ArithmeticOverflow)?,
+        )?;
+        let payload_block = data_offset / u64::from(BLOCK_SIZE);
+        let header_block = map.header_offset / u64::from(BLOCK_SIZE);
+        let block_offset = usize::try_from(data_offset % u64::from(BLOCK_SIZE))
+            .map_err(|_| CoreError::ArithmeticOverflow)?;
+        if payload_block != header_block
+            || block_offset
+                .checked_add(capacity)
+                .ok_or(CoreError::ArithmeticOverflow)?
+                > BLOCK_BYTES
+        {
+            return Err(CoreError::UnsupportedInode(
+                "Stage 38 inline pcluster requires header and encoded tail inside one metadata block",
+            ));
+        }
+        validate_head_blocks(&heads[..heads.len() - 1], self.bytes)?;
+        Ok(Some(InlineTail {
+            head_lcn: tail.lcn,
+            header_offset: map.header_offset,
+            data_offset,
+            capacity,
+        }))
     }
 
     fn read_full_map_header(&mut self, inode: &Inode) -> Result<FullMapHeader, CoreError> {
@@ -1031,7 +1294,9 @@ impl Image {
             .checked_add(16)
             .ok_or(CoreError::ArithmeticOverflow)?;
         Ok(FullMapHeader {
+            header_offset,
             ebase,
+            idata_size: read_u16(&header, 2)?,
             advise: read_u16(&header, 4)?,
             algorithm: header[6] & 0x0f,
             secondary_algorithm: header[6] >> 4,
@@ -2194,6 +2459,7 @@ fn read_superblock(file: &mut File, bytes: u64) -> Result<Superblock, CoreError>
     Ok(Superblock {
         root_nid: u64::from(read_u16(&raw, 0x0e)?),
         meta_block: u64::from(read_u32(&raw, 0x28)?),
+        feature_compat: read_u32(&raw, 0x08)?,
         incompat,
     })
 }
@@ -2438,6 +2704,7 @@ mod tests {
             logical_lclusters: 2,
             compact_2b_entries: 0,
             eof_plain_clusterofs: None,
+            inline_tail: None,
             heads: vec![Head {
                 lcn: 0,
                 pcluster: 10,
@@ -2675,6 +2942,11 @@ mod tests {
         assert_eq!(extents[1].physical_blocks, 1);
         assert_eq!(extents[2].kind, HeadKind::Lz4);
         assert_eq!(extents[2].physical_blocks, 1);
+    }
+
+    #[test]
+    fn erofs_crc32c_uses_raw_seeded_castagnoli_state() {
+        assert_eq!(crc32c_raw(u32::MAX, b"123456789", 0x82f6_3b78), 0x1cf9_6d7c);
     }
 
     #[test]

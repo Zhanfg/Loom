@@ -52,5 +52,6 @@ bash tests/integration/stage34_erofs_legacy_full_big_partial_tail.sh
 bash tests/integration/stage35_erofs_legacy_full_big_plain_data.sh
 bash tests/integration/stage36_erofs_legacy_full_big_plain_partial_tail.sh
 bash tests/integration/stage37_erofs_legacy_full_big_multiblock_plain_partial.sh
+bash tests/integration/stage38_erofs_legacy_full_inline_pcluster.sh
 
 printf '%s\n' 'Loom Linux filesystem hard gate PASS'
