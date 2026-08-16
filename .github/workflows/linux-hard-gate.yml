@@ -21,6 +21,19 @@ jobs:
       - name: Apply and verify inline-pcluster support
         run: |
           set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('tests/integration/apply_stage38_inline_pcluster.py')
+          s = p.read_text()
+          old = "pattern = re.compile(r'(?<!struct )Topology \\{(?:(?!Topology \\{).)*?\\n(?P<indent>\\s*)\\}', re.S)"
+          new = "pattern = re.compile(r'(?<![A-Za-z0-9_])Topology \\{(?:(?!Topology \\{).)*?\\n(?P<indent>\\s*)\\}', re.S)"
+          assert old in s
+          s = s.replace(old, new, 1)
+          old = "    if 'inline_tail:' in block:\n        return block"
+          new = "    if re.search(r'\\n\\s*inline_tail(?:\\s*:|,)', block):\n        return block"
+          assert old in s
+          p.write_text(s.replace(old, new, 1))
+          PY
           python3 tests/integration/apply_stage38_inline_pcluster.py
           cargo fmt --all
           cargo fmt --all -- --check
