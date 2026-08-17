@@ -2,52 +2,83 @@
 
 MODDIR=${0%/*}
 STATE=/data/adb/loom
+COMPOSE_CONF="$STATE/compose.conf"
 SHADOW_CONF="$STATE/shadow.conf"
 
-printf '%s\n' 'Loom shadow sidecar Alpha 2 status'
-printf '%s\n' '-----------------------------------'
+printf '%s\n' 'Loom Android Alpha 3 status'
+printf '%s\n' '---------------------------'
 
-shadow_enabled=0
-if [ -f "$SHADOW_CONF" ] && grep -Fxq 'LOOM_SHADOW_ENABLED=1' "$SHADOW_CONF"; then
-  shadow_enabled=1
+compose_enabled=0
+if [ -f "$COMPOSE_CONF" ] && grep -Fxq 'LOOM_COMPOSE_ENABLED=1' "$COMPOSE_CONF"; then
+  compose_enabled=1
 fi
-printf 'selected_mode=%s\n' "$( [ "$shadow_enabled" = 1 ] && printf 'sparse-shadow' || printf 'identity' )"
 
-if [ "$shadow_enabled" = 1 ] && [ -x "$MODDIR/bin/loom-shadow" ]; then
-  "$MODDIR/bin/loom-shadow" status 2>/dev/null || true
-elif [ -x "$MODDIR/bin/loom-sidecar" ]; then
-  "$MODDIR/bin/loom-sidecar" status 2>/dev/null || true
-elif [ -f "$STATE/status" ]; then
-  printf 'status='
-  cat "$STATE/status"
+if [ "$compose_enabled" = 1 ]; then
+  printf '%s\n' 'selected_mode=block-generation-compose'
+  if [ -x "$MODDIR/bin/loom-compose" ]; then
+    "$MODDIR/bin/loom-compose" status 2>/dev/null || true
+  else
+    printf '%s\n' 'status=COMPOSE_RUNTIME_MISSING'
+  fi
 else
-  printf '%s\n' 'status=not-initialized'
+  shadow_enabled=0
+  if [ -f "$SHADOW_CONF" ] && grep -Fxq 'LOOM_SHADOW_ENABLED=1' "$SHADOW_CONF"; then
+    shadow_enabled=1
+  fi
+  printf 'selected_mode=%s\n' "$( [ "$shadow_enabled" = 1 ] && printf 'sparse-shadow-single-source' || printf 'identity' )"
+  if [ "$shadow_enabled" = 1 ] && [ -x "$MODDIR/bin/loom-shadow" ]; then
+    "$MODDIR/bin/loom-shadow" status 2>/dev/null || true
+  elif [ -x "$MODDIR/bin/loom-sidecar" ]; then
+    "$MODDIR/bin/loom-sidecar" status 2>/dev/null || true
+  fi
 fi
 
-if [ -f "$SHADOW_CONF" ]; then
-  printf '\n== shadow.conf ==\n'
-  grep -E '^(LOOM_SHADOW_ENABLED|LOOM_SOURCE_MODULE_ID|LOOM_PAYLOAD_ROOT|LOOM_MAX_LAYERS|LOOM_TAKEOVER)=' "$SHADOW_CONF" 2>/dev/null || true
+if [ -f "$COMPOSE_CONF" ]; then
+  printf '\n== compose.conf ==\n'
+  grep -E '^(LOOM_COMPOSE_ENABLED|LOOM_COMPOSE_MODULE_ROOT|LOOM_COMPOSE_ORDER|LOOM_COMPOSE_MAX_FILES|LOOM_TARGET|LOOM_ORIGIN|LOOM_MOUNTPOINT|LOOM_TAKEOVER)=' "$COMPOSE_CONF" 2>/dev/null || true
 fi
 
-printf '\n== available module payload sources ==\n'
+if [ -f "$STATE/current-generation" ]; then
+  generation=$(cat "$STATE/current-generation" 2>/dev/null || true)
+  if [ -n "$generation" ] && [ -f "$STATE/generations/$generation/state.env" ]; then
+    printf '\n== current generation ==\n'
+    cat "$STATE/generations/$generation/state.env"
+  fi
+fi
+
+if [ -f "$STATE/recovery-hold" ]; then
+  printf '\n%s\n' 'RECOVERY HOLD ACTIVE'
+  printf 'held_generation=%s\n' "$(cat "$STATE/recovery-hold" 2>/dev/null || printf unknown)"
+  printf '%s\n' 'Loom will not automatically reactivate a generation after an interrupted boot.'
+  printf '%s\n' 'After diagnosing the cause, clear it explicitly with:'
+  printf '  su -c %s/bin/loom-compose resume\n' "$MODDIR"
+fi
+
+printf '\n== available ordinary module payload sources ==\n'
 found=0
 if [ -d /data/adb/modules ]; then
   for module in /data/adb/modules/*; do
     [ -d "$module/system" ] || continue
+    [ -f "$module/disable" ] && continue
+    [ -f "$module/remove" ] && continue
+    [ -f "$module/skip_mount" ] && continue
     id=${module##*/}
     [ "$id" = loom ] && continue
+    if [ -f "$module/module.prop" ] && grep -Eq '^metamodule=(1|true)$' "$module/module.prop" 2>/dev/null; then
+      continue
+    fi
     printf '%s\n' "$id"
     found=1
   done
 fi
-[ "$found" = 1 ] || printf '%s\n' '(none with a system/ tree)'
+[ "$found" = 1 ] || printf '%s\n' '(none)'
 
-for log in post-fs-data.log service.log sidecar.log shadow.log; do
+for log in post-fs-data.log service.log boot-completed.log compose.log compose-shadow.log shadow.log sidecar.log; do
   if [ -f "$STATE/$log" ]; then
     printf '\n== %s ==\n' "$log"
     tail -n 80 "$STATE/$log"
   fi
 done
 
-printf '\n%s\n' 'Safety: Alpha 2 never mounts over /system, /vendor, /product, or another module mount.'
-printf '%s\n' 'To import an existing module, set LOOM_SOURCE_MODULE_ID=<id> and LOOM_SHADOW_ENABLED=1 in /data/adb/loom/shadow.conf, then reboot.'
+printf '\n%s\n' 'Safety boundary: this build composes a real block-level effective view but does not replace the Android first-stage /system mount.'
+printf '%s\n' 'OverlayFS/Magic Mount are not used by the LoomFS composition path.'
