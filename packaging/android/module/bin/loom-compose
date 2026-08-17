@@ -1,0 +1,421 @@
+#!/system/bin/sh
+
+umask 077
+
+SELF_DIR=${0%/*}
+MODDIR=${LOOM_MODDIR:-${SELF_DIR%/*}}
+STATE=${LOOM_STATE_DIR:-/data/adb/loom}
+CONF=${LOOM_COMPOSE_CONFIG:-$STATE/compose.conf}
+DEFAULT_CONF="$MODDIR/compose.conf"
+WORK="$STATE/compose"
+STAGE="$STATE/payload/system/.compose-current"
+LOG=${LOOM_COMPOSE_LOG:-$STATE/compose.log}
+PENDING="$STATE/pending-generation"
+CURRENT="$STATE/current-generation"
+RECOVERY="$STATE/recovery-hold"
+
+mkdir -p "$STATE" "$STATE/payload/system" "$STATE/generations" "$WORK"
+chmod 0700 "$STATE" "$STATE/payload" "$STATE/payload/system" "$STATE/generations" "$WORK" 2>/dev/null || true
+
+log() {
+  printf '[loom-compose] %s\n' "$*" >>"$LOG"
+}
+
+set_status() {
+  printf '%s\n' "$1" >"$STATE/status"
+  log "status=$1"
+}
+
+fail() {
+  set_status "$1"
+  log "$2"
+  return 1
+}
+
+read_config_value() {
+  key=$1
+  file=$2
+  [ -f "$file" ] || return 1
+  sed -n "s/^${key}=//p" "$file" | tail -n 1
+}
+
+load_config() {
+  LOOM_COMPOSE_ENABLED=1
+  LOOM_COMPOSE_MODULE_ROOT=/data/adb/modules
+  LOOM_COMPOSE_ORDER=lexical-last-wins
+  LOOM_COMPOSE_MAX_FILES=128
+  LOOM_TARGET=system
+  LOOM_ORIGIN=auto
+  LOOM_MOUNTPOINT="$STATE/mnt/system-generation"
+  LOOM_TAKEOVER=0
+
+  if [ ! -f "$CONF" ] && [ -f "$DEFAULT_CONF" ]; then
+    cp "$DEFAULT_CONF" "$CONF" 2>/dev/null || true
+    chmod 0600 "$CONF" 2>/dev/null || true
+  fi
+
+  for key in LOOM_COMPOSE_ENABLED LOOM_COMPOSE_MODULE_ROOT LOOM_COMPOSE_ORDER LOOM_COMPOSE_MAX_FILES LOOM_TARGET LOOM_ORIGIN LOOM_MOUNTPOINT LOOM_TAKEOVER; do
+    value=$(read_config_value "$key" "$CONF" 2>/dev/null || true)
+    [ -n "$value" ] || continue
+    case "$key" in
+      LOOM_COMPOSE_ENABLED) LOOM_COMPOSE_ENABLED=$value ;;
+      LOOM_COMPOSE_MODULE_ROOT) LOOM_COMPOSE_MODULE_ROOT=$value ;;
+      LOOM_COMPOSE_ORDER) LOOM_COMPOSE_ORDER=$value ;;
+      LOOM_COMPOSE_MAX_FILES) LOOM_COMPOSE_MAX_FILES=$value ;;
+      LOOM_TARGET) LOOM_TARGET=$value ;;
+      LOOM_ORIGIN) LOOM_ORIGIN=$value ;;
+      LOOM_MOUNTPOINT) LOOM_MOUNTPOINT=$value ;;
+      LOOM_TAKEOVER) LOOM_TAKEOVER=$value ;;
+    esac
+  done
+
+  case "$LOOM_COMPOSE_ENABLED" in 0|1) ;; *) return 1 ;; esac
+  case "$LOOM_COMPOSE_ORDER" in lexical-last-wins) ;; *) return 1 ;; esac
+  case "$LOOM_COMPOSE_MAX_FILES" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$LOOM_COMPOSE_MAX_FILES" -ge 1 ] && [ "$LOOM_COMPOSE_MAX_FILES" -le 128 ] || return 1
+  case "$LOOM_TARGET" in *[!A-Za-z0-9_.-]*|'') return 1 ;; esac
+  case "$LOOM_MOUNTPOINT" in "$STATE"/mnt/*) ;; *) return 1 ;; esac
+  # Alpha 3 flashable-generation is still validation-only. A non-zero value is
+  # rejected instead of silently falling back to a VFS overmount.
+  [ "$LOOM_TAKEOVER" = 0 ] || return 1
+  [ -d "$LOOM_COMPOSE_MODULE_ROOT" ] || return 1
+  return 0
+}
+
+find_cmd() {
+  env_name=$1
+  fallback=$2
+  eval "override=\${$env_name:-}"
+  if [ -n "$override" ]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+  command -v "$fallback" 2>/dev/null || true
+}
+
+resolve_tools() {
+  FIND_BIN=$(find_cmd LOOM_FIND_BIN find)
+  SORT_BIN=$(find_cmd LOOM_SORT_BIN sort)
+  WC_BIN=$(find_cmd LOOM_WC_BIN wc)
+  LN_BIN=$(find_cmd LOOM_LN_BIN ln)
+  CP_BIN=$(find_cmd LOOM_CP_BIN cp)
+  MV_BIN=$(find_cmd LOOM_MV_BIN mv)
+  RM_BIN=$(find_cmd LOOM_RM_BIN rm)
+  SHA256_BIN=$(find_cmd LOOM_SHA256_BIN sha256sum)
+  DATE_BIN=$(find_cmd LOOM_DATE_BIN date)
+
+  [ -n "$FIND_BIN" ] || return 1
+  [ -n "$SORT_BIN" ] || return 1
+  [ -n "$WC_BIN" ] || return 1
+  [ -n "$LN_BIN" ] || return 1
+  [ -n "$CP_BIN" ] || return 1
+  [ -n "$MV_BIN" ] || return 1
+  [ -n "$RM_BIN" ] || return 1
+  [ -x "$MODDIR/bin/loom-shadow" ] || return 1
+  [ -x "$MODDIR/bin/loom" ] || return 1
+  return 0
+}
+
+module_is_active_payload_source() {
+  module=$1
+  id=${module##*/}
+
+  [ "$id" != loom ] || return 1
+  [ -f "$module/module.prop" ] || return 1
+  [ ! -f "$module/disable" ] || return 1
+  [ ! -f "$module/remove" ] || return 1
+  [ ! -f "$module/skip_mount" ] || return 1
+  [ -d "$module/system" ] || return 1
+
+  # Loom is not allowed to consume another metamodule as an ordinary payload.
+  if grep -Eq '^metamodule=(1|true)$' "$module/module.prop" 2>/dev/null; then
+    return 1
+  fi
+  return 0
+}
+
+discover_modules() {
+  raw="$WORK/modules.raw"
+  sorted="$WORK/modules.list"
+  : >"$raw"
+  for module in "$LOOM_COMPOSE_MODULE_ROOT"/*; do
+    [ -d "$module" ] || continue
+    module_is_active_payload_source "$module" || continue
+    printf '%s\n' "$module" >>"$raw"
+  done
+  "$SORT_BIN" "$raw" >"$sorted"
+  MODULE_COUNT=$($WC_BIN -l <"$sorted" | tr -d ' ')
+  case "$MODULE_COUNT" in ''|*[!0-9]*) return 1 ;; esac
+  return 0
+}
+
+reject_unsupported_tree() {
+  root=$1
+  module_id=$2
+
+  if "$FIND_BIN" "$root" -type l -print | grep -q .; then
+    fail COMPOSE_UNSUPPORTED_TREE "module=$module_id contains symlinks in system/; Alpha 3 block generation accepts regular files/directories only" || true
+    return 1
+  fi
+
+  # Character-device whiteouts, sockets, fifos and block devices require
+  # filesystem metadata mutation that the current EROFS compiler does not yet
+  # implement. Refuse the entire generation rather than silently dropping them.
+  if "$FIND_BIN" "$root" ! -type d ! -type f -print | grep -q .; then
+    fail COMPOSE_UNSUPPORTED_TREE "module=$module_id contains non-regular filesystem objects unsupported by the current block compiler" || true
+    return 1
+  fi
+  return 0
+}
+
+stage_one_file() {
+  source=$1
+  root=$2
+  module_id=$3
+  next_stage=$4
+
+  case "$source" in "$root"/*) ;; *) return 1 ;; esac
+  rel=${source#"$root"/}
+  case "$rel" in ''|/*|../*|*/../*|*/..) return 1 ;; esac
+
+  tab=$(printf '\t')
+  case "$rel$source" in *"$tab"*) return 1 ;; esac
+
+  dest="$next_stage/$rel"
+  parent=${dest%/*}
+  [ "$parent" != "$dest" ] && mkdir -p "$parent"
+  "$RM_BIN" -f "$dest"
+
+  # Hard-link when possible so composing modules does not duplicate payload
+  # bytes on /data. Fall back to a private copy when files cross filesystems.
+  if ! "$LN_BIN" "$source" "$dest" 2>/dev/null; then
+    "$CP_BIN" -f "$source" "$dest" || return 1
+  fi
+
+  printf '%s\t/%s\t%s\n' "$module_id" "$rel" "$source" >>"$WORK/candidates.tsv"
+  return 0
+}
+
+build_stage() {
+  discover_modules || return 1
+  next_stage="$STATE/payload/system/.compose-next-$$"
+  "$RM_BIN" -rf "$next_stage"
+  mkdir -p "$next_stage"
+  : >"$WORK/candidates.tsv"
+
+  while IFS= read -r module; do
+    [ -n "$module" ] || continue
+    module_id=${module##*/}
+    root="$module/system"
+    reject_unsupported_tree "$root" "$module_id" || {
+      "$RM_BIN" -rf "$next_stage"
+      return 1
+    }
+
+    files="$WORK/files.$module_id"
+    "$FIND_BIN" "$root" -type f -print | "$SORT_BIN" >"$files"
+    while IFS= read -r source; do
+      [ -n "$source" ] || continue
+      if ! stage_one_file "$source" "$root" "$module_id" "$next_stage"; then
+        "$RM_BIN" -rf "$next_stage"
+        fail COMPOSE_STAGE_FAILED "failed to stage module=$module_id payload=$source" || true
+        return 1
+      fi
+    done <"$files"
+    "$RM_BIN" -f "$files"
+  done <"$WORK/modules.list"
+
+  FILE_COUNT=$($FIND_BIN "$next_stage" -type f -print | $WC_BIN -l | tr -d ' ')
+  case "$FILE_COUNT" in ''|*[!0-9]*) "$RM_BIN" -rf "$next_stage"; return 1 ;; esac
+
+  if [ "$FILE_COUNT" -gt "$LOOM_COMPOSE_MAX_FILES" ]; then
+    "$RM_BIN" -rf "$next_stage"
+    fail COMPOSE_LAYER_LIMIT "composed payload has $FILE_COUNT files; Alpha 3 limit is $LOOM_COMPOSE_MAX_FILES" || true
+    return 1
+  fi
+
+  if [ "$FILE_COUNT" -eq 0 ]; then
+    "$RM_BIN" -rf "$next_stage"
+    return 2
+  fi
+
+  "$RM_BIN" -rf "$STAGE"
+  "$MV_BIN" "$next_stage" "$STAGE" || return 1
+  return 0
+}
+
+make_generation_id() {
+  if [ -n "$SHA256_BIN" ] && [ -s "$WORK/candidates.tsv" ]; then
+    digest=$($SHA256_BIN "$WORK/candidates.tsv" 2>/dev/null | sed 's/[[:space:]].*$//')
+    case "$digest" in
+      [0-9a-fA-F][0-9a-fA-F]*) printf 'g-%s\n' "$(printf '%s' "$digest" | cut -c1-16)"; return 0 ;;
+    esac
+  fi
+  now=0
+  if [ -n "$DATE_BIN" ]; then
+    now=$($DATE_BIN +%s 2>/dev/null || printf '0')
+  fi
+  printf 'g-%s-%s\n' "$now" "$$"
+}
+
+write_shadow_config() {
+  count=$1
+  cat >"$WORK/shadow.conf" <<EOF
+LOOM_SHADOW_ENABLED=1
+LOOM_SOURCE_MODULE_ID=
+LOOM_PAYLOAD_ROOT=$STAGE
+LOOM_TARGET=$LOOM_TARGET
+LOOM_ORIGIN=$LOOM_ORIGIN
+LOOM_DM_PREFIX=loom-shadow-compose-$LOOM_TARGET
+LOOM_MOUNTPOINT=$LOOM_MOUNTPOINT
+LOOM_MAX_LAYERS=$count
+LOOM_TAKEOVER=0
+EOF
+  chmod 0600 "$WORK/shadow.conf" 2>/dev/null || true
+}
+
+shadow_cleanup() {
+  [ -f "$WORK/shadow.conf" ] || return 0
+  LOOM_SHADOW_CONFIG="$WORK/shadow.conf" \
+  LOOM_SHADOW_LOG="$STATE/compose-shadow.log" \
+    "$MODDIR/bin/loom-shadow" cleanup >/dev/null 2>&1 || true
+}
+
+preflight() {
+  load_config || { fail COMPOSE_CONFIG_INVALID "invalid compose.conf or module root" || true; return 1; }
+  [ "$LOOM_COMPOSE_ENABLED" = 1 ] || { set_status COMPOSE_DISABLED; return 0; }
+  uid=${LOOM_TEST_UID:-$(id -u 2>/dev/null || printf '1')}
+  [ "$uid" = 0 ] || { fail COMPOSE_PREFLIGHT_FAILED "root privileges required" || true; return 1; }
+  resolve_tools || { fail COMPOSE_PREFLIGHT_FAILED "required composer/shadow tools are unavailable" || true; return 1; }
+  discover_modules || { fail COMPOSE_PREFLIGHT_FAILED "failed to enumerate ordinary modules" || true; return 1; }
+  set_status COMPOSE_PREFLIGHT_OK
+  log "preflight PASS modules=$MODULE_COUNT module_root=$LOOM_COMPOSE_MODULE_ROOT takeover=0"
+  return 0
+}
+
+activate() {
+  preflight || return 1
+  [ "$LOOM_COMPOSE_ENABLED" = 1 ] || return 0
+
+  # A pending generation surviving into a later boot means the previous boot did
+  # not reach boot-completed. Refuse automatic reactivation. This is already
+  # useful in sidecar mode and becomes the recovery invariant for future early
+  # first-stage takeover.
+  if [ -f "$PENDING" ]; then
+    previous=$(cat "$PENDING" 2>/dev/null || printf 'unknown')
+    printf '%s\n' "$previous" >"$RECOVERY"
+    shadow_cleanup
+    fail COMPOSE_RECOVERY_HOLD "previous generation $previous never committed; automatic activation held" || true
+    return 1
+  fi
+
+  build_stage
+  rc=$?
+  if [ "$rc" -eq 2 ]; then
+    shadow_cleanup
+    set_status COMPOSE_NO_PAYLOAD
+    log "no enabled ordinary module system/ payloads; nothing to compose"
+    return 0
+  fi
+  [ "$rc" -eq 0 ] || return 1
+
+  generation=$(make_generation_id)
+  gen_dir="$STATE/generations/$generation"
+  mkdir -p "$gen_dir"
+  cp "$WORK/modules.list" "$gen_dir/modules.list" 2>/dev/null || true
+  cp "$WORK/candidates.tsv" "$gen_dir/candidates.tsv" 2>/dev/null || true
+  cat >"$gen_dir/state.env" <<EOF
+LOOM_GENERATION=$generation
+LOOM_STATE=PREPARED
+LOOM_MODULE_COUNT=$MODULE_COUNT
+LOOM_FILE_COUNT=$FILE_COUNT
+LOOM_ORDER=$LOOM_COMPOSE_ORDER
+LOOM_TAKEOVER=0
+EOF
+
+  write_shadow_config "$FILE_COUNT"
+  printf '%s\n' "$generation" >"$PENDING"
+
+  shadow_cleanup
+  if ! LOOM_SHADOW_CONFIG="$WORK/shadow.conf" \
+      LOOM_SHADOW_LOG="$STATE/compose-shadow.log" \
+      "$MODDIR/bin/loom-shadow" activate; then
+    "$RM_BIN" -f "$PENDING"
+    printf '%s\n' 'LOOM_STATE=FAILED' >>"$gen_dir/state.env"
+    fail COMPOSE_ACTIVATION_FAILED "generation=$generation failed during block-view compilation/materialization" || true
+    return 1
+  fi
+
+  effective=$(sed -n 's/^LOOM_EFFECTIVE_DEVICE=//p' "$STATE/shadow-runtime/runtime.env" 2>/dev/null | tail -n 1)
+  cat >>"$gen_dir/state.env" <<EOF
+LOOM_STATE=ACTIVE_PENDING_BOOT
+LOOM_EFFECTIVE_DEVICE=$effective
+LOOM_MOUNTPOINT=$LOOM_MOUNTPOINT
+EOF
+  set_status COMPOSE_ACTIVE_PENDING_BOOT
+  log "activation PASS generation=$generation modules=$MODULE_COUNT files=$FILE_COUNT effective=${effective:-unknown} takeover=0"
+  return 0
+}
+
+commit_generation() {
+  load_config || return 1
+  [ "$LOOM_COMPOSE_ENABLED" = 1 ] || return 0
+  [ -f "$PENDING" ] || return 0
+  generation=$(cat "$PENDING" 2>/dev/null || true)
+  [ -n "$generation" ] || return 1
+  gen_dir="$STATE/generations/$generation"
+  [ -d "$gen_dir" ] || return 1
+
+  printf '%s\n' "$generation" >"$CURRENT"
+  "$RM_BIN" -f "$PENDING" "$RECOVERY"
+  cat >>"$gen_dir/state.env" <<EOF
+LOOM_STATE=COMMITTED
+EOF
+  set_status COMPOSE_COMMITTED
+  log "commit PASS generation=$generation"
+}
+
+resume_recovery() {
+  load_config || return 1
+  resolve_tools || return 1
+  "$RM_BIN" -f "$PENDING" "$RECOVERY"
+  set_status COMPOSE_RECOVERY_CLEARED
+  log "recovery hold cleared by explicit request"
+}
+
+cleanup_command() {
+  load_config || true
+  resolve_tools || return 1
+  shadow_cleanup
+  "$RM_BIN" -rf "$STAGE"
+  "$RM_BIN" -f "$PENDING"
+  set_status COMPOSE_INACTIVE
+  log "cleanup PASS"
+}
+
+status_command() {
+  load_config || true
+  printf 'status='
+  cat "$STATE/status" 2>/dev/null || printf 'UNKNOWN\n'
+  printf 'compose_enabled=%s\n' "${LOOM_COMPOSE_ENABLED:-unknown}"
+  printf 'takeover=%s\n' "${LOOM_TAKEOVER:-unknown}"
+  [ -f "$CURRENT" ] && printf 'current_generation=%s\n' "$(cat "$CURRENT")"
+  [ -f "$PENDING" ] && printf 'pending_generation=%s\n' "$(cat "$PENDING")"
+  [ -f "$RECOVERY" ] && printf 'recovery_hold=%s\n' "$(cat "$RECOVERY")"
+  [ -f "$WORK/modules.list" ] && {
+    printf 'modules_begin\n'
+    sed 's|.*/||' "$WORK/modules.list"
+    printf 'modules_end\n'
+  }
+  [ -f "$STATE/shadow-runtime/runtime.env" ] && cat "$STATE/shadow-runtime/runtime.env"
+}
+
+case "${1:-status}" in
+  preflight) preflight ;;
+  activate) activate ;;
+  commit) commit_generation ;;
+  resume) resume_recovery ;;
+  cleanup) cleanup_command ;;
+  status) status_command ;;
+  *) printf 'usage: %s {preflight|activate|commit|resume|cleanup|status}\n' "$0" >&2; exit 2 ;;
+esac
