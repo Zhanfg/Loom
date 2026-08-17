@@ -3,4 +3,4 @@ name=Loom
 version=@VERSION_NAME@
 versionCode=@VERSION_CODE@
 author=Loom Project
-description=Systemless effective-block-view runtime. Alpha 2 supports direct block-device sparse-shadow sidecar composition while keeping system takeover disabled by default. Source @SOURCE_SHA@.
+description=Systemless effective-block-view runtime. Alpha 3 composes enabled ordinary module system trees into a transactional LoomFS block generation with boot-completed commit and recovery hold. First-stage takeover remains disabled. Source @SOURCE_SHA@.
