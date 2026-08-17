@@ -1,0 +1,30 @@
+name: Alpha 6 early recovery proof
+
+on:
+  push:
+    branches:
+      - 'feat/alpha6-early-recovery-c'
+  pull_request:
+    paths:
+      - 'tools/loom-early-state.c'
+      - 'tests/integration/alpha6_early_recovery_protocol_c.sh'
+      - '.github/workflows/alpha6-recovery-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  recovery-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Strict C build
+        run: |
+          set -euo pipefail
+          gcc -std=c11 -O2 -Wall -Wextra -Werror \
+            tools/loom-early-state.c -o /tmp/loom-early-state
+
+      - name: Multi-boot recovery state proof
+        run: bash tests/integration/alpha6_early_recovery_protocol_c.sh
