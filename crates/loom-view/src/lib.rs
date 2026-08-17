@@ -38,8 +38,18 @@ impl EffectiveBlockStore {
     /// Returns [`ViewError`] when the origin geometry is unsuitable or I/O fails.
     pub fn open(origin_path: &Path, block_size: u32) -> Result<Self, ViewError> {
         validate_block_size(block_size)?;
-        let origin = File::open(origin_path).map_err(ViewError::Io)?;
-        let image_bytes = origin.metadata().map_err(ViewError::Io)?.len();
+        let mut origin = File::open(origin_path).map_err(ViewError::Io)?;
+        let metadata_bytes = origin.metadata().map_err(ViewError::Io)?.len();
+        let image_bytes = if metadata_bytes != 0 {
+            metadata_bytes
+        } else {
+            let current = origin.stream_position().map_err(ViewError::Io)?;
+            let end = origin.seek(SeekFrom::End(0)).map_err(ViewError::Io)?;
+            origin
+                .seek(SeekFrom::Start(current))
+                .map_err(ViewError::Io)?;
+            end
+        };
         if image_bytes == 0 || image_bytes % u64::from(block_size) != 0 {
             return Err(ViewError::OriginSizeNotBlockAligned {
                 bytes: image_bytes,
