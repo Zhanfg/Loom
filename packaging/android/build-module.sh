@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ $# -ne 9 ]]; then
-  echo "usage: $0 <loom-binary> <loom-flatten-binary> <loom-early-map-binary> <loom-fiemap-binary> <output-zip> <version-name> <version-code> <source-ref> <source-sha>" >&2
+if [[ $# -ne 10 ]]; then
+  echo "usage: $0 <loom-binary> <loom-flatten-binary> <loom-early-map-binary> <loom-early-state-binary> <loom-fiemap-binary> <output-zip> <version-name> <version-code> <source-ref> <source-sha>" >&2
   exit 2
 fi
 
 BINARY="$1"
 FLATTEN_BINARY="$2"
 EARLY_MAP_BINARY="$3"
-FIEMAP_BINARY="$4"
-OUTPUT="$5"
-VERSION_NAME="$6"
-VERSION_CODE="$7"
-SOURCE_REF="$8"
-SOURCE_SHA="$9"
+EARLY_STATE_BINARY="$4"
+FIEMAP_BINARY="$5"
+OUTPUT="$6"
+VERSION_NAME="$7"
+VERSION_CODE="$8"
+SOURCE_REF="$9"
+SOURCE_SHA="${10}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TEMPLATE="$ROOT/module"
@@ -23,6 +24,7 @@ for pair in \
   "loom:$BINARY" \
   "loom-flatten:$FLATTEN_BINARY" \
   "loom-early-map:$EARLY_MAP_BINARY" \
+  "loom-early-state:$EARLY_STATE_BINARY" \
   "loom-fiemap:$FIEMAP_BINARY"; do
   name=${pair%%:*}
   path=${pair#*:}
@@ -53,6 +55,7 @@ mv "$STAGE/bin/loom-shadow-commit" "$STAGE/bin/loom-shadow"
 install -m 0755 "$BINARY" "$STAGE/bin/loom"
 install -m 0755 "$FLATTEN_BINARY" "$STAGE/bin/loom-flatten"
 install -m 0755 "$EARLY_MAP_BINARY" "$STAGE/bin/loom-early-map"
+install -m 0755 "$EARLY_STATE_BINARY" "$STAGE/bin/loom-early-state"
 install -m 0755 "$FIEMAP_BINARY" "$STAGE/bin/loom-fiemap"
 touch "$STAGE/skip_mount"
 
@@ -70,7 +73,7 @@ source_sha=$SOURCE_SHA
 version=$VERSION_NAME
 versionCode=$VERSION_CODE
 architecture=arm64-v8a
-runtime_activation=alpha5-early-snapshot-prepare
+runtime_activation=alpha6-early-recovery-package
 composition_scope=enabled-ordinary-module-system-trees
 composition_order=lexical-last-wins
 filesystem_fabric=origin-plus-aggregate-sparse-shadow
@@ -83,6 +86,10 @@ early_snapshot_storage=metadata-ext4-raw-extents
 early_snapshot_default=disabled
 early_snapshot_state=prepared-not-active
 early_shadow_loop_required=false
+early_recovery_protocol=one-shot-last-good-force-stock
+early_auto_arm=false
+early_auto_confirm=false
+early_state_root=/metadata/loom/state
 generation_commit=boot-completed
 interrupted_boot_policy=recovery-hold
 mount_scope=/data/adb/loom/mnt
@@ -99,6 +106,7 @@ chmod 0755 \
   "$STAGE/bin/loom" \
   "$STAGE/bin/loom-flatten" \
   "$STAGE/bin/loom-early-map" \
+  "$STAGE/bin/loom-early-state" \
   "$STAGE/bin/loom-fiemap" \
   "$STAGE/bin/loom-sidecar" \
   "$STAGE/bin/loom-shadow" \
