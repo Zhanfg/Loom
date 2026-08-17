@@ -109,8 +109,9 @@ DM_FLAT_PATH="/dev/mapper/$DM_FLAT"
 # The single flattened device must be byte-identical to the original two-layer chain.
 sudo cmp "$DM2_PATH" "$DM_FLAT_PATH"
 
-# Spot-check the overlap semantics as an independent assertion.
-python3 - "$DM_FLAT_PATH" <<'PY'
+# Spot-check the overlap semantics as an independent assertion. Mapper nodes are
+# intentionally root-readable only on the hosted runner.
+sudo python3 - "$DM_FLAT_PATH" <<'PY'
 import pathlib
 import sys
 raw = pathlib.Path(sys.argv[1]).read_bytes()
