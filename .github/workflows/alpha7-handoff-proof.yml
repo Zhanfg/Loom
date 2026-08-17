@@ -1,0 +1,57 @@
+name: Alpha 7 first-stage handoff proof
+
+on:
+  push:
+    branches:
+      - 'feat/alpha7-*'
+  pull_request:
+    paths:
+      - 'tools/loom-early-state.c'
+      - 'tools/loom-early-table.c'
+      - 'tests/integration/alpha4_dm_flatten.sh'
+      - 'tests/integration/alpha5_metadata_raw_shadow.sh'
+      - 'tests/integration/alpha6_early_recovery_protocol_c.sh'
+      - 'tests/integration/alpha7_first_stage_handoff_proof.sh'
+      - '.github/workflows/alpha7-handoff-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  handoff-proof:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Source hygiene
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+          gcc -std=c11 -O2 -Wall -Wextra -Werror tools/loom-early-state.c -o /tmp/loom-early-state
+          gcc -std=c11 -O2 -Wall -Wextra -Werror tools/loom-early-table.c -o /tmp/loom-early-table
+
+      - name: Prepare privileged block runtime
+        run: |
+          sudo modprobe loop || true
+          sudo modprobe dm_mod || true
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs erofs-utils lz4
+
+      - name: Alpha 4 single-DM proof
+        run: bash tests/integration/alpha4_dm_flatten.sh
+
+      - name: Alpha 5 raw metadata proof
+        run: bash tests/integration/alpha5_metadata_raw_shadow.sh
+
+      - name: Alpha 6 one-shot recovery proof
+        run: bash tests/integration/alpha6_early_recovery_protocol_c.sh
+
+      - name: Alpha 7 attempted-before-DM handoff proof
+        run: bash tests/integration/alpha7_first_stage_handoff_proof.sh
