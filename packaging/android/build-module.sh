@@ -20,7 +20,7 @@ TEMPLATE="$ROOT/module"
 [[ -f "$BINARY" ]] || { echo "missing Loom binary: $BINARY" >&2; exit 1; }
 [[ -f "$FLATTEN_BINARY" ]] || { echo "missing loom-flatten binary: $FLATTEN_BINARY" >&2; exit 1; }
 [[ -f "$TEMPLATE/module.prop.in" ]] || { echo "missing Android module template" >&2; exit 1; }
-for runtime in loom-sidecar loom-shadow loom-shadow-flat loom-compose; do
+for runtime in loom-sidecar loom-shadow loom-shadow-commit loom-compose; do
   [[ -f "$TEMPLATE/bin/$runtime" ]] || { echo "missing Android runtime: $runtime" >&2; exit 1; }
 done
 for config in sidecar.conf shadow.conf compose.conf; do
@@ -39,9 +39,10 @@ rm -f "$STAGE/module.prop.in"
 
 # Preserve the already-validated Alpha 2/3 layered runtime as the compilation
 # executor. The packaged public `loom-shadow` entrypoint becomes the Alpha 4
-# flatten/commit wrapper.
+# collision-safe flatten/commit wrapper.
 mv "$STAGE/bin/loom-shadow" "$STAGE/bin/loom-shadow-layered"
-mv "$STAGE/bin/loom-shadow-flat" "$STAGE/bin/loom-shadow"
+mv "$STAGE/bin/loom-shadow-commit" "$STAGE/bin/loom-shadow"
+rm -f "$STAGE/bin/loom-shadow-flat"
 install -m 0755 "$BINARY" "$STAGE/bin/loom"
 install -m 0755 "$FLATTEN_BINARY" "$STAGE/bin/loom-flatten"
 touch "$STAGE/skip_mount"
