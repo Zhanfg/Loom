@@ -1,0 +1,49 @@
+diff --git a/crates/loom-erofs/src/compact_core.rs b/crates/loom-erofs/src/compact_core.rs
+--- a/crates/loom-erofs/src/compact_core.rs
++++ b/crates/loom-erofs/src/compact_core.rs
+@@ -1151,7 +1151,20 @@ fn validate_big_compatible_topology(
+ impl Image {
+     fn open(path: &Path) -> Result<Self, CoreError> {
+         let mut file = File::open(path).map_err(CoreError::Io)?;
+-        let bytes = file.metadata().map_err(CoreError::Io)?.len();
++        let metadata_bytes = file.metadata().map_err(CoreError::Io)?.len();
++        let bytes = if metadata_bytes != 0 {
++            metadata_bytes
++        } else {
++            let current = file.stream_position().map_err(CoreError::Io)?;
++            let end = file.seek(SeekFrom::End(0)).map_err(CoreError::Io)?;
++            file.seek(SeekFrom::Start(current)).map_err(CoreError::Io)?;
++            end
++        };
++        if bytes == 0 {
++            return Err(CoreError::InvalidFilesystem(
++                "origin image or block device reports zero bytes",
++            ));
++        }
+         let sb = read_superblock(&mut file, bytes)?;
+         Ok(Self { file, bytes, sb })
+     }
+diff --git a/crates/loom-view/src/lib.rs b/crates/loom-view/src/lib.rs
+--- a/crates/loom-view/src/lib.rs
++++ b/crates/loom-view/src/lib.rs
+@@ -38,8 +38,18 @@ impl EffectiveBlockStore {
+     /// Returns [`ViewError`] when the origin geometry is unsuitable or I/O fails.
+     pub fn open(origin_path: &Path, block_size: u32) -> Result<Self, ViewError> {
+         validate_block_size(block_size)?;
+-        let origin = File::open(origin_path).map_err(ViewError::Io)?;
+-        let image_bytes = origin.metadata().map_err(ViewError::Io)?.len();
++        let mut origin = File::open(origin_path).map_err(ViewError::Io)?;
++        let metadata_bytes = origin.metadata().map_err(ViewError::Io)?.len();
++        let image_bytes = if metadata_bytes != 0 {
++            metadata_bytes
++        } else {
++            let current = origin.stream_position().map_err(ViewError::Io)?;
++            let end = origin.seek(SeekFrom::End(0)).map_err(ViewError::Io)?;
++            origin
++                .seek(SeekFrom::Start(current))
++                .map_err(ViewError::Io)?;
++            end
++        };
+         if image_bytes == 0 || image_bytes % u64::from(block_size) != 0 {
+             return Err(ViewError::OriginSizeNotBlockAligned {
+                 bytes: image_bytes,

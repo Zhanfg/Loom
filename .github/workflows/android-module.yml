@@ -4,19 +4,19 @@ on:
   workflow_dispatch:
     inputs:
       source_ref:
-        description: 'Loom branch, tag, or commit SHA to package'
+        description: 'Filesystem compiler branch, tag, or commit SHA to package'
         required: true
         default: 'feat/android-block-origin-alpha2'
         type: string
       version_name:
         description: 'Module version name'
         required: true
-        default: '0.2.0-shadow-alpha2'
+        default: '0.3.0-generation-alpha3'
         type: string
       version_code:
         description: 'Numeric module version code'
         required: true
-        default: '10200'
+        default: '10300'
         type: string
       run_host_tests:
         description: 'Run host workspace tests before packaging'
@@ -30,6 +30,7 @@ on:
       - 'feat/android-sidecar-*'
       - 'feat/android-shadow-sidecar-*'
       - 'feat/unified-kernel-*'
+      - 'feat/alpha3-*'
   pull_request:
     paths:
       - '.github/workflows/android-module.yml'
@@ -41,9 +42,9 @@ permissions:
 
 jobs:
   package-arm64:
-    name: Build arm64 module ZIP
+    name: Build arm64 Alpha 3 module ZIP
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout packaging pipeline
@@ -57,6 +58,7 @@ jobs:
           set -euo pipefail
           bash pipeline/packaging/android/tests/sidecar_runtime_test.sh
           bash pipeline/packaging/android/tests/shadow_runtime_test.sh
+          bash pipeline/packaging/android/tests/compose_runtime_test.sh
 
       - name: Validate kernel runtime UAPI
         shell: bash
@@ -83,8 +85,8 @@ jobs:
             VERSION_CODE="$REQUESTED_CODE"
           else
             SOURCE_REF="$DEFAULT_SOURCE_REF"
-            VERSION_NAME="0.2.0-shadow-alpha2+run${GITHUB_RUN_NUMBER}"
-            VERSION_CODE="$((10200 + GITHUB_RUN_NUMBER))"
+            VERSION_NAME="0.3.0-generation-alpha3+run${GITHUB_RUN_NUMBER}"
+            VERSION_CODE="$((10300 + GITHUB_RUN_NUMBER))"
           fi
           [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]
           SAFE_VERSION="$(printf '%s' "$VERSION_NAME" | tr -c 'A-Za-z0-9._+-' '-')"
@@ -93,12 +95,29 @@ jobs:
           echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
           echo "safe_version=$SAFE_VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout Loom source
+      - name: Checkout Loom filesystem compiler source
         uses: actions/checkout@v5
         with:
           ref: ${{ steps.meta.outputs.source_ref }}
           path: source
           fetch-depth: 1
+
+      - name: Apply Stage 43 Android block-origin compatibility patch when requested
+        id: patchset
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATCHSET=none
+          SOURCE_REF='${{ steps.meta.outputs.source_ref }}'
+          if [[ "$SOURCE_REF" == 'feat/stage43-erofs-shared-partial-overlay' || \
+                "$SOURCE_REF" == 'feat/stage43-android-block-origin-alpha3' || \
+                "$SOURCE_REF" == 'be34050abd8509868aa0d9dbdecb69266ce2b0b6' ]]; then
+            PATCH='pipeline/packaging/android/patches/stage43-android-block-origin.patch'
+            git -C source apply --check "../$PATCH"
+            git -C source apply "../$PATCH"
+            PATCHSET=stage43-android-block-origin
+          fi
+          echo "patchset=$PATCHSET" >> "$GITHUB_OUTPUT"
 
       - name: Resolve exact source SHA
         id: source
@@ -179,7 +198,12 @@ jobs:
           set -euo pipefail
           ZIP='${{ steps.package.outputs.zip }}'
           unzip -t "$ZIP" >/dev/null
-          for entry in module.prop bin/loom bin/loom-sidecar bin/loom-shadow sidecar.conf shadow.conf customize.sh post-fs-data.sh service.sh action.sh uninstall.sh skip_mount build-info.txt; do
+          for entry in \
+            module.prop \
+            bin/loom bin/loom-sidecar bin/loom-shadow bin/loom-compose \
+            sidecar.conf shadow.conf compose.conf \
+            customize.sh post-fs-data.sh service.sh boot-completed.sh action.sh uninstall.sh \
+            skip_mount build-info.txt; do
             unzip -Z1 "$ZIP" | grep -Fxq "$entry" || { echo "Missing module entry: $entry" >&2; exit 1; }
           done
           unzip -p "$ZIP" module.prop
@@ -187,11 +211,14 @@ jobs:
           unzip -p "$ZIP" bin/loom > /tmp/loom-android
           chmod 0755 /tmp/loom-android
           file /tmp/loom-android | grep -q 'ARM aarch64\|ARM64\|aarch64'
-          unzip -p "$ZIP" service.sh | grep -q 'loom-shadow.*activate'
-          unzip -p "$ZIP" shadow.conf | grep -Fxq 'LOOM_SHADOW_ENABLED=0'
-          unzip -p "$ZIP" shadow.conf | grep -Fxq 'LOOM_TAKEOVER=0'
-          unzip -p "$ZIP" build-info.txt | grep -Fxq 'shadow_origin=direct-block-device'
-          unzip -p "$ZIP" build-info.txt | grep -Fxq 'stock_mount_replacement=false'
+          unzip -p "$ZIP" service.sh | grep -q 'loom-compose.*activate'
+          unzip -p "$ZIP" boot-completed.sh | grep -q 'loom-compose.*commit'
+          unzip -p "$ZIP" compose.conf | grep -Fxq 'LOOM_COMPOSE_ENABLED=1'
+          unzip -p "$ZIP" compose.conf | grep -Fxq 'LOOM_TAKEOVER=0'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'filesystem_fabric=origin-plus-sparse-shadow'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'uses_overlayfs=false'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'uses_magic_mount=false'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'first_stage_takeover=false'
           unzip -p "$ZIP" build-info.txt | grep -Fxq 'system_takeover=false'
           if unzip -Z1 "$ZIP" | grep -qE '^([^/]+/){2,}module\.prop$'; then
             echo 'module.prop is incorrectly nested inside wrapper directories' >&2
@@ -213,20 +240,21 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Loom Android sparse-shadow Alpha 2 artifact'
+            echo '## Loom Android Alpha 3 flashable generation artifact'
             echo
-            echo "- Source ref: `${{ steps.meta.outputs.source_ref }}`"
-            echo "- Source SHA: `${{ steps.source.outputs.sha }}`"
+            echo "- Filesystem source ref: `${{ steps.meta.outputs.source_ref }}`"
+            echo "- Filesystem source SHA: `${{ steps.source.outputs.sha }}`"
+            echo "- Compatibility patchset: `${{ steps.patchset.outputs.patchset }}`"
             echo "- Version: `${{ steps.meta.outputs.version_name }}` (`${{ steps.meta.outputs.version_code }}`)"
             echo "- Architecture: `arm64-v8a`"
             echo "- NDK: `${{ steps.ndk.outputs.root }}`"
             echo "- Artifact: `${{ steps.package.outputs.artifact_name }}`"
-            echo "- Default activation: `read-only identity sidecar`"
-            echo "- Opt-in validation activation: `direct-block sparse-shadow sidecar`"
-            echo "- Shadow backing: `read-only loop devices`"
-            echo "- Shadow composition: `transactional layered dm-linear`"
-            echo "- Existing system/module mount replacement: `false`"
-            echo "- System takeover: `false`"
+            echo "- Module composition: `enabled ordinary module system/ trees -> one deterministic staging tree`"
+            echo "- Filesystem fabric: `read-only origin + sparse shadow blocks + dm-linear effective device`"
+            echo "- Generation commit: `boot-completed`"
+            echo "- Interrupted boot: `automatic recovery hold`"
+            echo "- OverlayFS / Magic Mount in LoomFS path: `false / false`"
+            echo "- First-stage /system takeover: `false`"
             echo
-            echo '> Alpha 2 can materialize real Loom sparse shadows from a local payload tree or an existing module system/ tree while leaving the current module active. It still mounts only below /data/adb/loom/mnt.'
+            echo '> This is a flashable validation build. It builds a real block-level effective filesystem generation but deliberately does not replace Android first-stage system mounts yet.'
           } >> "$GITHUB_STEP_SUMMARY"
