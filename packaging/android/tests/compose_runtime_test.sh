@@ -96,7 +96,7 @@ run_compose() {
   LOOM_STATE_DIR="$STATE" \
   LOOM_COMPOSE_CONFIG="$CONF" \
   LOOM_TEST_UID=0 \
-    "$MODDIR/bin/loom-compose" "$@"
+    sh "$MODDIR/bin/loom-compose" "$@"
 }
 
 run_compose preflight
