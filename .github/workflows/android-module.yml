@@ -29,10 +29,12 @@ on:
       - infra/android-module-pipeline
       - 'feat/android-sidecar-*'
       - 'feat/android-shadow-sidecar-*'
+      - 'feat/unified-kernel-*'
   pull_request:
     paths:
       - '.github/workflows/android-module.yml'
       - 'packaging/android/**'
+      - 'kernel/**'
 
 permissions:
   contents: read
@@ -55,6 +57,15 @@ jobs:
           set -euo pipefail
           bash pipeline/packaging/android/tests/sidecar_runtime_test.sh
           bash pipeline/packaging/android/tests/shadow_runtime_test.sh
+
+      - name: Validate kernel runtime UAPI
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcc -std=c11 -Wall -Wextra -Werror \
+            pipeline/kernel/tests/uapi_layout_test.c \
+            -o /tmp/loom-uapi-layout-test
+          /tmp/loom-uapi-layout-test
 
       - name: Resolve source and version
         id: meta
