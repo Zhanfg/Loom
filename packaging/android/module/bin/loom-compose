@@ -144,7 +144,7 @@ discover_modules() {
     printf '%s\n' "$module" >>"$raw"
   done
   "$SORT_BIN" "$raw" >"$sorted"
-  MODULE_COUNT=$($WC_BIN -l <"$sorted" | tr -d ' ')
+  MODULE_COUNT=$("$WC_BIN" -l <"$sorted" | tr -d ' ')
   case "$MODULE_COUNT" in ''|*[!0-9]*) return 1 ;; esac
   return 0
 }
@@ -192,7 +192,13 @@ stage_one_file() {
     "$CP_BIN" -f "$source" "$dest" || return 1
   fi
 
-  printf '%s\t/%s\t%s\n' "$module_id" "$rel" "$source" >>"$WORK/candidates.tsv"
+  if [ -n "$SHA256_BIN" ]; then
+    payload_digest=$($SHA256_BIN "$source" 2>/dev/null | sed 's/[[:space:]].*$//' || true)
+  else
+    payload_digest=unavailable
+  fi
+  [ -n "$payload_digest" ] || payload_digest=unavailable
+  printf '%s\t/%s\t%s\t%s\n' "$module_id" "$rel" "$source" "$payload_digest" >>"$WORK/candidates.tsv"
   return 0
 }
 
@@ -225,7 +231,7 @@ build_stage() {
     "$RM_BIN" -f "$files"
   done <"$WORK/modules.list"
 
-  FILE_COUNT=$($FIND_BIN "$next_stage" -type f -print | $WC_BIN -l | tr -d ' ')
+  FILE_COUNT=$("$FIND_BIN" "$next_stage" -type f -print | "$WC_BIN" -l | tr -d ' ')
   case "$FILE_COUNT" in ''|*[!0-9]*) "$RM_BIN" -rf "$next_stage"; return 1 ;; esac
 
   if [ "$FILE_COUNT" -gt "$LOOM_COMPOSE_MAX_FILES" ]; then
@@ -245,15 +251,16 @@ build_stage() {
 }
 
 make_generation_id() {
-  if [ -n "$SHA256_BIN" ] && [ -s "$WORK/candidates.tsv" ]; then
-    digest=$($SHA256_BIN "$WORK/candidates.tsv" 2>/dev/null | sed 's/[[:space:]].*$//')
-    case "$digest" in
-      [0-9a-fA-F][0-9a-fA-F]*) printf 'g-%s\n' "$(printf '%s' "$digest" | cut -c1-16)"; return 0 ;;
-    esac
-  fi
   now=0
   if [ -n "$DATE_BIN" ]; then
     now=$($DATE_BIN +%s 2>/dev/null || printf '0')
+  fi
+
+  if [ -n "$SHA256_BIN" ] && [ -s "$WORK/candidates.tsv" ]; then
+    digest=$($SHA256_BIN "$WORK/candidates.tsv" 2>/dev/null | sed 's/[[:space:]].*$//')
+    case "$digest" in
+      [0-9a-fA-F][0-9a-fA-F]*) printf 'g-%.16s-%s\n' "$digest" "$now"; return 0 ;;
+    esac
   fi
   printf 'g-%s-%s\n' "$now" "$$"
 }
@@ -322,8 +329,8 @@ activate() {
   generation=$(make_generation_id)
   gen_dir="$STATE/generations/$generation"
   mkdir -p "$gen_dir"
-  cp "$WORK/modules.list" "$gen_dir/modules.list" 2>/dev/null || true
-  cp "$WORK/candidates.tsv" "$gen_dir/candidates.tsv" 2>/dev/null || true
+  "$CP_BIN" "$WORK/modules.list" "$gen_dir/modules.list" 2>/dev/null || true
+  "$CP_BIN" "$WORK/candidates.tsv" "$gen_dir/candidates.tsv" 2>/dev/null || true
   cat >"$gen_dir/state.env" <<EOF
 LOOM_GENERATION=$generation
 LOOM_STATE=PREPARED
@@ -360,6 +367,7 @@ EOF
 commit_generation() {
   load_config || return 1
   [ "$LOOM_COMPOSE_ENABLED" = 1 ] || return 0
+  resolve_tools || return 1
   [ -f "$PENDING" ] || return 0
   generation=$(cat "$PENDING" 2>/dev/null || true)
   [ -n "$generation" ] || return 1
