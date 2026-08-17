@@ -17,6 +17,10 @@ path = "src/flatten_main.rs"
 name = "loom-early-map"
 path = "src/early_map_main.rs"
 
+[[bin]]
+name = "loom-early-state"
+path = "src/early_state_main.rs"
+
 [dependencies]
 loom-erofs = { path = "../loom-erofs" }
 loom-ext4 = { path = "../loom-ext4" }
