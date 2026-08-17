@@ -9,6 +9,7 @@ CONF=${LOOM_EARLY_CONFIG:-$STATE/early.conf}
 DEFAULT_CONF="$MODDIR/early.conf"
 PROC_MOUNTS=${LOOM_PROC_MOUNTS:-/proc/mounts}
 LOG=${LOOM_EARLY_LOG:-$STATE/early-prepare.log}
+EARLY_STATUS="$STATE/early-status"
 METADATA_MOUNT_OVERRIDE=${LOOM_METADATA_MOUNT_OVERRIDE:-}
 FIEMAP=${LOOM_FIEMAP_BIN_OVERRIDE:-$MODDIR/bin/loom-fiemap}
 EARLY_MAP=${LOOM_EARLY_MAP_BIN_OVERRIDE:-$MODDIR/bin/loom-early-map}
@@ -20,7 +21,7 @@ mkdir -p "$STATE"
 chmod 0700 "$STATE" 2>/dev/null || true
 
 log() { printf '[loom-early-prepare] %s\n' "$*" >>"$LOG"; }
-set_status() { printf '%s\n' "$1" >"$STATE/status"; log "status=$1"; }
+set_status() { printf '%s\n' "$1" >"$EARLY_STATUS"; log "status=$1"; }
 
 read_config_value() {
   rcv_key=$1
@@ -227,8 +228,8 @@ EOF
 
 status_snapshot() {
   load_config || true
-  printf 'status='
-  cat "$STATE/status" 2>/dev/null || printf 'UNKNOWN\n'
+  printf 'early_status='
+  cat "$EARLY_STATUS" 2>/dev/null || printf 'UNKNOWN\n'
   printf 'early_prepare_enabled=%s\n' "${LOOM_EARLY_PREPARE_ENABLED:-unknown}"
   printf 'takeover=%s\n' "${LOOM_TAKEOVER:-unknown}"
   [ -f "$CURRENT" ] && printf 'current_generation=%s\n' "$(cat "$CURRENT")"
