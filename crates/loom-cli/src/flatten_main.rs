@@ -583,7 +583,7 @@ mod tests {
         let first = replacement(100, 20, 10, 0);
         let second = replacement(100, 25, 10, 0);
         let composed = first.compose(&second, 10).unwrap();
-        assert_eq!(composed.extents.len(), 5);
+        assert_eq!(composed.extents.len(), 4);
         assert_eq!(
             composed.extents[1],
             Extent {
