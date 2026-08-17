@@ -309,10 +309,15 @@ activate_command() {
   if flatten_active_runtime; then
     return 0
   fi
+
   # Fail closed: a failed single-device commit does not leave the old layered
-  # validation mount active as a silent fallback.
+  # validation mount active as a silent fallback. Preserve the precise flatten
+  # failure code across cleanup so users can distinguish the rollback cause.
+  failure_status=$(cat "$STATE/status" 2>/dev/null || printf 'SHADOW_FLATTEN_FAILED')
   cleanup_flat_only >/dev/null 2>&1 || true
   "$LAYERED" cleanup >/dev/null 2>&1 || true
+  printf '%s\n' "$failure_status" >"$STATE/status"
+  log "rollback complete after $failure_status"
   return 1
 }
 
