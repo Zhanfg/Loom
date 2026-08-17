@@ -1,0 +1,7 @@
+/target/
+*.img
+*.ext4
+*.pack
+*.table
+.idea/
+.vscode/

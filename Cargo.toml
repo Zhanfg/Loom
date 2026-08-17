@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/loom-types",
+    "crates/loom-map",
+    "crates/loom-pack",
+    "crates/loom-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+rust-version = "1.75"
+authors = ["Loom contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
