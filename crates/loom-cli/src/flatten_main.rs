@@ -263,8 +263,8 @@ impl FlatMap {
                 .checked_mul(SECTOR_SIZE as u64)
                 .ok_or(FlattenError::ArithmeticOverflow)?;
             let byte_end_u64 = checked_add(byte_start_u64, byte_len_u64)?;
-            let byte_start = usize::try_from(byte_start_u64)
-                .map_err(|_| FlattenError::ArithmeticOverflow)?;
+            let byte_start =
+                usize::try_from(byte_start_u64).map_err(|_| FlattenError::ArithmeticOverflow)?;
             let byte_end =
                 usize::try_from(byte_end_u64).map_err(|_| FlattenError::ArithmeticOverflow)?;
             let bytes = aggregate
@@ -377,7 +377,9 @@ fn write_outputs_atomically(
         return Err("shadow and table outputs must be different paths".into());
     }
     if shadow_path.exists() || table_path.exists() {
-        return Err("flatten outputs already exist; refusing to overwrite generation artifacts".into());
+        return Err(
+            "flatten outputs already exist; refusing to overwrite generation artifacts".into(),
+        );
     }
     ensure_parent_exists(shadow_path)?;
     ensure_parent_exists(table_path)?;
@@ -460,10 +462,7 @@ fn parse_u64(value: &str, line: usize) -> Result<u64, FlattenError> {
         .map_err(|_| FlattenError::InvalidNumber(line))
 }
 
-fn required(
-    args: &mut impl Iterator<Item = String>,
-    name: &str,
-) -> Result<String, Box<dyn Error>> {
+fn required(args: &mut impl Iterator<Item = String>, name: &str) -> Result<String, Box<dyn Error>> {
     args.next()
         .ok_or_else(|| format!("missing required argument: {name}").into())
 }
@@ -493,7 +492,9 @@ impl fmt::Display for FlattenError {
             Self::EmptyTable => write!(f, "dm-linear table contains no extents"),
             Self::ZeroLengthExtent => write!(f, "dm-linear extent has zero length"),
             Self::MalformedTableLine(line) => write!(f, "malformed dm-linear row at line {line}"),
-            Self::InvalidNumber(line) => write!(f, "invalid numeric field at dm-linear line {line}"),
+            Self::InvalidNumber(line) => {
+                write!(f, "invalid numeric field at dm-linear line {line}")
+            }
             Self::UnknownBackingDevice { line, device } => write!(
                 f,
                 "unknown backing device {device:?} at dm-linear line {line}"
@@ -509,7 +510,9 @@ impl fmt::Display for FlattenError {
             Self::BaseCoverageGap(sector) => {
                 write!(f, "base mapping does not cover source sector {sector}")
             }
-            Self::ShadowOutOfBounds => write!(f, "flattened map references bytes outside aggregate shadow"),
+            Self::ShadowOutOfBounds => {
+                write!(f, "flattened map references bytes outside aggregate shadow")
+            }
             Self::NonContiguous { expected, actual } => write!(
                 f,
                 "dm-linear map is not contiguous: expected sector {expected}, got {actual}"
@@ -612,12 +615,9 @@ mod tests {
 
     #[test]
     fn rejects_unknown_table_device() {
-        let error = FlatMap::parse_dm_table(
-            "0 32 linear /dev/wrong 0\n",
-            "/dev/origin",
-            "/dev/shadow",
-        )
-        .unwrap_err();
+        let error =
+            FlatMap::parse_dm_table("0 32 linear /dev/wrong 0\n", "/dev/origin", "/dev/shadow")
+                .unwrap_err();
         assert!(matches!(
             error,
             FlattenError::UnknownBackingDevice { line: 1, .. }
