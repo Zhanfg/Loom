@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod early_sha256;
+
+use early_sha256::{sha256_bytes_hex, sha256_file_hex};
 use std::env;
 use std::error::Error;
 use std::fmt;
@@ -86,11 +89,11 @@ fn decide(state: &Path, snapshots: &Path) -> Result<Decision, StateError> {
     };
 
     if !snapshot_valid(snapshots, &desired)? {
-        return Ok(fallback_decision(
+        return fallback_decision(
             snapshots,
             confirmed.as_deref(),
             "desired-snapshot-invalid",
-        )?);
+        );
     }
 
     if confirmed.as_deref() == Some(desired.as_str()) {
@@ -98,28 +101,28 @@ fn decide(state: &Path, snapshots: &Path) -> Result<Decision, StateError> {
     }
 
     if failed.as_deref() == Some(desired.as_str()) {
-        return Ok(fallback_decision(
+        return fallback_decision(
             snapshots,
             confirmed.as_deref(),
             "candidate-quarantined",
-        )?);
+        );
     }
 
     if attempted.as_deref() == Some(desired.as_str()) {
-        // The exact candidate was marked attempted before the previous early handoff,
-        // but userspace never confirmed it. Quarantine it before choosing a fallback.
+        // The candidate was durably marked before the previous early handoff,
+        // but userspace never confirmed it. Quarantine it before selecting a fallback.
         atomic_write(state, FAILED, &desired)?;
         remove_if_exists(&state.join(ATTEMPTED))?;
         sync_directory(state)?;
-        return Ok(fallback_decision(
+        return fallback_decision(
             snapshots,
             confirmed.as_deref(),
             "previous-attempt-unconfirmed",
-        )?);
+        );
     }
 
-    // This write is the one-shot safety boundary. A future first-stage host must
-    // durably record the attempt before it redirects the system mount.
+    // This durable marker is the one-shot boundary. A future first-stage host
+    // must complete it before substituting the system block source.
     atomic_write(state, ATTEMPTED, &desired)?;
     sync_directory(state)?;
     Ok(Decision::Candidate(desired))
@@ -173,15 +176,18 @@ fn fallback_decision(
 
 fn snapshot_valid(root: &Path, generation: &str) -> Result<bool, StateError> {
     validate_generation(generation)?;
-    let descriptor = root.join(generation).join("descriptor.env");
-    if !descriptor.is_file() {
+    let directory = root.join(generation);
+    let descriptor = directory.join("descriptor.env");
+    if !regular_file(&descriptor)? {
         return Ok(false);
     }
+
     let text = fs::read_to_string(&descriptor).map_err(StateError::Io)?;
     let mut descriptor_generation = None;
     let mut state = None;
     let mut table_hash = None;
     let mut shadow_hash = None;
+    let mut extents_hash = None;
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("LOOM_GENERATION=") {
             descriptor_generation = Some(value.to_owned());
@@ -191,19 +197,50 @@ fn snapshot_valid(root: &Path, generation: &str) -> Result<bool, StateError> {
             table_hash = Some(value.to_owned());
         } else if let Some(value) = line.strip_prefix("LOOM_SHADOW_SHA256=") {
             shadow_hash = Some(value.to_owned());
+        } else if let Some(value) = line.strip_prefix("LOOM_EXTENTS_SHA256=") {
+            extents_hash = Some(value.to_owned());
         }
     }
+
     if descriptor_generation.as_deref() != Some(generation) {
         return Ok(false);
     }
-    if !matches!(state.as_deref(), Some("PREPARED_NOT_ACTIVE") | Some("CONFIRMED")) {
+    if !matches!(
+        state.as_deref(),
+        Some("PREPARED_NOT_ACTIVE") | Some("CONFIRMED")
+    ) {
         return Ok(false);
     }
-    if !valid_sha256(table_hash.as_deref()) || !valid_sha256(shadow_hash.as_deref()) {
+    if !valid_sha256(table_hash.as_deref())
+        || !valid_sha256(shadow_hash.as_deref())
+        || !valid_sha256(extents_hash.as_deref())
+    {
         return Ok(false);
     }
-    Ok(root.join(generation).join("early.table").is_file()
-        && root.join(generation).join("shadow.pack").is_file())
+
+    let table = directory.join("early.table");
+    let shadow = directory.join("shadow.pack");
+    let extents = directory.join("shadow.extents");
+    if !regular_file(&table)? || !regular_file(&shadow)? || !regular_file(&extents)? {
+        return Ok(false);
+    }
+
+    Ok(hash_matches(&table, table_hash.as_deref().unwrap_or_default())?
+        && hash_matches(&shadow, shadow_hash.as_deref().unwrap_or_default())?
+        && hash_matches(&extents, extents_hash.as_deref().unwrap_or_default())?)
+}
+
+fn regular_file(path: &Path) -> Result<bool, StateError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(metadata.file_type().is_file()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StateError::Io(error)),
+    }
+}
+
+fn hash_matches(path: &Path, expected: &str) -> Result<bool, StateError> {
+    let actual = sha256_file_hex(path).map_err(StateError::Io)?;
+    Ok(actual.eq_ignore_ascii_case(expected))
 }
 
 fn valid_sha256(value: Option<&str>) -> bool {
@@ -409,14 +446,19 @@ mod tests {
     fn snapshot(root: &Path, generation: &str) {
         let dir = root.join(generation);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join("shadow.pack"), b"shadow").unwrap();
-        fs::write(dir.join("early.table"), b"table").unwrap();
+        let shadow = b"shadow";
+        let table = b"table";
+        let extents = b"0 100 1\n";
+        fs::write(dir.join("shadow.pack"), shadow).unwrap();
+        fs::write(dir.join("early.table"), table).unwrap();
+        fs::write(dir.join("shadow.extents"), extents).unwrap();
         fs::write(
             dir.join("descriptor.env"),
             format!(
-                "LOOM_GENERATION={generation}\nLOOM_STATE=PREPARED_NOT_ACTIVE\nLOOM_SHADOW_SHA256={}\nLOOM_TABLE_SHA256={}\n",
-                "a".repeat(64),
-                "b".repeat(64)
+                "LOOM_GENERATION={generation}\nLOOM_STATE=PREPARED_NOT_ACTIVE\nLOOM_SHADOW_SHA256={}\nLOOM_EXTENTS_SHA256={}\nLOOM_TABLE_SHA256={}\n",
+                sha256_bytes_hex(shadow),
+                sha256_bytes_hex(extents),
+                sha256_bytes_hex(table)
             ),
         )
         .unwrap();
@@ -437,7 +479,12 @@ mod tests {
             decide(&state, &snapshots).unwrap(),
             Decision::Stock("previous-attempt-unconfirmed")
         );
-        assert_eq!(read_generation_optional(&state.join(FAILED)).unwrap().as_deref(), Some("g-a"));
+        assert_eq!(
+            read_generation_optional(&state.join(FAILED))
+                .unwrap()
+                .as_deref(),
+            Some("g-a")
+        );
     }
 
     #[test]
@@ -449,7 +496,10 @@ mod tests {
         snapshot(&snapshots, "g-b");
 
         arm(&state, "g-a").unwrap();
-        assert!(matches!(decide(&state, &snapshots).unwrap(), Decision::Candidate(_)));
+        assert!(matches!(
+            decide(&state, &snapshots).unwrap(),
+            Decision::Candidate(_)
+        ));
         confirm(&state, &snapshots, "g-a").unwrap();
         assert_eq!(
             decide(&state, &snapshots).unwrap(),
@@ -485,7 +535,10 @@ mod tests {
         snapshot(&snapshots, "g-a");
         arm(&state, "g-a").unwrap();
         force_stock(&state, "on").unwrap();
-        assert_eq!(decide(&state, &snapshots).unwrap(), Decision::Stock("force-stock"));
+        assert_eq!(
+            decide(&state, &snapshots).unwrap(),
+            Decision::Stock("force-stock")
+        );
         force_stock(&state, "off").unwrap();
         assert_eq!(
             decide(&state, &snapshots).unwrap(),
@@ -510,5 +563,20 @@ mod tests {
                 reason: "desired-snapshot-invalid"
             }
         );
+    }
+
+    #[test]
+    fn content_hash_mismatch_invalidates_snapshot() {
+        let temp = TempDir::new("hash-mismatch");
+        let state = temp.0.join("state");
+        let snapshots = temp.0.join("snapshots");
+        snapshot(&snapshots, "g-a");
+        arm(&state, "g-a").unwrap();
+        fs::write(snapshots.join("g-a/shadow.pack"), b"tampered").unwrap();
+        assert_eq!(
+            decide(&state, &snapshots).unwrap(),
+            Decision::Stock("desired-snapshot-invalid")
+        );
+        assert!(!state.join(ATTEMPTED).exists());
     }
 }
