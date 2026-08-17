@@ -1,0 +1,241 @@
+name: Android Alpha 6 recovery package
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: 'Alpha 6 source ref'
+        required: true
+        default: 'feat/alpha6-early-recovery-c'
+        type: string
+      version_name:
+        description: 'Module version name'
+        required: true
+        default: '0.6.0-early-recovery-alpha6'
+        type: string
+      version_code:
+        description: 'Numeric module version code'
+        required: true
+        default: '10600'
+        type: string
+  push:
+    branches:
+      - 'feat/alpha6-recovery-*'
+  pull_request:
+    paths:
+      - '.github/workflows/android-alpha6.yml'
+      - 'packaging/android/**'
+
+permissions:
+  contents: read
+
+jobs:
+  package-arm64:
+    name: Build arm64 Alpha 6 module ZIP
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+
+    steps:
+      - name: Checkout packaging pipeline
+        uses: actions/checkout@v5
+        with:
+          path: pipeline
+
+      - name: Validate existing Android runtime safety
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n pipeline/packaging/android/build-module-alpha6.sh
+          bash pipeline/packaging/android/tests/sidecar_runtime_test.sh
+          bash pipeline/packaging/android/tests/shadow_runtime_test.sh
+          bash pipeline/packaging/android/tests/shadow_flat_runtime_test.sh
+          bash pipeline/packaging/android/tests/compose_runtime_test.sh
+          bash pipeline/packaging/android/tests/early_prepare_runtime_test.sh
+
+      - name: Resolve source and version
+        id: meta
+        shell: bash
+        env:
+          REQUESTED_REF: ${{ inputs.source_ref }}
+          REQUESTED_VERSION: ${{ inputs.version_name }}
+          REQUESTED_CODE: ${{ inputs.version_code }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            SOURCE_REF="${REQUESTED_REF:-feat/alpha6-early-recovery-c}"
+            VERSION_NAME="$REQUESTED_VERSION"
+            VERSION_CODE="$REQUESTED_CODE"
+          else
+            SOURCE_REF='feat/alpha6-early-recovery-c'
+            VERSION_NAME="0.6.0-early-recovery-alpha6+run${GITHUB_RUN_NUMBER}"
+            VERSION_CODE="$((10600 + GITHUB_RUN_NUMBER))"
+          fi
+          [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]
+          SAFE_VERSION="$(printf '%s' "$VERSION_NAME" | tr -c 'A-Za-z0-9._+-' '-')"
+          echo "source_ref=$SOURCE_REF" >> "$GITHUB_OUTPUT"
+          echo "version_name=$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          echo "version_code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          echo "safe_version=$SAFE_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout Alpha 6 source
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ steps.meta.outputs.source_ref }}
+          path: source
+          fetch-depth: 1
+
+      - name: Resolve exact source SHA
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="$(git -C source rev-parse HEAD)"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHA:0:12}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust with Android target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+          components: rustfmt, clippy
+
+      - name: Validate source userspace
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+
+      - name: Validate Alpha 4-6 block and recovery proofs
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo modprobe loop || true
+          sudo modprobe dm_mod || true
+          bash source/tests/integration/alpha4_dm_flatten.sh
+          bash source/tests/integration/alpha5_metadata_raw_shadow.sh
+          bash source/tests/integration/alpha6_early_recovery_protocol_c.sh
+
+      - name: Configure Android NDK toolchain
+        id: ndk
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          NDK_ROOT="$(find "$SDK_ROOT/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)"
+          [[ -n "$NDK_ROOT" && -d "$NDK_ROOT" ]] || { echo "No Android NDK found under $SDK_ROOT/ndk" >&2; exit 1; }
+          TOOLCHAIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          LINKER="$TOOLCHAIN/aarch64-linux-android21-clang"
+          [[ -x "$LINKER" ]] || { echo "Missing Android arm64 compiler: $LINKER" >&2; exit 1; }
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$LINKER" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$LINKER" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+          echo "STRIP=$TOOLCHAIN/llvm-strip" >> "$GITHUB_ENV"
+          echo "LOOM_ANDROID_CC=$LINKER" >> "$GITHUB_ENV"
+          echo "root=$NDK_ROOT" >> "$GITHUB_OUTPUT"
+
+      - name: Build Android arm64 native tools
+        working-directory: source
+        run: |
+          set -euo pipefail
+          cargo build --release -p loom-cli \
+            --bin loom --bin loom-flatten --bin loom-early-map \
+            --target aarch64-linux-android
+          "$LOOM_ANDROID_CC" -std=c11 -O2 -Wall -Wextra -Werror \
+            tools/loom-fiemap.c -o target/aarch64-linux-android/release/loom-fiemap
+          "$LOOM_ANDROID_CC" -std=c11 -O2 -Wall -Wextra -Werror \
+            tools/loom-early-state.c -o target/aarch64-linux-android/release/loom-early-state
+          for binary in loom loom-flatten loom-early-map loom-early-state loom-fiemap; do
+            "$STRIP" "target/aarch64-linux-android/release/$binary"
+            file "target/aarch64-linux-android/release/$binary"
+            readelf -h "target/aarch64-linux-android/release/$binary" | grep -q 'Machine:.*AArch64'
+          done
+
+      - name: Package Alpha 6 module ZIP
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          ZIP="dist/Loom-Android-${{ steps.meta.outputs.safe_version }}-${{ steps.source.outputs.short_sha }}-arm64.zip"
+          bash pipeline/packaging/android/build-module-alpha6.sh \
+            source/target/aarch64-linux-android/release/loom \
+            source/target/aarch64-linux-android/release/loom-flatten \
+            source/target/aarch64-linux-android/release/loom-early-map \
+            source/target/aarch64-linux-android/release/loom-early-state \
+            source/target/aarch64-linux-android/release/loom-fiemap \
+            "$ZIP" \
+            '${{ steps.meta.outputs.version_name }}' \
+            '${{ steps.meta.outputs.version_code }}' \
+            '${{ steps.meta.outputs.source_ref }}' \
+            '${{ steps.source.outputs.sha }}'
+          sha256sum "$ZIP" > "$ZIP.sha256"
+          echo "zip=$ZIP" >> "$GITHUB_OUTPUT"
+          echo "sha256=$ZIP.sha256" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=Loom-Android-${{ steps.meta.outputs.safe_version }}-${{ steps.source.outputs.short_sha }}-arm64" >> "$GITHUB_OUTPUT"
+
+      - name: Validate Alpha 6 archive policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP='${{ steps.package.outputs.zip }}'
+          unzip -t "$ZIP" >/dev/null
+          for entry in \
+            module.prop build-info.txt skip_mount \
+            bin/loom bin/loom-flatten bin/loom-early-map bin/loom-early-state bin/loom-fiemap \
+            bin/loom-sidecar bin/loom-shadow bin/loom-shadow-layered bin/loom-compose bin/loom-early-prepare \
+            sidecar.conf shadow.conf compose.conf early.conf recovery.conf \
+            customize.sh post-fs-data.sh service.sh boot-completed.sh action.sh uninstall.sh; do
+            unzip -Z1 "$ZIP" | grep -Fxq "$entry" || { echo "Missing module entry: $entry" >&2; exit 1; }
+          done
+          for binary in loom loom-flatten loom-early-map loom-early-state loom-fiemap; do
+            unzip -p "$ZIP" "bin/$binary" > "/tmp/$binary-alpha6"
+            chmod 0755 "/tmp/$binary-alpha6"
+            file "/tmp/$binary-alpha6" | grep -q 'ARM aarch64\|ARM64\|aarch64'
+          done
+          unzip -p "$ZIP" recovery.conf | grep -Fxq 'LOOM_EARLY_AUTO_ARM=0'
+          unzip -p "$ZIP" recovery.conf | grep -Fxq 'LOOM_EARLY_AUTO_CONFIRM=0'
+          unzip -p "$ZIP" recovery.conf | grep -Fxq 'LOOM_TAKEOVER=0'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'early_recovery_protocol=one-shot-last-good-force-stock'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'early_recovery_impl=dependency-free-c'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'early_snapshot_sha256_verify=true'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'early_auto_arm=false'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'early_auto_confirm=false'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'first_stage_takeover=false'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'uses_overlayfs=false'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'uses_magic_mount=false'
+          for script in post-fs-data.sh service.sh boot-completed.sh; do
+            if unzip -p "$ZIP" "$script" | grep -Eq 'loom-early-state[[:space:]]+(arm|confirm)'; then
+              echo "Forbidden automatic early-state transition in $script" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload Alpha 6 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.artifact_name }}
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.sha256 }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Build summary
+        shell: bash
+        run: |
+          {
+            echo '## Loom Android Alpha 6 early recovery artifact'
+            echo
+            echo "- Source: `${{ steps.meta.outputs.source_ref }}` @ `${{ steps.source.outputs.sha }}`"
+            echo "- Version: `${{ steps.meta.outputs.version_name }}`"
+            echo "- Artifact: `${{ steps.package.outputs.artifact_name }}`"
+            echo '- Stable LoomFS: one aggregate shadow + one DM device'
+            echo '- Early snapshot: raw ext4 /metadata sectors'
+            echo '- Recovery: one-shot candidate + last-good + force-stock'
+            echo '- Automatic arm: false'
+            echo '- Automatic confirm: false'
+            echo '- First-stage takeover: false'
+          } >> "$GITHUB_STEP_SUMMARY"
