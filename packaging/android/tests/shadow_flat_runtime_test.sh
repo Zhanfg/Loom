@@ -216,14 +216,14 @@ grep -Fq 'delete loom-shadow-flat-test-flat' "$LOG_DM"
 grep -Fq "detach $TMP/loops/aggregate.dev" "$LOG_LOOP"
 
 # A flatten failure must tear down the layered validation view instead of using
-# it as an implicit fallback.
+# it as an implicit fallback, while retaining the precise diagnostic status.
 : >"$LOG_DM"; : >"$LOG_LOOP"; : >"$TMP/proc_mounts"
 export FAKE_FLATTEN_FAIL=1
 if bash "$RUNTIME" activate; then
   echo 'expected flatten failure to fail closed' >&2
   exit 1
 fi
-[[ "$(cat "$STATE/status")" == SHADOW_INACTIVE ]]
+[[ "$(cat "$STATE/status")" == SHADOW_FLATTEN_FAILED ]]
 [[ ! -d "$STATE/shadow-runtime" ]]
 [[ ! -s "$TMP/proc_mounts" ]]
 unset FAKE_FLATTEN_FAIL
