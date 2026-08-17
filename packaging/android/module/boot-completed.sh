@@ -21,11 +21,24 @@ if [ -f "$COMPOSE_CONF" ] && grep -Fxq 'LOOM_COMPOSE_ENABLED=1' "$COMPOSE_CONF";
   compose_enabled=1
 fi
 
+commit_ok=1
 if [ "$compose_enabled" = 1 ] && [ -x "$MODDIR/bin/loom-compose" ]; then
   if "$MODDIR/bin/loom-compose" commit; then
     echo "[loom] generation commit PASS"
   else
     echo "[loom] generation commit FAIL; pending marker retained for recovery"
+    commit_ok=0
+  fi
+fi
+
+# Alpha 5 prepare is intentionally after a successful boot commit. It only copies
+# the already-validated aggregate shadow into /metadata and prepares raw-sector
+# descriptors for a future first-stage handoff. It never changes this boot's mount.
+if [ "$commit_ok" = 1 ] && [ -x "$MODDIR/bin/loom-early-prepare" ]; then
+  if "$MODDIR/bin/loom-early-prepare" prepare; then
+    echo "[loom] early snapshot prepare completed or disabled"
+  else
+    echo "[loom] early snapshot prepare FAIL; active LoomFS generation remains unchanged"
   fi
 fi
 
