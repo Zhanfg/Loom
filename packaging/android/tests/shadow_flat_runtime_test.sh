@@ -2,8 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME="$ROOT/module/bin/loom-shadow-flat"
-[[ -f "$RUNTIME" ]] || { echo "missing loom-shadow-flat runtime" >&2; exit 1; }
+RUNTIME="$ROOT/module/bin/loom-shadow-commit"
+[[ -f "$RUNTIME" ]] || { echo "missing loom-shadow-commit runtime" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
 cleanup() { rm -rf "$TMP"; }
@@ -56,6 +56,7 @@ EOF
 16 8 linear $tmp/dm/layer1.dev 16
 EOF
     printf '2\n' >"$runtime/layer_count"
+    layer_count=${FAKE_LAYER_COUNT_VALUE:-2}
     cat >"$runtime/runtime.env" <<EOF
 LOOM_MODE=sparse-shadow-sidecar
 LOOM_ORIGIN=$tmp/origin.dev
@@ -63,7 +64,7 @@ LOOM_EFFECTIVE_DEVICE=$tmp/dm/layer2.dev
 LOOM_MOUNTPOINT=$state/mnt/system-shadow
 LOOM_PAYLOAD_ROOT=$state/payload/system
 LOOM_SOURCE_MODULE_ID=
-LOOM_LAYER_COUNT=2
+LOOM_LAYER_COUNT=$layer_count
 LOOM_TAKEOVER=0
 EOF
     mkdir -p "$state/mnt/system-shadow"
@@ -214,6 +215,18 @@ bash "$RUNTIME" cleanup
 [[ ! -s "$TMP/proc_mounts" ]]
 grep -Fq 'delete loom-shadow-flat-test-flat' "$LOG_DM"
 grep -Fq "detach $TMP/loops/aggregate.dev" "$LOG_LOOP"
+
+# Invalid layer-count state must be rejected before any integer loop or flatten call.
+: >"$LOG_DM"; : >"$LOG_LOOP"; : >"$TMP/proc_mounts"
+export FAKE_LAYER_COUNT_VALUE=corrupt
+if bash "$RUNTIME" activate; then
+  echo 'expected corrupt layer count to fail closed' >&2
+  exit 1
+fi
+[[ "$(cat "$STATE/status")" == SHADOW_FLATTEN_STATE_INVALID ]]
+[[ ! -d "$STATE/shadow-runtime" ]]
+[[ ! -s "$TMP/proc_mounts" ]]
+unset FAKE_LAYER_COUNT_VALUE
 
 # A flatten failure must tear down the layered validation view instead of using
 # it as an implicit fallback, while retaining the precise diagnostic status.
