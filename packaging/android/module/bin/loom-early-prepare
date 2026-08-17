@@ -1,0 +1,243 @@
+#!/system/bin/sh
+
+umask 077
+
+SELF_DIR=${0%/*}
+MODDIR=${LOOM_MODDIR:-${SELF_DIR%/*}}
+STATE=${LOOM_STATE_DIR:-/data/adb/loom}
+CONF=${LOOM_EARLY_CONFIG:-$STATE/early.conf}
+DEFAULT_CONF="$MODDIR/early.conf"
+PROC_MOUNTS=${LOOM_PROC_MOUNTS:-/proc/mounts}
+LOG=${LOOM_EARLY_LOG:-$STATE/early-prepare.log}
+EARLY_STATUS="$STATE/early-status"
+METADATA_MOUNT_OVERRIDE=${LOOM_METADATA_MOUNT_OVERRIDE:-}
+FIEMAP=${LOOM_FIEMAP_BIN_OVERRIDE:-$MODDIR/bin/loom-fiemap}
+EARLY_MAP=${LOOM_EARLY_MAP_BIN_OVERRIDE:-$MODDIR/bin/loom-early-map}
+SHADOW_TOKEN=__LOOM_AGGREGATE_SHADOW__
+CURRENT="$STATE/current-generation"
+PREPARED="$STATE/early-prepared-generation"
+
+mkdir -p "$STATE"
+chmod 0700 "$STATE" 2>/dev/null || true
+
+log() { printf '[loom-early-prepare] %s\n' "$*" >>"$LOG"; }
+set_status() { printf '%s\n' "$1" >"$EARLY_STATUS"; log "status=$1"; }
+
+read_config_value() {
+  rcv_key=$1
+  rcv_file=$2
+  [ -f "$rcv_file" ] || return 1
+  sed -n "s/^${rcv_key}=//p" "$rcv_file" | tail -n 1
+}
+
+load_config() {
+  LOOM_EARLY_PREPARE_ENABLED=0
+  LOOM_METADATA_MOUNT=/metadata
+  LOOM_TAKEOVER=0
+
+  if [ ! -f "$CONF" ] && [ -f "$DEFAULT_CONF" ]; then
+    cp "$DEFAULT_CONF" "$CONF" 2>/dev/null || true
+    chmod 0600 "$CONF" 2>/dev/null || true
+  fi
+
+  lep_value=$(read_config_value LOOM_EARLY_PREPARE_ENABLED "$CONF" 2>/dev/null || true)
+  [ -n "$lep_value" ] && LOOM_EARLY_PREPARE_ENABLED=$lep_value
+  lep_value=$(read_config_value LOOM_METADATA_MOUNT "$CONF" 2>/dev/null || true)
+  [ -n "$lep_value" ] && LOOM_METADATA_MOUNT=$lep_value
+  lep_value=$(read_config_value LOOM_TAKEOVER "$CONF" 2>/dev/null || true)
+  [ -n "$lep_value" ] && LOOM_TAKEOVER=$lep_value
+
+  [ -n "$METADATA_MOUNT_OVERRIDE" ] && LOOM_METADATA_MOUNT=$METADATA_MOUNT_OVERRIDE
+  case "$LOOM_EARLY_PREPARE_ENABLED" in 0|1) ;; *) return 1 ;; esac
+  [ "$LOOM_TAKEOVER" = 0 ] || return 1
+  case "$LOOM_METADATA_MOUNT" in /*) ;; *) return 1 ;; esac
+  return 0
+}
+
+is_device() {
+  id_path=$1
+  [ -b "$id_path" ] && return 0
+  [ "${LOOM_TEST_ALLOW_REGULAR:-0}" = 1 ] && [ -e "$id_path" ]
+}
+
+canonical_path() {
+  cp_value=$(readlink -f "$1" 2>/dev/null || true)
+  [ -n "$cp_value" ] && printf '%s\n' "$cp_value" || printf '%s\n' "$1"
+}
+
+metadata_source() {
+  ms_found=
+  [ -f "$PROC_MOUNTS" ] || return 1
+  while read -r ms_source ms_mount ms_rest; do
+    if [ "$ms_mount" = "$LOOM_METADATA_MOUNT" ]; then
+      ms_found=$ms_source
+      break
+    fi
+  done <"$PROC_MOUNTS"
+  [ -n "$ms_found" ] || return 1
+  canonical_path "$ms_found"
+}
+
+read_env_value() {
+  rev_key=$1
+  rev_file=$2
+  [ -f "$rev_file" ] || return 1
+  sed -n "s/^${rev_key}=//p" "$rev_file" | tail -n 1
+}
+
+hash_file() {
+  hf_path=$1
+  hf_bin=$(command -v sha256sum 2>/dev/null || true)
+  [ -n "$hf_bin" ] || return 1
+  "$hf_bin" "$hf_path" | sed 's/[[:space:]].*$//'
+}
+
+valid_generation() {
+  case "$1" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
+  return 0
+}
+
+snapshot_is_current() {
+  sic_dir=$1
+  sic_generation=$2
+  sic_source_shadow=$3
+  [ -f "$sic_dir/descriptor.env" ] && [ -f "$sic_dir/shadow.pack" ] || return 1
+  sic_recorded=$(read_env_value LOOM_GENERATION "$sic_dir/descriptor.env" 2>/dev/null || true)
+  [ "$sic_recorded" = "$sic_generation" ] || return 1
+  sic_expected=$(read_env_value LOOM_SHADOW_SHA256 "$sic_dir/descriptor.env" 2>/dev/null || true)
+  [ -n "$sic_expected" ] || return 1
+  sic_actual=$(hash_file "$sic_source_shadow" 2>/dev/null || true)
+  [ -n "$sic_actual" ] && [ "$sic_actual" = "$sic_expected" ]
+}
+
+prepare_snapshot() {
+  load_config || { set_status EARLY_CONFIG_INVALID; return 1; }
+  if [ "$LOOM_EARLY_PREPARE_ENABLED" != 1 ]; then
+    set_status EARLY_PREPARE_DISABLED
+    return 0
+  fi
+
+  lep_uid=${LOOM_TEST_UID:-$(id -u 2>/dev/null || printf '1')}
+  [ "$lep_uid" = 0 ] || { set_status EARLY_PREPARE_REQUIRES_ROOT; return 1; }
+  [ -x "$FIEMAP" ] || { set_status EARLY_FIEMAP_RUNTIME_MISSING; return 1; }
+  [ -x "$EARLY_MAP" ] || { set_status EARLY_MAP_RUNTIME_MISSING; return 1; }
+  [ -d "$LOOM_METADATA_MOUNT" ] || { set_status EARLY_METADATA_UNAVAILABLE; return 1; }
+
+  lep_metadata_device=$(metadata_source 2>/dev/null || true)
+  [ -n "$lep_metadata_device" ] && is_device "$lep_metadata_device" || {
+    set_status EARLY_METADATA_DEVICE_INVALID
+    return 1
+  }
+
+  [ -f "$CURRENT" ] || { set_status EARLY_NO_COMMITTED_GENERATION; return 1; }
+  lep_generation=$(cat "$CURRENT" 2>/dev/null || true)
+  valid_generation "$lep_generation" || { set_status EARLY_GENERATION_INVALID; return 1; }
+
+  lep_flat_dir="$STATE/shadow-runtime/flat"
+  lep_runtime_env="$STATE/shadow-runtime/runtime.env"
+  lep_source_shadow="$lep_flat_dir/shadow.pack"
+  lep_source_table="$lep_flat_dir/table.raw"
+  [ -s "$lep_source_shadow" ] && [ -s "$lep_source_table" ] && [ -f "$lep_runtime_env" ] || {
+    set_status EARLY_FLAT_GENERATION_MISSING
+    return 1
+  }
+  lep_mode=$(read_env_value LOOM_MODE "$lep_runtime_env" 2>/dev/null || true)
+  lep_depth=$(read_env_value LOOM_STABLE_DM_DEPTH "$lep_runtime_env" 2>/dev/null || true)
+  lep_origin=$(read_env_value LOOM_ORIGIN "$lep_runtime_env" 2>/dev/null || true)
+  [ "$lep_mode" = sparse-shadow-flat-generation ] && [ "$lep_depth" = 1 ] && [ -n "$lep_origin" ] || {
+    set_status EARLY_FLAT_STATE_INVALID
+    return 1
+  }
+  grep -Fq "$SHADOW_TOKEN" "$lep_source_table" || { set_status EARLY_FLAT_TABLE_INVALID; return 1; }
+
+  lep_root="$LOOM_METADATA_MOUNT/loom/early"
+  lep_final="$lep_root/$lep_generation"
+  lep_stage="$lep_root/.${lep_generation}.tmp-$$"
+  mkdir -p "$lep_root" || { set_status EARLY_METADATA_WRITE_FAILED; return 1; }
+  chmod 0700 "$LOOM_METADATA_MOUNT/loom" "$lep_root" 2>/dev/null || true
+
+  if snapshot_is_current "$lep_final" "$lep_generation" "$lep_source_shadow"; then
+    printf '%s\n' "$lep_generation" >"$PREPARED"
+    set_status EARLY_SNAPSHOT_READY
+    log "snapshot already current generation=$lep_generation metadata_device=$lep_metadata_device"
+    return 0
+  fi
+  [ ! -e "$lep_final" ] || { set_status EARLY_SNAPSHOT_CONFLICT; return 1; }
+
+  rm -rf "$lep_stage"
+  mkdir -p "$lep_stage" || { set_status EARLY_METADATA_WRITE_FAILED; return 1; }
+  if ! cp "$lep_source_shadow" "$lep_stage/shadow.pack"; then
+    rm -rf "$lep_stage"
+    set_status EARLY_METADATA_WRITE_FAILED
+    return 1
+  fi
+  chmod 0400 "$lep_stage/shadow.pack" 2>/dev/null || true
+  sync
+
+  if ! "$FIEMAP" "$lep_stage/shadow.pack" "$lep_stage/shadow.extents" >>"$LOG" 2>&1; then
+    rm -rf "$lep_stage"
+    set_status EARLY_FIEMAP_FAILED
+    return 1
+  fi
+  if ! "$EARLY_MAP" \
+      "$lep_source_table" \
+      "$lep_origin" \
+      "$SHADOW_TOKEN" \
+      "$lep_stage/shadow.extents" \
+      "$lep_stage/early.table" >>"$LOG" 2>&1; then
+    rm -rf "$lep_stage"
+    set_status EARLY_MAP_FAILED
+    return 1
+  fi
+
+  lep_shadow_sha=$(hash_file "$lep_stage/shadow.pack" 2>/dev/null || true)
+  lep_extents_sha=$(hash_file "$lep_stage/shadow.extents" 2>/dev/null || true)
+  lep_table_sha=$(hash_file "$lep_stage/early.table" 2>/dev/null || true)
+  [ -n "$lep_shadow_sha" ] && [ -n "$lep_extents_sha" ] && [ -n "$lep_table_sha" ] || {
+    rm -rf "$lep_stage"
+    set_status EARLY_HASH_FAILED
+    return 1
+  }
+
+  cat >"$lep_stage/descriptor.env" <<EOF
+LOOM_EARLY_SCHEMA=1
+LOOM_GENERATION=$lep_generation
+LOOM_STATE=PREPARED_NOT_ACTIVE
+LOOM_SHADOW_SHA256=$lep_shadow_sha
+LOOM_EXTENTS_SHA256=$lep_extents_sha
+LOOM_TABLE_SHA256=$lep_table_sha
+LOOM_METADATA_DEVICE=$lep_metadata_device
+LOOM_ORIGIN_AT_PREPARE=$lep_origin
+LOOM_ORIGIN_TOKEN=__LOOM_ORIGIN__
+LOOM_METADATA_TOKEN=__LOOM_METADATA_DEVICE__
+LOOM_TAKEOVER=0
+EOF
+  chmod 0400 "$lep_stage/shadow.extents" "$lep_stage/early.table" "$lep_stage/descriptor.env" 2>/dev/null || true
+  sync
+  if ! mv "$lep_stage" "$lep_final"; then
+    rm -rf "$lep_stage"
+    set_status EARLY_COMMIT_FAILED
+    return 1
+  fi
+  sync
+  printf '%s\n' "$lep_generation" >"$PREPARED"
+  set_status EARLY_SNAPSHOT_READY
+  log "prepare PASS generation=$lep_generation metadata_device=$lep_metadata_device takeover=0"
+  return 0
+}
+
+status_snapshot() {
+  load_config || true
+  printf 'early_status='
+  cat "$EARLY_STATUS" 2>/dev/null || printf 'UNKNOWN\n'
+  printf 'early_prepare_enabled=%s\n' "${LOOM_EARLY_PREPARE_ENABLED:-unknown}"
+  printf 'takeover=%s\n' "${LOOM_TAKEOVER:-unknown}"
+  [ -f "$CURRENT" ] && printf 'current_generation=%s\n' "$(cat "$CURRENT")"
+  [ -f "$PREPARED" ] && printf 'prepared_generation=%s\n' "$(cat "$PREPARED")"
+}
+
+case "${1:-status}" in
+  prepare) prepare_snapshot ;;
+  status) status_snapshot ;;
+  *) printf 'usage: %s {prepare|status}\n' "$0" >&2; exit 2 ;;
+esac

@@ -6,17 +6,17 @@ on:
       source_ref:
         description: 'Filesystem compiler/runtime source branch, tag, or commit SHA to package'
         required: true
-        default: 'feat/single-generation-dm-alpha4'
+        default: 'feat/alpha5-metadata-raw-shadow'
         type: string
       version_name:
         description: 'Module version name'
         required: true
-        default: '0.4.0-single-dm-alpha4'
+        default: '0.5.0-early-prepare-alpha5'
         type: string
       version_code:
         description: 'Numeric module version code'
         required: true
-        default: '10400'
+        default: '10500'
         type: string
       run_host_tests:
         description: 'Run host workspace tests before packaging'
@@ -32,6 +32,7 @@ on:
       - 'feat/unified-kernel-*'
       - 'feat/alpha3-*'
       - 'feat/alpha4-*'
+      - 'feat/alpha5-*'
   pull_request:
     paths:
       - '.github/workflows/android-module.yml'
@@ -43,9 +44,9 @@ permissions:
 
 jobs:
   package-arm64:
-    name: Build arm64 Alpha 4 module ZIP
+    name: Build arm64 Alpha 5 module ZIP
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 50
 
     steps:
       - name: Checkout packaging pipeline
@@ -61,6 +62,7 @@ jobs:
           bash pipeline/packaging/android/tests/shadow_runtime_test.sh
           bash pipeline/packaging/android/tests/shadow_flat_runtime_test.sh
           bash pipeline/packaging/android/tests/compose_runtime_test.sh
+          bash pipeline/packaging/android/tests/early_prepare_runtime_test.sh
 
       - name: Validate kernel runtime UAPI
         shell: bash
@@ -80,15 +82,15 @@ jobs:
           REQUESTED_CODE: ${{ inputs.version_code }}
         run: |
           set -euo pipefail
-          DEFAULT_SOURCE_REF='feat/single-generation-dm-alpha4'
+          DEFAULT_SOURCE_REF='feat/alpha5-metadata-raw-shadow'
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             SOURCE_REF="${REQUESTED_REF:-$DEFAULT_SOURCE_REF}"
             VERSION_NAME="$REQUESTED_VERSION"
             VERSION_CODE="$REQUESTED_CODE"
           else
             SOURCE_REF="$DEFAULT_SOURCE_REF"
-            VERSION_NAME="0.4.0-single-dm-alpha4+run${GITHUB_RUN_NUMBER}"
-            VERSION_CODE="$((10400 + GITHUB_RUN_NUMBER))"
+            VERSION_NAME="0.5.0-early-prepare-alpha5+run${GITHUB_RUN_NUMBER}"
+            VERSION_CODE="$((10500 + GITHUB_RUN_NUMBER))"
           fi
           [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]
           SAFE_VERSION="$(printf '%s' "$VERSION_NAME" | tr -c 'A-Za-z0-9._+-' '-')"
@@ -131,13 +133,14 @@ jobs:
         working-directory: source
         run: cargo test --workspace
 
-      - name: Validate source single-device flatten proof
+      - name: Validate source block proofs
         shell: bash
         run: |
           set -euo pipefail
           sudo modprobe loop || true
           sudo modprobe dm_mod || true
           bash source/tests/integration/alpha4_dm_flatten.sh
+          bash source/tests/integration/alpha5_metadata_raw_shadow.sh
 
       - name: Configure Android NDK toolchain
         id: ndk
@@ -154,6 +157,7 @@ jobs:
           echo "CC_aarch64_linux_android=$LINKER" >> "$GITHUB_ENV"
           echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
           echo "STRIP=$TOOLCHAIN/llvm-strip" >> "$GITHUB_ENV"
+          echo "LOOM_ANDROID_CC=$LINKER" >> "$GITHUB_ENV"
           echo "root=$NDK_ROOT" >> "$GITHUB_OUTPUT"
           "$LINKER" --version | head -n 1
 
@@ -161,8 +165,12 @@ jobs:
         working-directory: source
         run: |
           set -euo pipefail
-          cargo build --release -p loom-cli --bin loom --bin loom-flatten --target aarch64-linux-android
-          for binary in loom loom-flatten; do
+          cargo build --release -p loom-cli \
+            --bin loom --bin loom-flatten --bin loom-early-map \
+            --target aarch64-linux-android
+          "$LOOM_ANDROID_CC" -std=c11 -O2 -Wall -Wextra -Werror \
+            tools/loom-fiemap.c -o target/aarch64-linux-android/release/loom-fiemap
+          for binary in loom loom-flatten loom-early-map loom-fiemap; do
             "$STRIP" "target/aarch64-linux-android/release/$binary"
             file "target/aarch64-linux-android/release/$binary"
             readelf -h "target/aarch64-linux-android/release/$binary" | grep -q 'Machine:.*AArch64'
@@ -178,6 +186,8 @@ jobs:
           bash pipeline/packaging/android/build-module.sh \
             source/target/aarch64-linux-android/release/loom \
             source/target/aarch64-linux-android/release/loom-flatten \
+            source/target/aarch64-linux-android/release/loom-early-map \
+            source/target/aarch64-linux-android/release/loom-fiemap \
             "$ZIP" \
             '${{ steps.meta.outputs.version_name }}' \
             '${{ steps.meta.outputs.version_code }}' \
@@ -196,27 +206,34 @@ jobs:
           unzip -t "$ZIP" >/dev/null
           for entry in \
             module.prop \
-            bin/loom bin/loom-flatten bin/loom-sidecar bin/loom-shadow bin/loom-shadow-layered bin/loom-compose \
-            sidecar.conf shadow.conf compose.conf \
+            bin/loom bin/loom-flatten bin/loom-early-map bin/loom-fiemap \
+            bin/loom-sidecar bin/loom-shadow bin/loom-shadow-layered bin/loom-compose bin/loom-early-prepare \
+            sidecar.conf shadow.conf compose.conf early.conf \
             customize.sh post-fs-data.sh service.sh boot-completed.sh action.sh uninstall.sh \
             skip_mount build-info.txt; do
             unzip -Z1 "$ZIP" | grep -Fxq "$entry" || { echo "Missing module entry: $entry" >&2; exit 1; }
           done
           unzip -p "$ZIP" module.prop
           unzip -p "$ZIP" build-info.txt
-          for binary in loom loom-flatten; do
+          for binary in loom loom-flatten loom-early-map loom-fiemap; do
             unzip -p "$ZIP" "bin/$binary" > "/tmp/$binary-android"
             chmod 0755 "/tmp/$binary-android"
             file "/tmp/$binary-android" | grep -q 'ARM aarch64\|ARM64\|aarch64'
           done
           unzip -p "$ZIP" bin/loom-shadow | grep -q 'loom-shadow-layered'
           unzip -p "$ZIP" bin/loom-shadow | grep -q 'LOOM_STABLE_DM_DEPTH=1'
+          unzip -p "$ZIP" bin/loom-early-prepare | grep -q 'PREPARED_NOT_ACTIVE'
           unzip -p "$ZIP" boot-completed.sh | grep -q 'loom-compose.*commit'
-          unzip -p "$ZIP" compose.conf | grep -Fxq 'LOOM_COMPOSE_ENABLED=1'
-          unzip -p "$ZIP" compose.conf | grep -Fxq 'LOOM_TAKEOVER=0'
+          unzip -p "$ZIP" boot-completed.sh | grep -q 'loom-early-prepare.*prepare'
+          unzip -p "$ZIP" early.conf | grep -Fxq 'LOOM_EARLY_PREPARE_ENABLED=0'
+          unzip -p "$ZIP" early.conf | grep -Fxq 'LOOM_TAKEOVER=0'
           unzip -p "$ZIP" build-info.txt | grep -Fxq 'filesystem_fabric=origin-plus-aggregate-sparse-shadow'
           unzip -p "$ZIP" build-info.txt | grep -Fxq 'stable_composition=flattened-single-dm-linear'
           unzip -p "$ZIP" build-info.txt | grep -Fxq 'stable_dm_depth=1'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'early_snapshot_storage=metadata-ext4-raw-extents'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'early_snapshot_default=disabled'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'early_snapshot_state=prepared-not-active'
+          unzip -p "$ZIP" build-info.txt | grep -Fxq 'early_shadow_loop_required=false'
           unzip -p "$ZIP" build-info.txt | grep -Fxq 'uses_overlayfs=false'
           unzip -p "$ZIP" build-info.txt | grep -Fxq 'uses_magic_mount=false'
           unzip -p "$ZIP" build-info.txt | grep -Fxq 'first_stage_takeover=false'
@@ -241,7 +258,7 @@ jobs:
         shell: bash
         run: |
           {
-            echo '## Loom Android Alpha 4 single-DM generation artifact'
+            echo '## Loom Android Alpha 5 early snapshot prepare artifact'
             echo
             echo "- Source ref: `${{ steps.meta.outputs.source_ref }}`"
             echo "- Source SHA: `${{ steps.source.outputs.sha }}`"
@@ -249,13 +266,13 @@ jobs:
             echo "- Architecture: `arm64-v8a`"
             echo "- NDK: `${{ steps.ndk.outputs.root }}`"
             echo "- Artifact: `${{ steps.package.outputs.artifact_name }}`"
-            echo "- Compile phase: `temporary layered dm-linear`"
-            echo "- Stable phase: `one aggregate sparse shadow + one final dm-linear device`"
-            echo "- Stable DM depth: `1`"
-            echo "- Generation commit: `boot-completed`"
-            echo "- Interrupted boot: `automatic recovery hold`"
+            echo "- Stable LoomFS: `one aggregate shadow + one final dm device`"
+            echo "- Early snapshot backing: `ext4 /metadata physical extents`"
+            echo "- Early shadow loop required: `false`"
+            echo "- Early snapshot default: `disabled`"
+            echo "- Early snapshot state: `prepared-not-active`"
             echo "- OverlayFS / Magic Mount in LoomFS path: `false / false`"
             echo "- First-stage /system takeover: `false`"
             echo
-            echo '> Alpha 4 removes the persistent N-layer dm chain while retaining the proven block-level compiler. Android first-stage takeover remains a separate safety gate.'
+            echo '> Alpha 5 prepares all raw block mappings needed for a future first-stage handoff but deliberately does not activate them during boot.'
           } >> "$GITHUB_STEP_SUMMARY"
