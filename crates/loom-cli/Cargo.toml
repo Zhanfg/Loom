@@ -9,6 +9,10 @@ rust-version.workspace = true
 name = "loom"
 path = "src/main.rs"
 
+[[bin]]
+name = "loom-flatten"
+path = "src/flatten_main.rs"
+
 [dependencies]
 loom-erofs = { path = "../loom-erofs" }
 loom-ext4 = { path = "../loom-ext4" }
