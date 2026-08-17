@@ -1,0 +1,344 @@
+#!/system/bin/sh
+
+umask 077
+
+SELF_DIR=${0%/*}
+MODDIR=${LOOM_MODDIR:-${SELF_DIR%/*}}
+STATE=${LOOM_STATE_DIR:-/data/adb/loom}
+RUNTIME="$STATE/shadow-runtime"
+FLAT="$RUNTIME/flat"
+FLAT_ENV="$FLAT/flat.env"
+CONF=${LOOM_SHADOW_CONFIG:-$STATE/shadow.conf}
+PROC_MOUNTS=${LOOM_PROC_MOUNTS:-/proc/mounts}
+LOG=${LOOM_SHADOW_FLAT_LOG:-$STATE/shadow-flat.log}
+LAYERED=${LOOM_LAYERED_RUNTIME_OVERRIDE:-$MODDIR/bin/loom-shadow-layered}
+FLATTEN=${LOOM_FLATTEN_BIN_OVERRIDE:-$MODDIR/bin/loom-flatten}
+SHADOW_TOKEN=__LOOM_AGGREGATE_SHADOW__
+
+mkdir -p "$STATE"
+chmod 0700 "$STATE" 2>/dev/null || true
+
+log() {
+  printf '[loom-shadow-flat] %s\n' "$*" >>"$LOG"
+}
+
+set_status() {
+  printf '%s\n' "$1" >"$STATE/status"
+  log "status=$1"
+}
+
+find_cmd() {
+  env_name=$1
+  fallback=$2
+  eval "override=\${$env_name:-}"
+  if [ -n "$override" ]; then
+    printf '%s\n' "$override"
+    return 0
+  fi
+  command -v "$fallback" 2>/dev/null || true
+}
+
+resolve_tools() {
+  LOSETUP=$(find_cmd LOOM_LOSETUP_BIN losetup)
+  DMCTL=$(find_cmd LOOM_DMCTL_BIN dmctl)
+  DMSETUP=$(find_cmd LOOM_DMSETUP_BIN dmsetup)
+  MOUNT_BIN=$(find_cmd LOOM_MOUNT_BIN mount)
+  UMOUNT_BIN=$(find_cmd LOOM_UMOUNT_BIN umount)
+  [ -n "$LOSETUP" ] || return 1
+  [ -n "$DMCTL" ] || [ -n "$DMSETUP" ] || return 1
+  [ -n "$MOUNT_BIN" ] || return 1
+  [ -n "$UMOUNT_BIN" ] || return 1
+  return 0
+}
+
+is_device() {
+  [ -b "$1" ] && return 0
+  [ "${LOOM_TEST_ALLOW_REGULAR:-0}" = 1 ] && [ -e "$1" ] && return 0
+  return 1
+}
+
+read_env_value() {
+  key=$1
+  file=$2
+  [ -f "$file" ] || return 1
+  sed -n "s/^${key}=//p" "$file" | tail -n 1
+}
+
+config_value() {
+  key=$1
+  [ -f "$CONF" ] || return 1
+  sed -n "s/^${key}=//p" "$CONF" | tail -n 1
+}
+
+is_mounted_at() {
+  mountpoint=$1
+  [ -n "$mountpoint" ] || return 1
+  [ -f "$PROC_MOUNTS" ] || return 1
+  grep -F " $mountpoint " "$PROC_MOUNTS" >/dev/null 2>&1
+}
+
+dm_delete_name() {
+  name=$1
+  [ -n "$name" ] || return 0
+  if [ -n "${DMCTL:-}" ]; then
+    "$DMCTL" delete "$name" >/dev/null 2>&1 || true
+  elif [ -n "${DMSETUP:-}" ]; then
+    "$DMSETUP" remove "$name" >/dev/null 2>&1 || true
+  fi
+}
+
+dm_create_from_table() {
+  name=$1
+  table=$2
+  DM_PATH=
+  if [ -n "$DMCTL" ]; then
+    set -- create "$name" -ro
+    while read -r start count kind device source_start extra; do
+      [ -n "$start" ] || continue
+      [ "$kind" = linear ] || return 1
+      [ -z "$extra" ] || return 1
+      case "$start$count$source_start" in *[!0-9]*) return 1 ;; esac
+      set -- "$@" linear "$start" "$count" "$device" "$source_start"
+    done <"$table"
+    "$DMCTL" "$@" >/dev/null || return 1
+    DM_PATH=$($DMCTL getpath "$name" 2>/dev/null || true)
+  else
+    "$DMSETUP" create "$name" --readonly --table "$(cat "$table")" >/dev/null || return 1
+    if [ -e "/dev/block/mapper/$name" ]; then
+      DM_PATH="/dev/block/mapper/$name"
+    elif [ -e "/dev/mapper/$name" ]; then
+      DM_PATH="/dev/mapper/$name"
+    fi
+  fi
+  [ -n "$DM_PATH" ] || return 1
+  is_device "$DM_PATH" || return 1
+  return 0
+}
+
+cleanup_flat_only() {
+  resolve_tools || return 1
+  mountpoint=$(read_env_value LOOM_MOUNTPOINT "$FLAT_ENV" 2>/dev/null || true)
+  if [ -n "$mountpoint" ] && is_mounted_at "$mountpoint"; then
+    "$UMOUNT_BIN" "$mountpoint" >/dev/null 2>&1 || "$UMOUNT_BIN" -l "$mountpoint" >/dev/null 2>&1 || true
+  fi
+  dm_name=$(read_env_value LOOM_FLAT_DM_NAME "$FLAT_ENV" 2>/dev/null || true)
+  [ -n "$dm_name" ] && dm_delete_name "$dm_name"
+  loop=$(read_env_value LOOM_FLAT_LOOP "$FLAT_ENV" 2>/dev/null || true)
+  if [ -n "$loop" ]; then
+    "$LOSETUP" -d "$loop" >/dev/null 2>&1 || true
+  fi
+  rm -rf "$FLAT"
+  return 0
+}
+
+cleanup_intermediate_layers() {
+  count=$1
+  i=$count
+  while [ "$i" -gt 0 ]; do
+    layer="$RUNTIME/layers/$i"
+    if [ -f "$layer/dm_name" ]; then
+      dm_delete_name "$(cat "$layer/dm_name")"
+    fi
+    if [ -f "$layer/loop" ]; then
+      loop=$(cat "$layer/loop")
+      "$LOSETUP" -d "$loop" >/dev/null 2>&1 || true
+    fi
+    i=$((i - 1))
+  done
+}
+
+build_manifest() {
+  origin=$1
+  count=$2
+  manifest=$3
+  : >"$manifest"
+  current=$origin
+  materialized=0
+  i=1
+  while [ "$i" -le "$count" ]; do
+    layer="$RUNTIME/layers/$i"
+    if [ -f "$layer/table" ] && [ -f "$layer/shadow.pack" ] && [ -f "$layer/loop" ] && [ -f "$layer/dm_path" ]; then
+      loop=$(cat "$layer/loop")
+      dm_path=$(cat "$layer/dm_path")
+      tab=$(printf '\t')
+      case "$layer/table$current$loop$layer/shadow.pack" in *"$tab"*) return 1 ;; esac
+      printf '%s\t%s\t%s\t%s\n' "$layer/table" "$current" "$loop" "$layer/shadow.pack" >>"$manifest"
+      current=$dm_path
+      materialized=$((materialized + 1))
+    fi
+    i=$((i + 1))
+  done
+  [ "$materialized" -gt 0 ] || return 1
+  MANIFEST_FINAL_ORIGIN=$current
+  MANIFEST_LAYER_COUNT=$materialized
+  return 0
+}
+
+mount_flat() {
+  device=$1
+  mountpoint=$2
+  mkdir -p "$mountpoint"
+  chmod 0700 "$mountpoint" 2>/dev/null || true
+  "$MOUNT_BIN" -t erofs -o ro,nosuid,nodev,noexec "$device" "$mountpoint" || return 1
+  is_mounted_at "$mountpoint"
+}
+
+flatten_active_runtime() {
+  [ -x "$FLATTEN" ] || { set_status SHADOW_FLATTEN_RUNTIME_MISSING; log "missing $FLATTEN"; return 1; }
+  resolve_tools || { set_status SHADOW_FLATTEN_PREFLIGHT_FAILED; log 'flatten tools unavailable'; return 1; }
+
+  runtime_env="$RUNTIME/runtime.env"
+  [ -f "$runtime_env" ] || { set_status SHADOW_FLATTEN_STATE_INVALID; return 1; }
+  origin=$(read_env_value LOOM_ORIGIN "$runtime_env" || true)
+  effective=$(read_env_value LOOM_EFFECTIVE_DEVICE "$runtime_env" || true)
+  mountpoint=$(read_env_value LOOM_MOUNTPOINT "$runtime_env" || true)
+  count=$(read_env_value LOOM_LAYER_COUNT "$runtime_env" || printf '0')
+  case "$count" in ''|*[!0-9]*) set_status SHADOW_FLATTEN_STATE_INVALID; return 1 ;; esac
+  [ -n "$origin" ] && [ -n "$effective" ] && [ -n "$mountpoint" ] && [ "$count" -gt 0 ] || {
+    set_status SHADOW_FLATTEN_STATE_INVALID
+    return 1
+  }
+
+  rm -rf "$FLAT"
+  mkdir -p "$FLAT"
+  manifest="$FLAT/layers.tsv"
+  build_manifest "$origin" "$count" "$manifest" || {
+    set_status SHADOW_FLATTEN_MANIFEST_FAILED
+    return 1
+  }
+  [ "$MANIFEST_FINAL_ORIGIN" = "$effective" ] || {
+    set_status SHADOW_FLATTEN_STATE_INVALID
+    log "manifest final origin $MANIFEST_FINAL_ORIGIN != layered effective $effective"
+    return 1
+  }
+
+  aggregate="$FLAT/shadow.pack"
+  raw_table="$FLAT/table.raw"
+  table="$FLAT/table"
+  if ! "$FLATTEN" "$manifest" "$aggregate" "$origin" "$SHADOW_TOKEN" "$raw_table" >>"$LOG" 2>&1; then
+    set_status SHADOW_FLATTEN_FAILED
+    return 1
+  fi
+  [ -s "$aggregate" ] && [ -s "$raw_table" ] || {
+    set_status SHADOW_FLATTEN_FAILED
+    return 1
+  }
+
+  loop=$($LOSETUP -f -r --show "$aggregate" 2>/dev/null || true)
+  [ -n "$loop" ] && is_device "$loop" || {
+    set_status SHADOW_FLATTEN_LOOP_FAILED
+    return 1
+  }
+  cat >"$FLAT_ENV" <<EOF
+LOOM_FLAT_STATE=LOOP_ATTACHED
+LOOM_FLAT_LOOP=$loop
+LOOM_MOUNTPOINT=$mountpoint
+EOF
+
+  sed "s|$SHADOW_TOKEN|$loop|g" "$raw_table" >"$table"
+  grep -q "$SHADOW_TOKEN" "$table" && {
+    cleanup_flat_only || true
+    set_status SHADOW_FLATTEN_TABLE_FAILED
+    return 1
+  }
+
+  prefix=$(config_value LOOM_DM_PREFIX 2>/dev/null || printf 'loom-shadow-system')
+  flat_name="${prefix}-flat"
+  dm_delete_name "$flat_name"
+  if ! dm_create_from_table "$flat_name" "$table"; then
+    cleanup_flat_only || true
+    set_status SHADOW_FLATTEN_DM_FAILED
+    return 1
+  fi
+  flat_device=$DM_PATH
+  cat >"$FLAT_ENV" <<EOF
+LOOM_FLAT_STATE=DM_CREATED
+LOOM_FLAT_LOOP=$loop
+LOOM_FLAT_DM_NAME=$flat_name
+LOOM_FLAT_DEVICE=$flat_device
+LOOM_MOUNTPOINT=$mountpoint
+EOF
+
+  if is_mounted_at "$mountpoint"; then
+    "$UMOUNT_BIN" "$mountpoint" >/dev/null 2>&1 || "$UMOUNT_BIN" -l "$mountpoint" >/dev/null 2>&1 || {
+      cleanup_flat_only || true
+      set_status SHADOW_FLATTEN_UNMOUNT_FAILED
+      return 1
+    }
+  fi
+
+  if ! mount_flat "$flat_device" "$mountpoint"; then
+    cleanup_flat_only || true
+    set_status SHADOW_FLATTEN_MOUNT_FAILED
+    return 1
+  fi
+
+  # The flat device references only the authoritative origin and aggregate loop,
+  # so the transient compilation graph is no longer needed after this point.
+  cleanup_intermediate_layers "$count"
+
+  cat >"$FLAT_ENV" <<EOF
+LOOM_FLAT_STATE=ACTIVE
+LOOM_FLAT_LOOP=$loop
+LOOM_FLAT_DM_NAME=$flat_name
+LOOM_FLAT_DEVICE=$flat_device
+LOOM_MOUNTPOINT=$mountpoint
+LOOM_TRANSIENT_LAYER_COUNT=$MANIFEST_LAYER_COUNT
+LOOM_STABLE_DM_DEPTH=1
+EOF
+  cat >"$runtime_env" <<EOF
+LOOM_MODE=sparse-shadow-flat-generation
+LOOM_ORIGIN=$origin
+LOOM_EFFECTIVE_DEVICE=$flat_device
+LOOM_MOUNTPOINT=$mountpoint
+LOOM_LAYER_COUNT=$MANIFEST_LAYER_COUNT
+LOOM_TRANSIENT_LAYER_COUNT=$MANIFEST_LAYER_COUNT
+LOOM_STABLE_DM_DEPTH=1
+LOOM_TAKEOVER=0
+EOF
+  set_status SHADOW_ACTIVE_FLAT
+  log "flatten PASS layers=$MANIFEST_LAYER_COUNT effective=$flat_device stable_dm_depth=1"
+  return 0
+}
+
+activate_command() {
+  cleanup_flat_only >/dev/null 2>&1 || true
+  if ! "$LAYERED" activate; then
+    return 1
+  fi
+  if flatten_active_runtime; then
+    return 0
+  fi
+  # Fail closed: a failed single-device commit does not leave the old layered
+  # validation mount active as a silent fallback.
+  cleanup_flat_only >/dev/null 2>&1 || true
+  "$LAYERED" cleanup >/dev/null 2>&1 || true
+  return 1
+}
+
+cleanup_command() {
+  cleanup_flat_only >/dev/null 2>&1 || true
+  "$LAYERED" cleanup
+}
+
+preflight_command() {
+  [ -x "$LAYERED" ] || { set_status SHADOW_LAYERED_RUNTIME_MISSING; return 1; }
+  [ -x "$FLATTEN" ] || { set_status SHADOW_FLATTEN_RUNTIME_MISSING; return 1; }
+  "$LAYERED" preflight
+}
+
+status_command() {
+  "$LAYERED" status 2>/dev/null || true
+  if [ -f "$FLAT_ENV" ]; then
+    printf '\n== flat generation ==\n'
+    cat "$FLAT_ENV"
+  fi
+}
+
+case "${1:-status}" in
+  preflight) preflight_command ;;
+  activate) activate_command ;;
+  cleanup) cleanup_command ;;
+  status) status_command ;;
+  *) printf 'usage: %s {preflight|activate|cleanup|status}\n' "$0" >&2; exit 2 ;;
+esac
