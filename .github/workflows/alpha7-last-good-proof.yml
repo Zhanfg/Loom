@@ -1,0 +1,36 @@
+name: Alpha 7 last-good handoff proof
+
+on:
+  push:
+    branches:
+      - 'feat/alpha7-*'
+  pull_request:
+    paths:
+      - 'tools/loom-early-state.c'
+      - 'tools/loom-early-table.c'
+      - 'tests/integration/alpha7_last_good_handoff_proof.sh'
+      - '.github/workflows/alpha7-last-good-proof.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  last-good:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Compile first-stage helpers
+        run: |
+          set -euo pipefail
+          gcc -std=c11 -O2 -Wall -Wextra -Werror tools/loom-early-state.c -o /tmp/loom-early-state
+          gcc -std=c11 -O2 -Wall -Wextra -Werror tools/loom-early-table.c -o /tmp/loom-early-table
+
+      - name: Prepare device-mapper runtime
+        run: |
+          sudo modprobe loop || true
+          sudo modprobe dm_mod || true
+
+      - name: Prove failed upgrade returns a usable last-good device
+        run: bash tests/integration/alpha7_last_good_handoff_proof.sh
