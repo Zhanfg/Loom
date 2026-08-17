@@ -3,6 +3,7 @@
 use std::env;
 use std::error::Error;
 use std::fmt;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -209,8 +210,7 @@ impl FlatMap {
                     .find(|extent| {
                         extent.logical_start <= cursor
                             && checked_add(extent.logical_start, extent.sector_count)
-                                .map(|end| cursor < end)
-                                .unwrap_or(false)
+                                .is_ok_and(|end| cursor < end)
                     })
                     .ok_or(FlattenError::BaseCoverageGap(cursor))?;
                 let base_end = checked_add(base_extent.logical_start, base_extent.sector_count)?;
@@ -302,10 +302,12 @@ impl FlatMap {
                 Source::Origin => origin_device,
                 Source::Shadow => shadow_device,
             };
-            output.push_str(&format!(
-                "{} {} linear {} {}\n",
+            writeln!(
+                &mut output,
+                "{} {} linear {} {}",
                 extent.logical_start, extent.sector_count, device, extent.source_start
-            ));
+            )
+            .map_err(|_| FlattenError::Formatting)?;
         }
         Ok(output)
     }
@@ -483,6 +485,7 @@ enum FlattenError {
     WrongFinalSize { expected: u64, actual: u64 },
     InvalidDeviceName(String),
     ArithmeticOverflow,
+    Formatting,
 }
 
 impl fmt::Display for FlattenError {
@@ -525,6 +528,7 @@ impl fmt::Display for FlattenError {
                 write!(f, "invalid device-mapper backing device name {device:?}")
             }
             Self::ArithmeticOverflow => write!(f, "flattening arithmetic overflow"),
+            Self::Formatting => write!(f, "failed to format flattened dm-linear table"),
         }
     }
 }
