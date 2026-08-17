@@ -1,0 +1,31 @@
+name: Alpha 8 boot attestation proof
+
+on:
+  push:
+    branches:
+      - 'feat/alpha8-boot-attestation-v2'
+  pull_request:
+    paths:
+      - 'tools/loom-early-state.c'
+      - 'tools/loom-early-attest.c'
+      - 'tests/integration/alpha8_boot_attestation.sh'
+      - '.github/workflows/alpha8-boot-attestation.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  attestation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Strict first-stage helper builds
+        run: |
+          set -euo pipefail
+          gcc -std=c11 -O2 -Wall -Wextra -Werror tools/loom-early-state.c -o /tmp/loom-early-state
+          gcc -std=c11 -O2 -Wall -Wextra -Werror tools/loom-early-attest.c -o /tmp/loom-early-attest
+
+      - name: Boot-scoped activation attestation proof
+        run: bash tests/integration/alpha8_boot_attestation.sh
