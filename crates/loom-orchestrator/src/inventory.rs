@@ -1,9 +1,10 @@
-use crate::providers::{kasumi_provider, nomount_provider, overlay_provider, ProviderDescriptor};
+use crate::providers::{kasumi_provider, magic_provider, nomount_provider, overlay_provider, ProviderDescriptor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuntimeSignals {
     pub overlayfs: bool,
     pub nomount: bool,
+    pub magic: bool,
     pub kasumi: bool,
 }
 
@@ -19,6 +20,7 @@ impl ProviderInventory {
             providers: vec![
                 overlay_provider(signals.overlayfs),
                 nomount_provider(signals.nomount),
+                magic_provider(signals.magic),
                 kasumi_provider(signals.kasumi),
             ],
         }
@@ -40,6 +42,7 @@ mod tests {
         let inventory = ProviderInventory::from_signals(RuntimeSignals {
             overlayfs: true,
             nomount: true,
+            magic: true,
             kasumi: true,
         });
         let kasumi = inventory
