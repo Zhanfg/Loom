@@ -187,7 +187,11 @@ mod tests {
         };
 
         assert!(matches!(
-            plan_requests(&providers, std::slice::from_ref(&request), PlanPolicy::default()),
+            plan_requests(
+                &providers,
+                std::slice::from_ref(&request),
+                PlanPolicy::default()
+            ),
             Err(PlanError::NoProvider { .. })
         ));
 
