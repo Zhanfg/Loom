@@ -58,8 +58,8 @@ const fn backend_rank(kind: BackendKind, req: Requirements) -> u8 {
 
     match kind {
         BackendKind::Overlay => 0,
-        BackendKind::NoMount => 1,
-        BackendKind::Magic => 2,
+        BackendKind::Magic => 1,
+        BackendKind::NoMount => 2,
         BackendKind::Kasumi => 3,
     }
 }
@@ -124,12 +124,13 @@ pub fn plan_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::providers::{kasumi_provider, nomount_provider, overlay_provider};
+    use crate::providers::{kasumi_provider, magic_provider, nomount_provider, overlay_provider};
 
     #[test]
     fn ordinary_path_prefers_overlay() {
         let providers = [
             overlay_provider(true),
+            magic_provider(true),
             nomount_provider(true),
             kasumi_provider(true),
         ];
@@ -151,6 +152,7 @@ mod tests {
     fn mountless_path_prefers_nomount() {
         let providers = [
             overlay_provider(true),
+            magic_provider(true),
             nomount_provider(true),
             kasumi_provider(true),
         ];
@@ -168,10 +170,34 @@ mod tests {
         assert_eq!(plan[0].backend, BackendKind::NoMount);
     }
 
+
+    #[test]
+    fn ordinary_path_falls_back_to_magic_before_nomount() {
+        let providers = [
+            overlay_provider(false),
+            magic_provider(true),
+            nomount_provider(true),
+            kasumi_provider(false),
+        ];
+        let request = PlanRequest {
+            path: "/system/etc/hosts".into(),
+            requirements: Requirements {
+                redirect_file: true,
+                selinux_fidelity: true,
+                ..Requirements::default()
+            },
+            preferred_backend: None,
+        };
+
+        let plan = plan_requests(&providers, &[request], PlanPolicy::default()).unwrap();
+        assert_eq!(plan[0].backend, BackendKind::Magic);
+    }
+
     #[test]
     fn kasumi_is_not_selected_by_default() {
         let providers = [
             overlay_provider(false),
+            magic_provider(false),
             nomount_provider(false),
             kasumi_provider(true),
         ];
