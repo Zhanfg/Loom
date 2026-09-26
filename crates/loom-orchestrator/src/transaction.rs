@@ -69,8 +69,8 @@ pub fn execute_atomic<E: Executor>(
         }
     }
 
-    for token in &tokens {
-        if let Err(cause) = executor.verify(token) {
+    for index in 0..tokens.len() {
+        if let Err(cause) = executor.verify(&tokens[index]) {
             let rollback_failures = rollback_all(executor, tokens);
             return Err(ExecutionError {
                 stage: "verify",
