@@ -93,6 +93,11 @@ fn choose_provider<'a>(
     candidates.into_iter().next()
 }
 
+/// Builds a provider assignment for every requested path.
+///
+/// # Errors
+/// Returns [`PlanError::NoProvider`] when no available provider allowed by the
+/// current stability policy satisfies a path's capability requirements.
 pub fn plan_requests(
     providers: &[ProviderDescriptor],
     requests: &[PlanRequest],
@@ -182,7 +187,7 @@ mod tests {
         };
 
         assert!(matches!(
-            plan_requests(&providers, &[request.clone()], PlanPolicy::default()),
+            plan_requests(&providers, std::slice::from_ref(&request), PlanPolicy::default()),
             Err(PlanError::NoProvider { .. })
         ));
 
