@@ -71,7 +71,7 @@ impl NomountRule {
     /// Creates a file or directory redirect rule.
     ///
     /// # Errors
-    /// Returns NomountError when either path is invalid or too large for v20.
+    /// Returns `NomountError` when either path is invalid or too large for v20.
     pub fn redirect(
         virtual_path: impl Into<String>,
         real_path: impl Into<String>,
@@ -91,7 +91,7 @@ impl NomountRule {
     /// Creates a whiteout rule.
     ///
     /// # Errors
-    /// Returns NomountError when the virtual path is invalid.
+    /// Returns `NomountError` when the virtual path is invalid.
     pub fn whiteout(virtual_path: impl Into<String>, uid: u32) -> Result<Self, NomountError> {
         let rule = Self {
             flags: FLAG_WHITEOUT,
@@ -106,7 +106,7 @@ impl NomountRule {
     /// Creates a source-less virtual directory rule.
     ///
     /// # Errors
-    /// Returns NomountError when the virtual path is invalid.
+    /// Returns `NomountError` when the virtual path is invalid.
     pub fn virtual_dir(virtual_path: impl Into<String>, uid: u32) -> Result<Self, NomountError> {
         let rule = Self {
             flags: FLAG_IS_DIR | FLAG_VIRTUAL_DIR,
@@ -118,10 +118,10 @@ impl NomountRule {
         Ok(rule)
     }
 
-    /// Validates one rule against the NoMount v20 wire format.
+    /// Validates one rule against the `NoMount` v20 wire format.
     ///
     /// # Errors
-    /// Returns NomountError for invalid paths, flags, or oversized records.
+    /// Returns `NomountError` for invalid paths, flags, or oversized records.
     pub fn validate(&self) -> Result<(), NomountError> {
         validate_absolute_path(&self.virtual_path, "virtual path")?;
         if self.flags & FLAG_WHITEOUT != 0 || self.flags & FLAG_VIRTUAL_DIR != 0 {
@@ -189,10 +189,10 @@ pub struct AppliedRule {
 }
 
 pub trait NomountTransport {
-    /// Exchanges one complete NoMount page.
+    /// Exchanges one complete `NoMount` page.
     ///
     /// # Errors
-    /// Returns NomountError when delivery or response retrieval fails.
+    /// Returns `NomountError` when delivery or response retrieval fails.
     fn exchange(&mut self, request: &[u8]) -> Result<Vec<u8>, NomountError>;
 }
 
@@ -204,7 +204,7 @@ impl SystemNomountTransport {
     /// Creates the Linux/Android keyring transport.
     ///
     /// # Errors
-    /// Returns NomountError when the payload page cannot be allocated.
+    /// Returns `NomountError` when the payload page cannot be allocated.
     pub fn new() -> Result<Self, NomountError> {
         Ok(Self {
             page: PageBuffer::new(PAYLOAD_LEN)?,
@@ -241,10 +241,10 @@ impl<T: NomountTransport> NomountClient<T> {
         self.transport
     }
 
-    /// Reads the kernel-side NoMount protocol version.
+    /// Reads the kernel-side `NoMount` protocol version.
     ///
     /// # Errors
-    /// Returns NomountError for transport or malformed-response failures.
+    /// Returns `NomountError` for transport or malformed-response failures.
     pub fn version(&mut self) -> Result<String, NomountError> {
         let request = build_payload(Command::GetVersion, 0, &[])?;
         parse_version(&self.transport.exchange(&request)?)
@@ -253,7 +253,7 @@ impl<T: NomountTransport> NomountClient<T> {
     /// Adds one or more path rules.
     ///
     /// # Errors
-    /// Returns NomountError when encoding, delivery, or kernel consumption fails.
+    /// Returns `NomountError` when encoding, delivery, or kernel consumption fails.
     pub fn add_rules(&mut self, rules: &[NomountRule]) -> Result<(), NomountError> {
         for payload in build_add_rule_payloads(rules)? {
             ensure_consumed(&self.transport.exchange(&payload)?)?;
@@ -264,7 +264,7 @@ impl<T: NomountTransport> NomountClient<T> {
     /// Deletes exact virtual paths. Missing rules are idempotent.
     ///
     /// # Errors
-    /// Returns NomountError for transport failures or malformed responses.
+    /// Returns `NomountError` for transport failures or malformed responses.
     pub fn remove_rules(&mut self, rules: &[NomountRule]) -> Result<(), NomountError> {
         for payload in build_del_rule_payloads(rules)? {
             let response = self.transport.exchange(&payload)?;
@@ -277,7 +277,7 @@ impl<T: NomountTransport> NomountClient<T> {
     /// Adds one isolated UID. Existing entries are idempotent.
     ///
     /// # Errors
-    /// Returns NomountError for transport or kernel failures.
+    /// Returns `NomountError` for transport or kernel failures.
     pub fn add_uid(&mut self, uid: u32) -> Result<(), NomountError> {
         let request = build_payload(Command::AddUid, uid, &[])?;
         let response = self.transport.exchange(&request)?;
@@ -287,17 +287,17 @@ impl<T: NomountTransport> NomountClient<T> {
     /// Removes one isolated UID. Missing entries are idempotent.
     ///
     /// # Errors
-    /// Returns NomountError for transport or kernel failures.
+    /// Returns `NomountError` for transport or kernel failures.
     pub fn remove_uid(&mut self, uid: u32) -> Result<(), NomountError> {
         let request = build_payload(Command::DelUid, uid, &[])?;
         let response = self.transport.exchange(&request)?;
         ensure_status_allowing(&response, &[KERNEL_ENOENT])
     }
 
-    /// Lists every installed rule through GET_LIST pagination.
+    /// Lists every installed rule through `GET_LIST` pagination.
     ///
     /// # Errors
-    /// Returns NomountError for transport, pagination, or decoding failures.
+    /// Returns `NomountError` for transport, pagination, or decoding failures.
     pub fn list_rules(&mut self) -> Result<Vec<ListedRule>, NomountError> {
         let mut cursor = 0_u32;
         let mut all = Vec::new();
@@ -318,10 +318,10 @@ impl<T: NomountTransport> NomountClient<T> {
         }
     }
 
-    /// Lists every isolated UID through GET_UIDS pagination.
+    /// Lists every isolated UID through `GET_UIDS` pagination.
     ///
     /// # Errors
-    /// Returns NomountError for transport, pagination, or decoding failures.
+    /// Returns `NomountError` for transport, pagination, or decoding failures.
     pub fn list_uids(&mut self) -> Result<Vec<u32>, NomountError> {
         let mut cursor = 0_u32;
         let mut all = Vec::new();
@@ -345,16 +345,16 @@ impl<T: NomountTransport> NomountClient<T> {
     /// Applies one rule and returns a rollback token.
     ///
     /// # Errors
-    /// Returns NomountError when the rule cannot be installed.
+    /// Returns `NomountError` when the rule cannot be installed.
     pub fn apply(&mut self, rule: &NomountRule) -> Result<AppliedRule, NomountError> {
         self.add_rules(std::slice::from_ref(rule))?;
         Ok(AppliedRule { rule: rule.clone() })
     }
 
-    /// Verifies one applied rule through GET_LIST.
+    /// Verifies one applied rule through `GET_LIST`.
     ///
     /// # Errors
-    /// Returns NomountError if read-back does not exactly match the expected rule.
+    /// Returns `NomountError` if read-back does not exactly match the expected rule.
     pub fn verify(&mut self, token: &AppliedRule) -> Result<(), NomountError> {
         let expected = &token.rule;
         if self.list_rules()?.iter().any(|rule| {
@@ -374,7 +374,7 @@ impl<T: NomountTransport> NomountClient<T> {
     /// Rolls back one applied rule.
     ///
     /// # Errors
-    /// Returns NomountError when the kernel cannot remove the rule.
+    /// Returns `NomountError` when the kernel cannot remove the rule.
     pub fn rollback(&mut self, token: AppliedRule) -> Result<(), NomountError> {
         self.remove_rules(&[token.rule])
     }
