@@ -353,8 +353,7 @@ mod tests {
     #[test]
     fn adapter_requires_new_mount_id() {
         let runtime = FakeRuntime {
-            mountinfo_before:
-                "20 1 0:1 / /system/etc/hosts rw - ext4 /dev/a rw\n".to_owned(),
+            mountinfo_before: "20 1 0:1 / /system/etc/hosts rw - ext4 /dev/a rw\n".to_owned(),
             mountinfo_after: concat!(
                 "20 1 0:1 / /system/etc/hosts rw - ext4 /dev/a rw\n",
                 "31 20 0:1 / /system/etc/hosts ro - ext4 /dev/a ro\n"
