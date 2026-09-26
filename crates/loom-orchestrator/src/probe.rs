@@ -29,13 +29,9 @@ impl RuntimeProbe {
             }
         };
 
-        let magic = [
-            "/system/bin/mount",
-            "/bin/mount",
-            "/usr/bin/mount",
-        ]
-        .iter()
-        .any(|candidate| Path::new(candidate).is_file());
+        let magic = ["/system/bin/mount", "/bin/mount", "/usr/bin/mount"]
+            .iter()
+            .any(|candidate| Path::new(candidate).is_file());
         if !magic {
             notes.push("Magic Mount helper was not found at a known absolute path".to_owned());
         }
