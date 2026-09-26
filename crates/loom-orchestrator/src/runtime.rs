@@ -228,10 +228,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
         }
     }
 
-    fn rollback_all(
-        &mut self,
-        applied: Vec<AppliedEntry<O::Token, N::Token>>,
-    ) -> Vec<String> {
+    fn rollback_all(&mut self, applied: Vec<AppliedEntry<O::Token, N::Token>>) -> Vec<String> {
         let mut failures = Vec::new();
         for entry in applied.into_iter().rev() {
             let result = match entry.token {
@@ -311,7 +308,10 @@ mod tests {
     fn overlay_action(target: &str) -> RuntimeAction {
         RuntimeAction::Overlay(OverlaySpec {
             target: PathBuf::from(target),
-            lowerdirs: vec![PathBuf::from("/data/adb/modules/demo/system"), PathBuf::from(target)],
+            lowerdirs: vec![
+                PathBuf::from("/data/adb/modules/demo/system"),
+                PathBuf::from(target),
+            ],
             upperdir: None,
             workdir: None,
             read_only: true,
