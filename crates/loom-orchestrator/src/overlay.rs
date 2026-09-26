@@ -48,10 +48,10 @@ pub struct OverlaySpec {
 }
 
 impl OverlaySpec {
-    /// Validates an OverlayFS mount specification.
+    /// Validates an `OverlayFS` mount specification.
     ///
     /// # Errors
-    /// Returns OverlayError when required paths are absent, relative, unsafe for
+    /// Returns `OverlayError` when required paths are absent, relative, unsafe for
     /// the option grammar, or upper/work are not supplied as a pair.
     pub fn validate(&self) -> Result<(), OverlayError> {
         validate_path(&self.target, "target")?;
@@ -84,10 +84,10 @@ impl OverlaySpec {
         Ok(())
     }
 
-    /// Builds the Linux OverlayFS data option string.
+    /// Builds the Linux `OverlayFS` data option string.
     ///
     /// # Errors
-    /// Returns OverlayError when the specification is invalid or a path is not
+    /// Returns `OverlayError` when the specification is invalid or a path is not
     /// representable in the conservative option grammar.
     pub fn options(&self) -> Result<String, OverlayError> {
         self.validate()?;
@@ -116,22 +116,22 @@ pub struct OverlayToken {
 }
 
 pub trait OverlayRuntime {
-    /// Mounts one OverlayFS specification.
+    /// Mounts one `OverlayFS` specification.
     ///
     /// # Errors
-    /// Returns OverlayError when the mount cannot be created.
+    /// Returns `OverlayError` when the mount cannot be created.
     fn mount(&mut self, spec: &OverlaySpec) -> Result<(), OverlayError>;
 
     /// Returns the current process mountinfo view.
     ///
     /// # Errors
-    /// Returns OverlayError when mountinfo cannot be read.
+    /// Returns `OverlayError` when mountinfo cannot be read.
     fn mountinfo(&mut self) -> Result<String, OverlayError>;
 
     /// Removes one mount target.
     ///
     /// # Errors
-    /// Returns OverlayError when both normal and lazy unmount fail.
+    /// Returns `OverlayError` when both normal and lazy unmount fail.
     fn unmount(&mut self, target: &Path) -> Result<(), OverlayError>;
 }
 
@@ -244,10 +244,10 @@ impl<R: OverlayRuntime> OverlayAdapter<R> {
         self.runtime
     }
 
-    /// Applies one OverlayFS mount and returns a rollback token.
+    /// Applies one `OverlayFS` mount and returns a rollback token.
     ///
     /// # Errors
-    /// Returns OverlayError when the specification is invalid or mount fails.
+    /// Returns `OverlayError` when the specification is invalid or mount fails.
     pub fn apply(&mut self, spec: &OverlaySpec) -> Result<OverlayToken, OverlayError> {
         spec.validate()?;
         self.runtime.mount(spec)?;
@@ -256,10 +256,10 @@ impl<R: OverlayRuntime> OverlayAdapter<R> {
         })
     }
 
-    /// Verifies the applied target is currently backed by OverlayFS.
+    /// Verifies the applied target is currently backed by `OverlayFS`.
     ///
     /// # Errors
-    /// Returns OverlayError when mountinfo cannot be read or the target is not
+    /// Returns `OverlayError` when mountinfo cannot be read or the target is not
     /// present as an overlay mount.
     pub fn verify(&mut self, token: &OverlayToken) -> Result<(), OverlayError> {
         let mountinfo = self.runtime.mountinfo()?;
@@ -272,10 +272,10 @@ impl<R: OverlayRuntime> OverlayAdapter<R> {
         )))
     }
 
-    /// Rolls back one applied OverlayFS mount.
+    /// Rolls back one applied `OverlayFS` mount.
     ///
     /// # Errors
-    /// Returns OverlayError when the mount cannot be removed.
+    /// Returns `OverlayError` when the mount cannot be removed.
     pub fn rollback(&mut self, token: OverlayToken) -> Result<(), OverlayError> {
         self.runtime.unmount(&token.target)
     }
