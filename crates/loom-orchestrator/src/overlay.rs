@@ -143,16 +143,14 @@ pub struct CommandOverlayRuntime {
 
 impl Default for CommandOverlayRuntime {
     fn default() -> Self {
-        let android_mount = PathBuf::from("/system/bin/mount");
-        let android_umount = PathBuf::from("/system/bin/umount");
         Self {
-            mount_program: if android_mount.exists() {
-                android_mount
+            mount_program: if Path::new("/system/bin/mount").exists() {
+                PathBuf::from("/system/bin/mount")
             } else {
                 PathBuf::from("mount")
             },
-            umount_program: if android_umount.exists() {
-                android_umount
+            umount_program: if Path::new("/system/bin/umount").exists() {
+                PathBuf::from("/system/bin/umount")
             } else {
                 PathBuf::from("umount")
             },
@@ -276,7 +274,7 @@ impl<R: OverlayRuntime> OverlayAdapter<R> {
     ///
     /// # Errors
     /// Returns `OverlayError` when the mount cannot be removed.
-    pub fn rollback(&mut self, token: OverlayToken) -> Result<(), OverlayError> {
+    pub fn rollback(&mut self, token: &OverlayToken) -> Result<(), OverlayError> {
         self.runtime.unmount(&token.target)
     }
 }
@@ -396,7 +394,7 @@ mod tests {
         let mut adapter = OverlayAdapter::new(runtime);
         let token = adapter.apply(&spec()).unwrap();
         adapter.verify(&token).unwrap();
-        adapter.rollback(token).unwrap();
+        adapter.rollback(&token).unwrap();
         let runtime = adapter.into_inner();
         assert_eq!(runtime.mounted, vec![PathBuf::from("/system")]);
         assert_eq!(runtime.unmounted, vec![PathBuf::from("/system")]);
