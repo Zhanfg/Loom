@@ -9,6 +9,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/loom-orchestrator/**"
+      - "crates/loom-sys/**"
       - "docs/orchestrator-v1.md"
       - ".github/workflows/orchestrator.yml"
   pull_request:
