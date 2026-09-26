@@ -1,11 +1,13 @@
 use core::fmt;
 
+use crate::magic::{MagicAdapter, MagicRuntime, MagicSpec, MagicToken};
 use crate::nomount::{AppliedRule, NomountClient, NomountRule, NomountTransport};
 use crate::overlay::{OverlayAdapter, OverlayRuntime, OverlaySpec, OverlayToken};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeAction {
     Overlay(OverlaySpec),
+    Magic(MagicSpec),
     NoMount(NomountRule),
 }
 
@@ -14,6 +16,7 @@ impl RuntimeAction {
     pub fn path(&self) -> &str {
         match self {
             Self::Overlay(spec) => spec.target.to_str().unwrap_or("<non-utf8-overlay-target>"),
+            Self::Magic(spec) => spec.target.to_str().unwrap_or("<non-utf8-magic-target>"),
             Self::NoMount(rule) => &rule.virtual_path,
         }
     }
@@ -57,6 +60,44 @@ impl<R: OverlayRuntime> OverlayBackend for OverlayAdapter<R> {
     }
 }
 
+pub trait MagicBackend {
+    type Token;
+
+    /// Applies one Magic Mount action.
+    ///
+    /// # Errors
+    /// Returns a stringified backend error when apply fails.
+    fn apply_magic(&mut self, spec: &MagicSpec) -> Result<Self::Token, String>;
+
+    /// Verifies one applied Magic Mount action.
+    ///
+    /// # Errors
+    /// Returns a stringified backend error when verification fails.
+    fn verify_magic(&mut self, token: &Self::Token) -> Result<(), String>;
+
+    /// Rolls back one applied Magic Mount action.
+    ///
+    /// # Errors
+    /// Returns a stringified backend error when rollback fails.
+    fn rollback_magic(&mut self, token: &Self::Token) -> Result<(), String>;
+}
+
+impl<R: MagicRuntime> MagicBackend for MagicAdapter<R> {
+    type Token = MagicToken;
+
+    fn apply_magic(&mut self, spec: &MagicSpec) -> Result<Self::Token, String> {
+        self.apply(spec).map_err(|error| error.to_string())
+    }
+
+    fn verify_magic(&mut self, token: &Self::Token) -> Result<(), String> {
+        self.verify(token).map_err(|error| error.to_string())
+    }
+
+    fn rollback_magic(&mut self, token: &Self::Token) -> Result<(), String> {
+        self.rollback(token).map_err(|error| error.to_string())
+    }
+}
+
 pub trait NomountBackend {
     type Token;
 
@@ -95,14 +136,15 @@ impl<T: NomountTransport> NomountBackend for NomountClient<T> {
     }
 }
 
-enum RuntimeToken<O, N> {
+enum RuntimeToken<O, M, N> {
     Overlay(O),
+    Magic(M),
     NoMount(N),
 }
 
-struct AppliedEntry<O, N> {
+struct AppliedEntry<O, M, N> {
     path: String,
-    token: RuntimeToken<O, N>,
+    token: RuntimeToken<O, M, N>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -110,6 +152,7 @@ pub struct RuntimeReport {
     pub applied: usize,
     pub verified: usize,
     pub overlay_actions: usize,
+    pub magic_actions: usize,
     pub nomount_actions: usize,
 }
 
@@ -137,25 +180,30 @@ impl fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
-pub struct RuntimeCoordinator<O, N> {
+pub struct RuntimeCoordinator<O, M, N> {
     overlay: O,
+    magic: M,
     nomount: N,
 }
 
-impl<O, N> RuntimeCoordinator<O, N> {
+impl<O, M, N> RuntimeCoordinator<O, M, N> {
     #[must_use]
-    pub const fn new(overlay: O, nomount: N) -> Self {
-        Self { overlay, nomount }
+    pub const fn new(overlay: O, magic: M, nomount: N) -> Self {
+        Self {
+            overlay,
+            magic,
+            nomount,
+        }
     }
 
     #[must_use]
-    pub fn into_inner(self) -> (O, N) {
-        (self.overlay, self.nomount)
+    pub fn into_inner(self) -> (O, M, N) {
+        (self.overlay, self.magic, self.nomount)
     }
 }
 
-impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
-    /// Applies and verifies a mixed `OverlayFS`/`NoMount` runtime batch atomically.
+impl<O: OverlayBackend, M: MagicBackend, N: NomountBackend> RuntimeCoordinator<O, M, N> {
+    /// Applies and verifies a mixed `OverlayFS`/Magic Mount/`NoMount` batch atomically.
     ///
     /// Every successful action yields a rollback token. Any later apply or verify
     /// failure rolls all previously applied actions back in reverse order.
@@ -166,6 +214,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
     pub fn execute(&mut self, actions: &[RuntimeAction]) -> Result<RuntimeReport, RuntimeError> {
         let mut applied = Vec::with_capacity(actions.len());
         let mut overlay_actions = 0_usize;
+        let mut magic_actions = 0_usize;
         let mut nomount_actions = 0_usize;
 
         for action in actions {
@@ -175,6 +224,15 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
                     Ok(token) => {
                         overlay_actions += 1;
                         RuntimeToken::Overlay(token)
+                    }
+                    Err(cause) => {
+                        return Err(self.fail_with_rollback("apply", path, cause, &applied));
+                    }
+                },
+                RuntimeAction::Magic(spec) => match self.magic.apply_magic(spec) {
+                    Ok(token) => {
+                        magic_actions += 1;
+                        RuntimeToken::Magic(token)
                     }
                     Err(cause) => {
                         return Err(self.fail_with_rollback("apply", path, cause, &applied));
@@ -197,6 +255,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
         for entry in &applied {
             let result = match &entry.token {
                 RuntimeToken::Overlay(token) => self.overlay.verify_overlay(token),
+                RuntimeToken::Magic(token) => self.magic.verify_magic(token),
                 RuntimeToken::NoMount(token) => self.nomount.verify_nomount(token),
             };
             if let Err(cause) = result {
@@ -204,6 +263,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
                 break;
             }
         }
+
         if let Some((path, cause)) = verification_failure {
             return Err(self.fail_with_rollback("verify", path, cause, &applied));
         }
@@ -212,6 +272,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
             applied: applied.len(),
             verified: applied.len(),
             overlay_actions,
+            magic_actions,
             nomount_actions,
         })
     }
@@ -221,7 +282,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
         stage: &'static str,
         path: String,
         cause: String,
-        applied: &[AppliedEntry<O::Token, N::Token>],
+        applied: &[AppliedEntry<O::Token, M::Token, N::Token>],
     ) -> RuntimeError {
         let rollback_failures = self.rollback_all(applied);
         RuntimeError {
@@ -232,11 +293,15 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
         }
     }
 
-    fn rollback_all(&mut self, applied: &[AppliedEntry<O::Token, N::Token>]) -> Vec<String> {
+    fn rollback_all(
+        &mut self,
+        applied: &[AppliedEntry<O::Token, M::Token, N::Token>],
+    ) -> Vec<String> {
         let mut failures = Vec::new();
         for entry in applied.iter().rev() {
             let result = match &entry.token {
                 RuntimeToken::Overlay(token) => self.overlay.rollback_overlay(token),
+                RuntimeToken::Magic(token) => self.magic.rollback_magic(token),
                 RuntimeToken::NoMount(token) => self.nomount.rollback_nomount(token),
             };
             if let Err(error) = result {
@@ -276,6 +341,35 @@ mod tests {
         }
 
         fn rollback_overlay(&mut self, token: &Self::Token) -> Result<(), String> {
+            self.rolled_back.push(token.clone());
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeMagic {
+        applied: Vec<String>,
+        rolled_back: Vec<String>,
+        fail_apply: bool,
+    }
+
+    impl MagicBackend for FakeMagic {
+        type Token = String;
+
+        fn apply_magic(&mut self, spec: &MagicSpec) -> Result<Self::Token, String> {
+            if self.fail_apply {
+                return Err("magic apply failed".to_owned());
+            }
+            let path = spec.target.display().to_string();
+            self.applied.push(path.clone());
+            Ok(path)
+        }
+
+        fn verify_magic(&mut self, _token: &Self::Token) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn rollback_magic(&mut self, token: &Self::Token) -> Result<(), String> {
             self.rolled_back.push(token.clone());
             Ok(())
         }
@@ -322,14 +416,22 @@ mod tests {
         })
     }
 
+    fn magic_action(target: &str) -> RuntimeAction {
+        RuntimeAction::Magic(MagicSpec {
+            source: PathBuf::from("/data/adb/modules/demo/system/etc/hosts"),
+            target: PathBuf::from(target),
+            read_only: true,
+        })
+    }
+
     #[test]
     fn later_nomount_apply_failure_rolls_back_overlay_prefix() {
-        let overlay = FakeOverlay::default();
         let nomount = FakeNoMount {
             fail_apply: true,
             ..FakeNoMount::default()
         };
-        let mut runtime = RuntimeCoordinator::new(overlay, nomount);
+        let mut runtime =
+            RuntimeCoordinator::new(FakeOverlay::default(), FakeMagic::default(), nomount);
         let actions = [
             overlay_action("/system"),
             RuntimeAction::NoMount(
@@ -338,36 +440,58 @@ mod tests {
         ];
 
         assert!(runtime.execute(&actions).is_err());
-        let (overlay, _) = runtime.into_inner();
+        let (overlay, _, _) = runtime.into_inner();
         assert_eq!(overlay.rolled_back, vec!["/system"]);
     }
 
     #[test]
-    fn overlay_verify_failure_rolls_back_mixed_batch_reverse_order() {
+    fn magic_apply_failure_rolls_back_overlay_prefix() {
+        let magic = FakeMagic {
+            fail_apply: true,
+            ..FakeMagic::default()
+        };
+        let mut runtime =
+            RuntimeCoordinator::new(FakeOverlay::default(), magic, FakeNoMount::default());
+        let actions = [overlay_action("/system"), magic_action("/vendor/etc/hosts")];
+
+        assert!(runtime.execute(&actions).is_err());
+        let (overlay, _, _) = runtime.into_inner();
+        assert_eq!(overlay.rolled_back, vec!["/system"]);
+    }
+
+    #[test]
+    fn overlay_verify_failure_rolls_back_all_backends_reverse_order() {
         let overlay = FakeOverlay {
             fail_verify: true,
             ..FakeOverlay::default()
         };
-        let nomount = FakeNoMount::default();
-        let mut runtime = RuntimeCoordinator::new(overlay, nomount);
+        let mut runtime =
+            RuntimeCoordinator::new(overlay, FakeMagic::default(), FakeNoMount::default());
         let actions = [
             RuntimeAction::NoMount(
                 NomountRule::redirect("/vendor/etc/a", "/data/adb/a", 0, false).unwrap(),
             ),
+            magic_action("/product/etc/hosts"),
             overlay_action("/system"),
         ];
 
         assert!(runtime.execute(&actions).is_err());
-        let (overlay, nomount) = runtime.into_inner();
+        let (overlay, magic, nomount) = runtime.into_inner();
         assert_eq!(overlay.rolled_back, vec!["/system"]);
+        assert_eq!(magic.rolled_back, vec!["/product/etc/hosts"]);
         assert_eq!(nomount.rolled_back, vec!["/vendor/etc/a"]);
     }
 
     #[test]
     fn successful_mixed_batch_reports_backend_counts() {
-        let mut runtime = RuntimeCoordinator::new(FakeOverlay::default(), FakeNoMount::default());
+        let mut runtime = RuntimeCoordinator::new(
+            FakeOverlay::default(),
+            FakeMagic::default(),
+            FakeNoMount::default(),
+        );
         let actions = [
             overlay_action("/system"),
+            magic_action("/product/etc/hosts"),
             RuntimeAction::NoMount(
                 NomountRule::redirect("/vendor/etc/a", "/data/adb/a", 0, false).unwrap(),
             ),
@@ -376,9 +500,10 @@ mod tests {
         assert_eq!(
             runtime.execute(&actions).unwrap(),
             RuntimeReport {
-                applied: 2,
-                verified: 2,
+                applied: 3,
+                verified: 3,
                 overlay_actions: 1,
+                magic_actions: 1,
                 nomount_actions: 1,
             }
         );
