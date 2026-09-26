@@ -1,7 +1,7 @@
 use core::fmt;
 
-use crate::nomount::{AppliedRule, NomountClient, NomountError, NomountRule, NomountTransport};
-use crate::overlay::{OverlayAdapter, OverlayError, OverlayRuntime, OverlaySpec, OverlayToken};
+use crate::nomount::{AppliedRule, NomountClient, NomountRule, NomountTransport};
+use crate::overlay::{OverlayAdapter, OverlayRuntime, OverlaySpec, OverlayToken};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeAction {
@@ -193,15 +193,19 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
             applied.push(AppliedEntry { path, token });
         }
 
-        for index in 0..applied.len() {
-            let result = match &applied[index].token {
+        let mut verification_failure = None;
+        for entry in &applied {
+            let result = match &entry.token {
                 RuntimeToken::Overlay(token) => self.overlay.verify_overlay(token),
                 RuntimeToken::NoMount(token) => self.nomount.verify_nomount(token),
             };
             if let Err(cause) = result {
-                let path = applied[index].path.clone();
-                return Err(self.fail_with_rollback("verify", path, cause, applied));
+                verification_failure = Some((entry.path.clone(), cause));
+                break;
             }
+        }
+        if let Some((path, cause)) = verification_failure {
+            return Err(self.fail_with_rollback("verify", path, cause, applied));
         }
 
         Ok(RuntimeReport {
