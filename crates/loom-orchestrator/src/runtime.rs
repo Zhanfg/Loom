@@ -38,7 +38,7 @@ pub trait OverlayBackend {
     ///
     /// # Errors
     /// Returns a stringified backend error when rollback fails.
-    fn rollback_overlay(&mut self, token: Self::Token) -> Result<(), String>;
+    fn rollback_overlay(&mut self, token: &Self::Token) -> Result<(), String>;
 }
 
 impl<R: OverlayRuntime> OverlayBackend for OverlayAdapter<R> {
@@ -52,7 +52,7 @@ impl<R: OverlayRuntime> OverlayBackend for OverlayAdapter<R> {
         self.verify(token).map_err(|error| error.to_string())
     }
 
-    fn rollback_overlay(&mut self, token: Self::Token) -> Result<(), String> {
+    fn rollback_overlay(&mut self, token: &Self::Token) -> Result<(), String> {
         self.rollback(token).map_err(|error| error.to_string())
     }
 }
@@ -76,7 +76,7 @@ pub trait NomountBackend {
     ///
     /// # Errors
     /// Returns a stringified backend error when rollback fails.
-    fn rollback_nomount(&mut self, token: Self::Token) -> Result<(), String>;
+    fn rollback_nomount(&mut self, token: &Self::Token) -> Result<(), String>;
 }
 
 impl<T: NomountTransport> NomountBackend for NomountClient<T> {
@@ -90,7 +90,7 @@ impl<T: NomountTransport> NomountBackend for NomountClient<T> {
         self.verify(token).map_err(|error| error.to_string())
     }
 
-    fn rollback_nomount(&mut self, token: Self::Token) -> Result<(), String> {
+    fn rollback_nomount(&mut self, token: &Self::Token) -> Result<(), String> {
         self.rollback(token).map_err(|error| error.to_string())
     }
 }
@@ -177,7 +177,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
                         RuntimeToken::Overlay(token)
                     }
                     Err(cause) => {
-                        return Err(self.fail_with_rollback("apply", path, cause, applied));
+                        return Err(self.fail_with_rollback("apply", path, cause, &applied));
                     }
                 },
                 RuntimeAction::NoMount(rule) => match self.nomount.apply_nomount(rule) {
@@ -186,7 +186,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
                         RuntimeToken::NoMount(token)
                     }
                     Err(cause) => {
-                        return Err(self.fail_with_rollback("apply", path, cause, applied));
+                        return Err(self.fail_with_rollback("apply", path, cause, &applied));
                     }
                 },
             };
@@ -205,7 +205,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
             }
         }
         if let Some((path, cause)) = verification_failure {
-            return Err(self.fail_with_rollback("verify", path, cause, applied));
+            return Err(self.fail_with_rollback("verify", path, cause, &applied));
         }
 
         Ok(RuntimeReport {
@@ -221,7 +221,7 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
         stage: &'static str,
         path: String,
         cause: String,
-        applied: Vec<AppliedEntry<O::Token, N::Token>>,
+        applied: &[AppliedEntry<O::Token, N::Token>],
     ) -> RuntimeError {
         let rollback_failures = self.rollback_all(applied);
         RuntimeError {
@@ -232,10 +232,10 @@ impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
         }
     }
 
-    fn rollback_all(&mut self, applied: Vec<AppliedEntry<O::Token, N::Token>>) -> Vec<String> {
+    fn rollback_all(&mut self, applied: &[AppliedEntry<O::Token, N::Token>]) -> Vec<String> {
         let mut failures = Vec::new();
-        for entry in applied.into_iter().rev() {
-            let result = match entry.token {
+        for entry in applied.iter().rev() {
+            let result = match &entry.token {
                 RuntimeToken::Overlay(token) => self.overlay.rollback_overlay(token),
                 RuntimeToken::NoMount(token) => self.nomount.rollback_nomount(token),
             };
@@ -275,8 +275,8 @@ mod tests {
             Ok(())
         }
 
-        fn rollback_overlay(&mut self, token: Self::Token) -> Result<(), String> {
-            self.rolled_back.push(token);
+        fn rollback_overlay(&mut self, token: &Self::Token) -> Result<(), String> {
+            self.rolled_back.push(token.clone());
             Ok(())
         }
     }
@@ -303,8 +303,8 @@ mod tests {
             Ok(())
         }
 
-        fn rollback_nomount(&mut self, token: Self::Token) -> Result<(), String> {
-            self.rolled_back.push(token);
+        fn rollback_nomount(&mut self, token: &Self::Token) -> Result<(), String> {
+            self.rolled_back.push(token.clone());
             Ok(())
         }
     }
