@@ -18,6 +18,8 @@ pub use nomount::{NomountClient, NomountError, NomountRule, SystemNomountTranspo
 pub use overlay::{CommandOverlayRuntime, OverlayAdapter, OverlayError, OverlaySpec};
 pub use planner::{plan_requests, PlanEntry, PlanError, PlanPolicy, PlanRequest};
 pub use probe::RuntimeProbe;
-pub use providers::{kasumi_provider, magic_provider, nomount_provider, overlay_provider, ProviderDescriptor};
+pub use providers::{
+    kasumi_provider, magic_provider, nomount_provider, overlay_provider, ProviderDescriptor,
+};
 pub use runtime::{RuntimeAction, RuntimeCoordinator, RuntimeError, RuntimeReport};
 pub use transaction::{execute_atomic, ExecutionError, ExecutionReport, Executor};
