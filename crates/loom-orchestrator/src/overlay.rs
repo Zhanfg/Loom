@@ -294,7 +294,10 @@ fn validate_path(path: &Path, label: &str) -> Result<(), OverlayError> {
 fn validate_option_path(path: &Path, label: &str) -> Result<(), OverlayError> {
     validate_path(path, label)?;
     let text = path.to_string_lossy();
-    if text.contains([',', ':', '\n', '\r']) {
+    if text
+        .chars()
+        .any(|character| matches!(character, ',' | ':' | '\n' | '\r'))
+    {
         return Err(OverlayError::InvalidSpec(format!(
             "{label} contains an unsupported option separator: {text}"
         )));
