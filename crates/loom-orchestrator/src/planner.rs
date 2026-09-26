@@ -170,7 +170,6 @@ mod tests {
         assert_eq!(plan[0].backend, BackendKind::NoMount);
     }
 
-
     #[test]
     fn ordinary_path_falls_back_to_magic_before_nomount() {
         let providers = [
