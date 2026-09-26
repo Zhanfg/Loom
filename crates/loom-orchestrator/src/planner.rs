@@ -166,7 +166,11 @@ mod tests {
 
     #[test]
     fn kasumi_is_not_selected_by_default() {
-        let providers = [\n            overlay_provider(false),\n            nomount_provider(false),\n            kasumi_provider(true),\n        ];
+        let providers = [
+            overlay_provider(false),
+            nomount_provider(false),
+            kasumi_provider(true),
+        ];
         let request = PlanRequest {
             path: "/system/bin/example".into(),
             requirements: Requirements {
