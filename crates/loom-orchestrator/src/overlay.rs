@@ -357,7 +357,10 @@ mod tests {
     fn spec() -> OverlaySpec {
         OverlaySpec {
             target: PathBuf::from("/system"),
-            lowerdirs: vec![PathBuf::from("/data/adb/modules/a/system"), PathBuf::from("/system")],
+            lowerdirs: vec![
+                PathBuf::from("/data/adb/modules/a/system"),
+                PathBuf::from("/system"),
+            ],
             upperdir: None,
             workdir: None,
             read_only: true,
@@ -374,8 +377,7 @@ mod tests {
 
     #[test]
     fn mountinfo_verifies_fstype_and_target() {
-        let info =
-            "36 25 0:32 / /system rw,relatime - overlay overlay rw,lowerdir=/x:/system\n";
+        let info = "36 25 0:32 / /system rw,relatime - overlay overlay rw,lowerdir=/x:/system\n";
         assert!(mountinfo_has_overlay(info, Path::new("/system")));
         assert!(!mountinfo_has_overlay(info, Path::new("/vendor")));
     }
