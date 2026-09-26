@@ -12,7 +12,7 @@ pub mod runtime;
 pub mod transaction;
 
 pub use capabilities::{BackendKind, CapabilitySet, ProviderStability, Requirements};
-pub use inventory::{ProviderInventory, RuntimeSignals};
+pub use inventory::{Availability, ProviderInventory, RuntimeSignals};
 pub use magic::{CommandMagicRuntime, MagicAdapter, MagicError, MagicSpec};
 pub use nomount::{NomountClient, NomountError, NomountRule, SystemNomountTransport};
 pub use overlay::{CommandOverlayRuntime, OverlayAdapter, OverlayError, OverlaySpec};
