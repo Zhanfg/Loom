@@ -58,6 +58,30 @@ pub const fn nomount_provider(available: bool) -> ProviderDescriptor {
 }
 
 #[must_use]
+pub const fn magic_provider(available: bool) -> ProviderDescriptor {
+    ProviderDescriptor {
+        name: "magic",
+        backend: BackendKind::Magic,
+        stability: ProviderStability::Preview,
+        available,
+        capabilities: CapabilitySet {
+            redirect_file: true,
+            redirect_dir: true,
+            whiteout: false,
+            opaque_dir: false,
+            symlink: false,
+            uid_isolation: false,
+            writable_forward: false,
+            selinux_fidelity: true,
+            xattr_fidelity: true,
+            stat_identity: true,
+            hot_reload: false,
+            mountless: false,
+        },
+    }
+}
+
+#[must_use]
 pub const fn kasumi_provider(available: bool) -> ProviderDescriptor {
     ProviderDescriptor {
         name: "kasumi",
