@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-use crate::inventory::RuntimeSignals;
+use crate::inventory::{Availability, RuntimeSignals};
 use crate::nomount::{NomountClient, SystemNomountTransport, NOMOUNT_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,10 +66,10 @@ impl RuntimeProbe {
 
         Self {
             signals: RuntimeSignals {
-                overlayfs,
-                nomount,
-                magic,
-                kasumi: false,
+                overlayfs: Availability::from(overlayfs),
+                nomount: Availability::from(nomount),
+                magic: Availability::from(magic),
+                kasumi: Availability::Unavailable,
             },
             nomount_version,
             notes,
