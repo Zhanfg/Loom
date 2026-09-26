@@ -17,20 +17,12 @@ pub struct PlanEntry {
     pub backend: BackendKind,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PlanPolicy {
     pub allow_experimental: bool,
     pub allow_reference_only: bool,
 }
 
-impl Default for PlanPolicy {
-    fn default() -> Self {
-        Self {
-            allow_experimental: false,
-            allow_reference_only: false,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
@@ -78,15 +70,15 @@ fn choose_provider<'a>(
     request: &PlanRequest,
     policy: PlanPolicy,
 ) -> Option<&'a ProviderDescriptor> {
-    if let Some(preferred) = request.preferred_backend {
-        if let Some(provider) = providers.iter().find(|provider| {
+    if let Some(provider) = request.preferred_backend.and_then(|preferred| {
+        providers.iter().find(|provider| {
             provider.backend == preferred
                 && provider.available
                 && allowed(provider, policy)
                 && provider.capabilities.satisfies(request.requirements)
-        }) {
-            return Some(provider);
-        }
+        })
+    }) {
+        return Some(provider);
     }
 
     let mut candidates = providers
