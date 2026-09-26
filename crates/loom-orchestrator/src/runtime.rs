@@ -22,19 +22,19 @@ impl RuntimeAction {
 pub trait OverlayBackend {
     type Token;
 
-    /// Applies one OverlayFS action.
+    /// Applies one `OverlayFS` action.
     ///
     /// # Errors
     /// Returns a stringified backend error when apply fails.
     fn apply_overlay(&mut self, spec: &OverlaySpec) -> Result<Self::Token, String>;
 
-    /// Verifies one applied OverlayFS action.
+    /// Verifies one applied `OverlayFS` action.
     ///
     /// # Errors
     /// Returns a stringified backend error when verification fails.
     fn verify_overlay(&mut self, token: &Self::Token) -> Result<(), String>;
 
-    /// Rolls back one applied OverlayFS action.
+    /// Rolls back one applied `OverlayFS` action.
     ///
     /// # Errors
     /// Returns a stringified backend error when rollback fails.
@@ -60,19 +60,19 @@ impl<R: OverlayRuntime> OverlayBackend for OverlayAdapter<R> {
 pub trait NomountBackend {
     type Token;
 
-    /// Applies one NoMount action.
+    /// Applies one `NoMount` action.
     ///
     /// # Errors
     /// Returns a stringified backend error when apply fails.
     fn apply_nomount(&mut self, rule: &NomountRule) -> Result<Self::Token, String>;
 
-    /// Verifies one applied NoMount action.
+    /// Verifies one applied `NoMount` action.
     ///
     /// # Errors
     /// Returns a stringified backend error when verification fails.
     fn verify_nomount(&mut self, token: &Self::Token) -> Result<(), String>;
 
-    /// Rolls back one applied NoMount action.
+    /// Rolls back one applied `NoMount` action.
     ///
     /// # Errors
     /// Returns a stringified backend error when rollback fails.
@@ -155,13 +155,13 @@ impl<O, N> RuntimeCoordinator<O, N> {
 }
 
 impl<O: OverlayBackend, N: NomountBackend> RuntimeCoordinator<O, N> {
-    /// Applies and verifies a mixed OverlayFS/NoMount runtime batch atomically.
+    /// Applies and verifies a mixed `OverlayFS`/`NoMount` runtime batch atomically.
     ///
     /// Every successful action yields a rollback token. Any later apply or verify
     /// failure rolls all previously applied actions back in reverse order.
     ///
     /// # Errors
-    /// Returns RuntimeError on the first apply/verify failure, preserving any
+    /// Returns `RuntimeError` on the first apply/verify failure, preserving any
     /// rollback failures in the same error.
     pub fn execute(&mut self, actions: &[RuntimeAction]) -> Result<RuntimeReport, RuntimeError> {
         let mut applied = Vec::with_capacity(actions.len());
