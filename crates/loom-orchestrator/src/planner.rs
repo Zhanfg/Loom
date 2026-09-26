@@ -23,7 +23,6 @@ pub struct PlanPolicy {
     pub allow_reference_only: bool,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanError {
     NoProvider { path: String },
