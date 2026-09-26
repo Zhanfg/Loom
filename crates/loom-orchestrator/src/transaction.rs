@@ -5,8 +5,22 @@ use crate::planner::PlanEntry;
 pub trait Executor {
     type Token;
 
+    /// Applies one planned entry and returns a rollback token.
+    ///
+    /// # Errors
+    /// Returns an implementation-defined error when the backend cannot apply the entry.
     fn apply(&mut self, entry: &PlanEntry) -> Result<Self::Token, String>;
+
+    /// Verifies that an applied token is externally observable and correct.
+    ///
+    /// # Errors
+    /// Returns an implementation-defined error when read-back verification fails.
     fn verify(&mut self, token: &Self::Token) -> Result<(), String>;
+
+    /// Reverts one previously applied token.
+    ///
+    /// # Errors
+    /// Returns an implementation-defined error when rollback cannot fully remove the effect.
     fn rollback(&mut self, token: Self::Token) -> Result<(), String>;
 }
 
@@ -49,6 +63,14 @@ fn rollback_all<E: Executor>(executor: &mut E, tokens: Vec<E::Token>) -> Vec<Str
     failures
 }
 
+/// Applies and verifies a complete batch without accepting partial success.
+///
+/// On an apply or verification failure, every token already produced is rolled
+/// back in reverse order before the error is returned.
+///
+/// # Errors
+/// Returns [`ExecutionError`] when apply or verification fails. Rollback errors
+/// are retained in the returned error instead of being discarded.
 pub fn execute_atomic<E: Executor>(
     executor: &mut E,
     plan: &[PlanEntry],
