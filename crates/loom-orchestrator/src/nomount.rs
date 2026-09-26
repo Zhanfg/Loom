@@ -92,10 +92,7 @@ impl NomountRule {
     ///
     /// # Errors
     /// Returns NomountError when the virtual path is invalid.
-    pub fn whiteout(
-        virtual_path: impl Into<String>,
-        uid: u32,
-    ) -> Result<Self, NomountError> {
+    pub fn whiteout(virtual_path: impl Into<String>, uid: u32) -> Result<Self, NomountError> {
         let rule = Self {
             flags: FLAG_WHITEOUT,
             uid,
@@ -110,10 +107,7 @@ impl NomountRule {
     ///
     /// # Errors
     /// Returns NomountError when the virtual path is invalid.
-    pub fn virtual_dir(
-        virtual_path: impl Into<String>,
-        uid: u32,
-    ) -> Result<Self, NomountError> {
+    pub fn virtual_dir(virtual_path: impl Into<String>, uid: u32) -> Result<Self, NomountError> {
         let rule = Self {
             flags: FLAG_IS_DIR | FLAG_VIRTUAL_DIR,
             uid,
@@ -169,9 +163,8 @@ impl NomountRule {
         self.validate()?;
         out.extend_from_slice(&self.flags.to_le_bytes());
         out.extend_from_slice(&self.uid.to_le_bytes());
-        let virtual_len = u16::try_from(self.virtual_path.len()).map_err(|_| {
-            NomountError::Protocol("virtual path length exceeds u16".to_owned())
-        })?;
+        let virtual_len = u16::try_from(self.virtual_path.len())
+            .map_err(|_| NomountError::Protocol("virtual path length exceeds u16".to_owned()))?;
         let real_len = u16::try_from(self.real_path.len())
             .map_err(|_| NomountError::Protocol("real path length exceeds u16".to_owned()))?;
         out.extend_from_slice(&virtual_len.to_le_bytes());
@@ -679,9 +672,7 @@ mod tests {
             ],
         };
         let mut client = NomountClient::new(transport);
-        client
-            .verify(&AppliedRule { rule: rule.clone() })
-            .unwrap();
+        client.verify(&AppliedRule { rule: rule.clone() }).unwrap();
         assert_eq!(client.into_inner().requests.len(), 2);
     }
 }
