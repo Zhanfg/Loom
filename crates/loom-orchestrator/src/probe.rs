@@ -1,4 +1,5 @@
 use std::fs;
+use std::path::Path;
 
 use crate::inventory::RuntimeSignals;
 use crate::nomount::{NomountClient, SystemNomountTransport, NOMOUNT_VERSION};
@@ -27,6 +28,17 @@ impl RuntimeProbe {
                 false
             }
         };
+
+        let magic = [
+            "/system/bin/mount",
+            "/bin/mount",
+            "/usr/bin/mount",
+        ]
+        .iter()
+        .any(|candidate| Path::new(candidate).is_file());
+        if !magic {
+            notes.push("Magic Mount helper was not found at a known absolute path".to_owned());
+        }
 
         let (nomount, nomount_version) = match SystemNomountTransport::new() {
             Ok(transport) => {
@@ -60,6 +72,7 @@ impl RuntimeProbe {
             signals: RuntimeSignals {
                 overlayfs,
                 nomount,
+                magic,
                 kasumi: false,
             },
             nomount_version,
