@@ -1,0 +1,49 @@
+name: orchestrator-v1
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feat/orchestrator-v1
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/loom-orchestrator/**"
+      - "crates/loom-sys/**"
+      - "docs/orchestrator-v1.md"
+      - ".github/workflows/orchestrator.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/loom-orchestrator/**"
+      - ".github/workflows/orchestrator.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  orchestrator:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Check
+        run: cargo check -p loom-orchestrator --all-targets
+
+      - name: Test
+        run: cargo test -p loom-orchestrator --all-targets
+
+      - name: Clippy correctness gate
+        run: cargo clippy -p loom-orchestrator --all-targets -- -D clippy::correctness
