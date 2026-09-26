@@ -375,8 +375,8 @@ impl<T: NomountTransport> NomountClient<T> {
     ///
     /// # Errors
     /// Returns `NomountError` when the kernel cannot remove the rule.
-    pub fn rollback(&mut self, token: AppliedRule) -> Result<(), NomountError> {
-        self.remove_rules(&[token.rule])
+    pub fn rollback(&mut self, token: &AppliedRule) -> Result<(), NomountError> {
+        self.remove_rules(std::slice::from_ref(&token.rule))
     }
 }
 
