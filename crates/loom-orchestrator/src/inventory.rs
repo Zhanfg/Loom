@@ -1,4 +1,4 @@
-use crate::providers::{ProviderDescriptor, kasumi_provider, nomount_provider, overlay_provider};
+use crate::providers::{kasumi_provider, nomount_provider, overlay_provider, ProviderDescriptor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct RuntimeSignals {
