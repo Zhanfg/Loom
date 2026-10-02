@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - feat/axymorrsen-signer-flutter
+  pull_request:
+    branches:
+      - feat/axymorrsen-signer-flutter
   workflow_dispatch:
 
 permissions:
