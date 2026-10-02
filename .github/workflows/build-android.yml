@@ -1,0 +1,87 @@
+name: Bootstrap and Build AXYMORSEN Signer
+
+on:
+  push:
+    branches:
+      - feat/axymorrsen-signer-flutter
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: signer-bootstrap-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Expand source
+        shell: bash
+        run: |
+          test -f axymorrsen-signer-source.tar.gz
+          tar -xzf axymorrsen-signer-source.tar.gz
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android scaffold
+        shell: bash
+        run: |
+          rm -rf /tmp/axymorrsen_signer_scaffold android
+          flutter create             --platforms=android             --org io.axymorrsen             --project-name axymorrsen_signer             /tmp/axymorrsen_signer_scaffold
+          cp -R /tmp/axymorrsen_signer_scaffold/android ./android
+          ./tool/bootstrap_android.sh
+
+      - name: Resolve Dart dependencies
+        run: flutter pub get
+
+      - name: Analyze
+        run: flutter analyze
+
+      - name: Test
+        run: flutter test
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Collect artifact
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/app/outputs/flutter-apk/app-release.apk dist/AXYMORSEN-Signer-1.0.0.apk
+          sha256sum dist/AXYMORSEN-Signer-1.0.0.apk | tee dist/AXYMORSEN-Signer-1.0.0.apk.sha256
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: AXYMORSEN-Signer-1.0.0-android
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Materialize source tree
+        shell: bash
+        run: |
+          rm -f axymorrsen-signer-source.tar.gz
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: materialize Flutter signer source tree"
+            git push origin HEAD:feat/axymorrsen-signer-flutter
+          fi
