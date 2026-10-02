@@ -33,6 +33,79 @@ jobs:
           gzip -t /tmp/axymorrsen-signer-source.tar.gz
           tar -xzf /tmp/axymorrsen-signer-source.tar.gz
 
+      - name: Modernize Flutter stable APIs
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          p = Path("lib/features/home/home_screen.dart")
+          s = p.read_text()
+
+          old_dropdown = """                  DropdownButtonFormField<String>(
+                    value: _selectedKeyId,
+                    decoration: const InputDecoration(labelText: 'Signing key'),
+                    items: _keys
+                        .map((key) => DropdownMenuItem(value: key.id, child: Text('${key.alias} · ${key.sha256.substring(0, 17)}…')))
+                        .toList(growable: false),
+                    onChanged: _busy ? null : (value) => setState(() => _selectedKeyId = value),
+                  ),
+          """
+          new_dropdown = """                  InputDecorator(
+                    decoration: const InputDecoration(labelText: 'Signing key'),
+                    child: DropdownButtonHideUnderline(
+                      child: DropdownButton<String>(
+                        isExpanded: true,
+                        value: _selectedKeyId,
+                        items: _keys
+                            .map((key) => DropdownMenuItem(
+                                  value: key.id,
+                                  child: Text('${key.alias} · ${key.sha256.substring(0, 17)}…'),
+                                ))
+                            .toList(growable: false),
+                        onChanged: _busy ? null : (value) => setState(() => _selectedKeyId = value),
+                      ),
+                    ),
+                  ),
+          """
+
+          old_radios = """                  for (final key in _keys)
+                    RadioListTile<String>(
+                      value: key.id,
+                      groupValue: _selectedKeyId,
+                      onChanged: _busy ? null : (value) => setState(() => _selectedKeyId = value),
+                      title: Text(key.alias),
+                      subtitle: Text('CN=${key.commonName}\\n${key.sha256}'),
+                    ),
+          """
+          new_radios = """                  RadioGroup<String>(
+                    groupValue: _selectedKeyId,
+                    onChanged: (value) {
+                      if (_busy) return;
+                      setState(() => _selectedKeyId = value);
+                    },
+                    child: Column(
+                      children: [
+                        for (final key in _keys)
+                          RadioListTile<String>(
+                            value: key.id,
+                            enabled: !_busy,
+                            title: Text(key.alias),
+                            subtitle: Text('CN=${key.commonName}\\n${key.sha256}'),
+                          ),
+                      ],
+                    ),
+                  ),
+          """
+
+          if old_dropdown not in s:
+              raise SystemExit("dropdown patch anchor not found")
+          if old_radios not in s:
+              raise SystemExit("radio patch anchor not found")
+          s = s.replace(old_dropdown, new_dropdown).replace(old_radios, new_radios)
+          p.write_text(s)
+          PY
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
