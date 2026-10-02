@@ -27,8 +27,11 @@ jobs:
       - name: Expand source
         shell: bash
         run: |
-          test -f axymorrsen-signer-source.tar.gz
-          tar -xzf axymorrsen-signer-source.tar.gz
+          set -euo pipefail
+          test -d .bootstrap
+          cat .bootstrap/source.b64.* | tr -d '\\r\\n' | base64 --decode > /tmp/axymorrsen-signer-source.tar.gz
+          gzip -t /tmp/axymorrsen-signer-source.tar.gz
+          tar -xzf /tmp/axymorrsen-signer-source.tar.gz
 
       - name: Set up Java
         uses: actions/setup-java@v4
@@ -80,7 +83,8 @@ jobs:
       - name: Materialize source tree
         shell: bash
         run: |
-          rm -f axymorrsen-signer-source.tar.gz
+          rm -rf .bootstrap
+          rm -f axymorrsen-signer-source.tar.gz .bootstrap-trigger .ci-pr-trigger
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add -A
