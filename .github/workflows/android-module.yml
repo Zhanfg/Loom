@@ -115,7 +115,10 @@ jobs:
           echo "short_sha=${SHA:0:12}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust with Android target
-        uses: dtolnay/rust-toolchain@stable
+        # Toolchain pinned together with the source: the pinned Alpha 2
+        # tree (2026-08) passes its clippy -D warnings gate on the stable
+        # of its era; newer clippy releases reject that era's test code.
+        uses: dtolnay/rust-toolchain@1.98.0
         with:
           targets: aarch64-linux-android
           components: rustfmt, clippy
