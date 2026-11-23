@@ -6,7 +6,7 @@ on:
       source_ref:
         description: 'Loom branch, tag, or commit SHA to package'
         required: true
-        default: 'feat/android-block-origin-alpha2'
+        default: '952b7880fe7765c4410057cb8217ef7adcfcceca'
         type: string
       version_name:
         description: 'Module version name'
@@ -65,7 +65,11 @@ jobs:
           REQUESTED_CODE: ${{ inputs.version_code }}
         run: |
           set -euo pipefail
-          DEFAULT_SOURCE_REF='feat/android-block-origin-alpha2'
+          # Pinned compiler source: the exact tree Alpha 2 was built from
+          # (formerly the mutable branch feat/android-block-origin-alpha2).
+          # Packaging must not silently pick up newer branch commits.
+          PINNED_SOURCE_SHA='952b7880fe7765c4410057cb8217ef7adcfcceca'
+          DEFAULT_SOURCE_REF="$PINNED_SOURCE_SHA"
           if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             SOURCE_REF="${REQUESTED_REF:-$DEFAULT_SOURCE_REF}"
             VERSION_NAME="$REQUESTED_VERSION"
@@ -74,6 +78,11 @@ jobs:
             SOURCE_REF="$DEFAULT_SOURCE_REF"
             VERSION_NAME="0.2.0-shadow-alpha2+run${GITHUB_RUN_NUMBER}"
             VERSION_CODE="$((10200 + GITHUB_RUN_NUMBER))"
+          fi
+          if [[ "$SOURCE_REF" == "$PINNED_SOURCE_SHA" ]]; then
+            echo "source_pinned=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "source_pinned=false" >> "$GITHUB_OUTPUT"
           fi
           [[ "$VERSION_CODE" =~ ^[0-9]+$ ]]
           SAFE_VERSION="$(printf '%s' "$VERSION_NAME" | tr -c 'A-Za-z0-9._+-' '-')"
@@ -92,9 +101,16 @@ jobs:
       - name: Resolve exact source SHA
         id: source
         shell: bash
+        env:
+          SOURCE_PINNED: ${{ steps.meta.outputs.source_pinned }}
+          PINNED_SOURCE_SHA: '952b7880fe7765c4410057cb8217ef7adcfcceca'
         run: |
           set -euo pipefail
           SHA="$(git -C source rev-parse HEAD)"
+          if [[ "$SOURCE_PINNED" == "true" && "$SHA" != "$PINNED_SOURCE_SHA" ]]; then
+            echo "ERROR: pinned source expected $PINNED_SOURCE_SHA but checked out $SHA" >&2
+            exit 1
+          fi
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "short_sha=${SHA:0:12}" >> "$GITHUB_OUTPUT"
 
